@@ -12,5 +12,4 @@ Cubic will process hostile or malformed data. All network input, server data, re
 - Never download or execute arbitrary executable code.
 - Treat resource packs as untrusted data, not trusted code.
 
-No networking, downloading, archive processing, authentication, or credential storage is implemented in Phase 1.
-
+No networking, downloading, archive processing, authentication, or credential storage is implemented. Phase 2 adds only native windowing, GPU initialization, and clear-frame presentation; rendering performs no filesystem or network operations.
