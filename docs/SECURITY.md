@@ -12,4 +12,8 @@ Cubic will process hostile or malformed data. All network input, server data, re
 - Never download or execute arbitrary executable code.
 - Treat resource packs as untrusted data, not trusted code.
 
-No networking, downloading, archive processing, authentication, or credential storage is implemented. Phase 2 adds only native windowing, GPU initialization, and clear-frame presentation; rendering performs no filesystem or network operations.
+Phase 3's protocol reader uses checked slice access and borrowed results where ownership is unnecessary. Length-prefixed strings, byte arrays, BitSets, frame bodies, and aggregate fragmented input are bounded before allocation or copying. Fallible reservation reports a structured error. Incremental framing never trusts a declared frame size and does not allocate the frame body until all bounded bytes are present. Malformed or truncated data returns `CodecError`; production decode paths contain no unsafe code or intentional panic path.
+
+Limits are explicit inputs to codecs so future packet schemas can apply field-appropriate bounds. The default frame body limit is the current protocol maximum of 2,097,151 bytes, while aggregate buffered input has a separate 8 MiB default. Callers may configure stricter bounds. These protections do not replace future per-connection budgets, timeouts, decompression limits, or transport backpressure.
+
+No networking, downloading, archive processing, compression, encryption, authentication, or credential storage is implemented. Phase 2 rendering still performs no filesystem or network operations. Resource and archive protections remain future requirements.

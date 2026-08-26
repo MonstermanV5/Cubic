@@ -4,7 +4,7 @@ Status markers: `[ ]` not started, `[~]` partial, `[x]` complete, `[!]` blocked.
 
 - [x] Phase 1 - repository and architecture
 - [x] Phase 2 - Windows/iOS graphical bootstrap
-- [ ] Phase 3 - protocol primitives
+- [x] Phase 3 - protocol primitives
 - [ ] Phase 4 - NBT
 - [ ] Phase 5 - server status ping
 - [ ] Phase 6 - version-data architecture
@@ -39,4 +39,4 @@ Status markers: `[ ]` not started, `[~]` partial, `[x]` complete, `[!]` blocked.
 - [ ] Phase 35 - iPad soak/thermal/memory testing
 - [ ] Phase 36 - final acceptance testing
 
-Phase 1 remains complete while its repository acceptance criteria and validation commands pass. Phase 2 is partial until the new macOS/iOS CI job runs successfully. Phase 3 and later phases are intentionally left at a high level and have not begun.
+Phases 1-3 are complete while their acceptance criteria and validation commands continue to pass. Phase 4 and later phases are intentionally left at a high level and have not begun.

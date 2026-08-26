@@ -23,8 +23,14 @@ rust-version = "1.98"
 pollster = "1.0.1"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
+thiserror = "2.0.20"
 wgpu = { version = "30.0.1", default-features = false, features = ["dx12", "metal", "std"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+
+[workspace.dependencies.proptest]
+version = "1.11.0"
+default-features = false
+features = ["std"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
