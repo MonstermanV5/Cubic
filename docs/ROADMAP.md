@@ -3,7 +3,7 @@
 Status markers: `[ ]` not started, `[~]` partial, `[x]` complete, `[!]` blocked.
 
 - [x] Phase 1 - repository and architecture
-- [~] Phase 2 - Windows/iOS graphical bootstrap
+- [x] Phase 2 - Windows/iOS graphical bootstrap
 - [ ] Phase 3 - protocol primitives
 - [ ] Phase 4 - NBT
 - [ ] Phase 5 - server status ping
