@@ -311,6 +311,11 @@ version = "0.1.0"
 [[package]]
 name = "cubic-version"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "cubic-world"
@@ -1736,6 +1741,9 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 [[package]]
 name = "version-generator"
 version = "0.1.0"
+dependencies = [
+ "cubic-version",
+]
 
 [[package]]
 name = "walkdir"

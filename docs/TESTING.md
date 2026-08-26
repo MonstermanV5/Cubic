@@ -34,6 +34,20 @@ Phase 5 protocol tests use hand-authored packet vectors and cover Handshake, Sta
 
 A real Java Edition server smoke test is still required before Phase 5 can be marked complete. Run `cargo run -p cubic-app -- status <host[:port]> [--protocol <number>]` only against a server the tester is authorized to query, then verify the reported version, protocol, players, MOTD, favicon presence, and plausible latency.
 
+## Phase 6
+
+Phase 6 adds 19 tests in `cubic-version` and 3 integration tests in `version-generator`. All tests are synchronous, headless, and contact no network.
+
+`cubic-version` identity tests (5) cover: release and snapshot style IDs accepted as opaque strings; empty, dot, double-dot, and traversal IDs rejected; path separators, control characters, and overlong IDs rejected; Windows-reserved names and filesystem-reserved characters rejected; and the compatibility profile ID restricted namespace.
+
+`cubic-version` model tests (7) cover: current format version accepted and exposed; unsupported format version rejected before typed parsing; malformed, missing, and invalid kind JSON producing distinct structured errors; negative protocol version and invalid compatibility profile rejected; duplicate compatibility profile IDs and duplicate catalog version IDs rejected; serialization producing canonical, newline-terminated, byte-identical output for different insertion orders; and catalog ordering and multi-result protocol lookup being deterministic.
+
+`cubic-version` store tests (7) cover: exact version lookup returning `Some` or `None` explicitly; protocol lookup returning zero, one, or multiple results in version-ID order (exercising a shared protocol number across a release and a snapshot); release and snapshot datasets coexisting in deterministic sorted order; catalog generation producing byte-identical output across repeated runs; catalog/dataset protocol mismatch detected on open; directory/declared version ID mismatch detected during catalog build; and oversized metadata rejected before JSON parsing.
+
+`version-generator` CLI tests (3) cover: `validate` accepting consistent synthetic data and reporting the correct count; `validate` rejecting inconsistent data (protocol mismatch written after fixture copy) with a non-zero exit code; and `build-catalog` producing byte-identical output across runs.
+
+All tests use synthetic fixtures under `crates/cubic-version/tests/fixtures/version-data`: two releases (`cubic-test-release-a` with protocol 9000, `cubic-test-release-b` with protocol 9001 and one compatibility profile) and one snapshot (`cubic-test-snapshot` with protocol 9000 and one compatibility profile). The two versions sharing protocol 9000 exercise multi-result lookup. Tests that mutate fixtures copy them to temporary directories and clean up on drop.
+
 ## Future testing
 
 - Unit tests will cover isolated logic and error cases.

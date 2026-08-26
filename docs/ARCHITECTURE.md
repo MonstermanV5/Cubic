@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes current and intended boundaries. Phases 1-4 implement the repository scaffold, native clear-frame graphics bootstrap, transport-independent protocol primitives, and raw Java Edition NBT. Phase 5 adds only the Java Edition server-list Status exchange. Minecraft game systems remain unimplemented.
+This document describes current and intended boundaries. Phases 1-4 implement the repository scaffold, native clear-frame graphics bootstrap, transport-independent protocol primitives, and raw Java Edition NBT. Phase 5 adds only the Java Edition server-list Status exchange. Phase 6 adds the `cubic-version` runtime library and the `version-generator` offline tool. Minecraft game systems remain unimplemented.
 
 ## Workspace responsibilities
 
@@ -8,13 +8,13 @@ This document describes current and intended boundaries. Phases 1-4 implement th
 - `cubic-core`: platform-independent, high-level client/engine state and shared abstractions.
 - `cubic-protocol`: owns the synchronous binary reader/writer, structured codec errors, bounded primitive codecs, incremental uncompressed packet framing, bounded raw Java Edition NBT, and the isolated Phase 5 Handshake/Status packet codecs. It contains no sockets, async runtime, login/play schemas, compression, or version selection.
 - `cubic-network`: owns Phase 5's asynchronous TCP status-query workflow, strict server-address parsing, timeouts, frame-stream integration, and typed query errors. It does not own protocol byte layouts.
-- `cubic-version`: future Minecraft version metadata and loading of generated version data.
+- `cubic-version`: Minecraft version metadata, typed version/protocol/schema identifiers, release and snapshot kinds, compatibility profile identifiers, bounded filesystem-backed version-data store, catalog loading and validation. Synchronous, transport-independent, and free of rendering, world state, and platform dependencies.
 - `cubic-resources`: future resource-pack resolution, resource lookup, and caching.
 - `cubic-world`: future world, chunk, block, biome, and entity state.
 - `cubic-render`: owns the Phase 2 wgpu instance, adapter/device/queue, presentation surface, resizing, clear-frame submission, and surface recovery. Future rendering remains unimplemented.
 - `cubic-ui`: future application, HUD, menu, and chat UI.
 - `cubic-platform`: owns the winit event loop, native window lifecycle, redraw scheduling, suspension, and the isolated future iOS host handoff.
-- `version-generator`: future development/build utility that converts external Minecraft metadata into Cubic's internal version-data format.
+- `version-generator`: offline development/build utility that validates installed version datasets and builds a deterministic catalog from on-disk version data. Depends only on `cubic-version`; performs no network access.
 
 ## Dependency direction
 
