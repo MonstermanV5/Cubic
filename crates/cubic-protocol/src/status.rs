@@ -4,16 +4,20 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{CodecError, CodecReader, CodecWriter, StringLimits, encode_frame, split_raw_packet};
+use crate::{
+    CodecError, CodecReader, CodecWriter, StringLimits, encode_frame,
+    handshake::{Handshake, HandshakeNextState, encode_handshake},
+    split_raw_packet,
+};
 
-pub const HANDSHAKE_PACKET_ID: i32 = 0;
 pub const STATUS_REQUEST_PACKET_ID: i32 = 0;
 pub const STATUS_RESPONSE_PACKET_ID: i32 = 0;
 pub const PING_PACKET_ID: i32 = 1;
 pub const PONG_PACKET_ID: i32 = 1;
-pub const STATUS_NEXT_STATE: i32 = 1;
+pub const HANDSHAKE_PACKET_ID: i32 = crate::handshake::HANDSHAKE_PACKET_ID;
+pub const STATUS_NEXT_STATE: i32 = HandshakeNextState::Status as i32;
+pub const MAX_HANDSHAKE_HOST_UTF16_UNITS: usize = crate::handshake::MAX_HANDSHAKE_HOST_UTF16_UNITS;
 pub const STATUS_PROBE_PROTOCOL_VERSION: i32 = -1;
-pub const MAX_HANDSHAKE_HOST_UTF16_UNITS: usize = 255;
 pub const MAX_STATUS_JSON_UTF16_UNITS: usize = 32_767;
 pub const MAX_STATUS_JSON_ENCODED_BYTES: usize = MAX_STATUS_JSON_UTF16_UNITS * 3;
 pub const MAX_STATUS_FRAME_SIZE: usize = 128 * 1024;
@@ -158,19 +162,15 @@ struct WireStatusPlayerSample {
 }
 
 pub fn encode_status_handshake(handshake: &StatusHandshake<'_>) -> Result<Vec<u8>, CodecError> {
-    let mut writer = CodecWriter::new();
-    writer.write_var_int(HANDSHAKE_PACKET_ID);
-    writer.write_var_int(handshake.protocol_version);
-    writer.write_string(
-        handshake.server_address,
-        StringLimits::new(
-            MAX_HANDSHAKE_HOST_UTF16_UNITS,
-            MAX_HANDSHAKE_HOST_UTF16_UNITS * 3,
-        ),
-    )?;
-    writer.write_u16(handshake.server_port);
-    writer.write_var_int(STATUS_NEXT_STATE);
-    encode_frame(writer.as_slice(), MAX_STATUS_FRAME_SIZE)
+    encode_handshake(
+        &Handshake {
+            protocol_version: handshake.protocol_version,
+            server_address: handshake.server_address,
+            server_port: handshake.server_port,
+            next_state: HandshakeNextState::Status,
+        },
+        MAX_STATUS_FRAME_SIZE,
+    )
 }
 
 pub fn encode_status_request() -> Result<Vec<u8>, CodecError> {

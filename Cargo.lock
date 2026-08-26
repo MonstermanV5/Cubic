@@ -267,6 +267,7 @@ name = "cubic-network"
 version = "0.1.0"
 dependencies = [
  "cubic-protocol",
+ "cubic-version",
  "thiserror 2.0.20",
  "tokio",
 ]

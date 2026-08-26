@@ -1,13 +1,13 @@
 # Architecture
 
-This document describes current and intended boundaries. Phases 1-4 implement the repository scaffold, native clear-frame graphics bootstrap, transport-independent protocol primitives, and raw Java Edition NBT. Phase 5 adds only the Java Edition server-list Status exchange. Phase 6 adds the `cubic-version` runtime library and the `version-generator` offline tool. Minecraft game systems remain unimplemented.
+This document describes current and intended boundaries. Phases 1-4 implement the repository scaffold, native clear-frame graphics bootstrap, transport-independent protocol primitives, and raw Java Edition NBT. Phase 5 adds the Java Edition server-list Status exchange. Phase 6 adds the `cubic-version` runtime library and the `version-generator` offline tool. Phase 7 adds a narrow development-only offline login bootstrap for Java 26.1.2 / protocol 775. Minecraft game systems remain unimplemented.
 
 ## Workspace responsibilities
 
-- `cubic-app`: final executable and application composition root. With no arguments it delegates to the graphical platform layer; its `status` subcommand creates the small async runtime used by `cubic-network`.
+- `cubic-app`: final executable and application composition root. With no arguments it delegates to the graphical platform layer; its `status` and `dev-login` subcommands create the small async runtime used by `cubic-network`.
 - `cubic-core`: platform-independent, high-level client/engine state and shared abstractions.
-- `cubic-protocol`: owns the synchronous binary reader/writer, structured codec errors, bounded primitive codecs, incremental uncompressed packet framing, bounded raw Java Edition NBT, and the isolated Phase 5 Handshake/Status packet codecs. It contains no sockets, async runtime, login/play schemas, compression, or version selection.
-- `cubic-network`: owns Phase 5's asynchronous TCP status-query workflow, strict server-address parsing, timeouts, frame-stream integration, and typed query errors. It does not own protocol byte layouts.
+- `cubic-protocol`: owns the synchronous binary reader/writer, structured codec errors, bounded primitive codecs, incremental uncompressed packet framing, bounded raw Java Edition NBT, a shared Handshake codec, Status codecs, and the isolated temporary protocol-775 Login/Configuration bootstrap profile. It contains no sockets, async runtime, compression, authentication, or general Play schemas.
+- `cubic-network`: owns asynchronous TCP connection, shared framed transport, strict server-address parsing, deadlines, Phase 5 Status sequencing, and the Phase 7 Login/Configuration state machine. It depends on typed identities from `cubic-version` but does not own protocol byte layouts.
 - `cubic-version`: Minecraft version metadata, typed version/protocol/schema identifiers, release and snapshot kinds, compatibility profile identifiers, bounded filesystem-backed version-data store, catalog loading and validation. Synchronous, transport-independent, and free of rendering, world state, and platform dependencies.
 - `cubic-resources`: future resource-pack resolution, resource lookup, and caching.
 - `cubic-world`: future world, chunk, block, biome, and entity state.
@@ -18,9 +18,9 @@ This document describes current and intended boundaries. Phases 1-4 implement th
 
 ## Dependency direction
 
-`cubic-app` is the composition root and currently depends on `cubic-core`, `cubic-platform`, and `cubic-network`. `cubic-network` depends on `cubic-protocol`; the protocol crate does not depend on the network crate or Tokio. `cubic-platform` depends on `cubic-render` to service native redraw events. `cubic-render` depends on cross-platform winit window handles and wgpu, but not on `cubic-platform` or `cubic-app`. `cubic-core` remains independent. Lower-level crates must not depend on `cubic-app`, and dependencies must remain acyclic.
+`cubic-app` is the composition root and currently depends on `cubic-core`, `cubic-platform`, and `cubic-network`. `cubic-network` depends on `cubic-protocol` and `cubic-version`; neither lower-level crate depends on the network crate or Tokio. `cubic-platform` depends on `cubic-render` to service native redraw events. `cubic-render` depends on cross-platform winit window handles and wgpu, but not on `cubic-platform` or `cubic-app`. `cubic-core` remains independent. Lower-level crates must not depend on `cubic-app`, and dependencies must remain acyclic.
 
-`cubic-protocol` remains independent of the application, platform, renderer, async runtime, and network transport. `cubic-network` feeds arbitrary TCP fragments into its synchronous frame decoder and gives completed frame bodies to the narrow Status codecs. A future generated packet-schema layer may consume completed frame bodies and decode NBT directly from the same primitive reader without copying the remainder of a packet. Root-format selection is an explicit call-site choice, not a Minecraft-version check inside NBT.
+`cubic-protocol` remains independent of the application, platform, renderer, async runtime, and network transport. `cubic-network` feeds arbitrary TCP fragments into its synchronous frame decoder and gives completed frame bodies to state-specific codecs. A future generated packet-schema layer may consume completed frame bodies and decode NBT directly from the same primitive reader without copying the remainder of a packet. Root-format selection is an explicit call-site choice, not a Minecraft-version check inside NBT.
 
 The current Status path is deliberately separate from the graphical lifecycle:
 
@@ -30,6 +30,16 @@ cubic-app status -> cubic-network -> Tokio TCP/DNS and timeouts
 ```
 
 It performs no renderer, window, world, authentication, or resource work. See `NETWORKING.md` for the exact exchange and limitations.
+
+The Phase 7 path is similarly separate:
+
+```text
+cubic-app dev-login -> cubic-network state machine and framed TCP transport
+                    -> cubic-version typed version/protocol identity
+                    -> cubic-protocol protocol-775 bootstrap packet profile
+```
+
+All manually authored 26.1.2 packet IDs and layouts live in the single `cubic_protocol::bootstrap::v775` module. Phase 12 will replace or absorb that temporary profile with generated packet data. Network and engine code must not grow scattered version strings, numeric protocol checks, or giant version match statements.
 
 Platform-specific implementations belong in `cubic-platform` or clearly marked platform-specific modules. Shared engine and rendering code do not assume Windows or iOS APIs. The only current target-specific source is the future native-host handoff in `cubic-platform::ios`.
 

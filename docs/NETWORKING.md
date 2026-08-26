@@ -1,6 +1,6 @@
-# Phase 5 Server Status Networking
+# Phase 5 Status and Phase 7 Development Login Networking
 
-Phase 5 implements only the Java Edition server-list Status exchange. It proves that Cubic can connect over TCP, use its existing incremental framing safely, decode a bounded server response, and validate a latency Pong. It is not a general Minecraft connection layer.
+Phase 5 implements the Java Edition server-list Status exchange. Phase 7 retains that behavior and extracts the shared TCP/framing mechanics into a small `MinecraftConnection`, then adds the narrowly scoped development-login state machine described below. This is still not persistent general Play networking.
 
 ## Ownership and flow
 
@@ -17,7 +17,28 @@ parse address
   -> typed result plus monotonic elapsed latency
 ```
 
-The same `FrameDecoder` is retained across both reads. Consequently a split length prefix or body is reconstructed incrementally, and bytes belonging to a later frame remain buffered without repeatedly copying the entire input. Reads use an 8 KiB scratch buffer. The latency measurement starts immediately before writing Ping and ends after a valid Pong is decoded, using Tokio's monotonic `Instant`.
+The shared connection retains one `FrameDecoder` across reads. Consequently a split length prefix or body is reconstructed incrementally, and bytes belonging to a later frame remain buffered without repeatedly copying the entire input. Reads use an 8 KiB scratch buffer. The Status latency measurement starts immediately before writing Ping and ends after a valid Pong is decoded, using Tokio's monotonic `Instant`.
+
+## Phase 7 development login
+
+The explicit connection states are `Handshake`, `Login`, `Configuration`, `Play`, and `Closed`; state transitions are validated rather than inferred from arbitrary incoming IDs. The implemented flow is:
+
+```text
+Handshake(next state = Login, protocol 775)
+  -> Login Start(name, zero UUID for offline assignment)
+  <- Login Success
+  -> Login Acknowledged
+  -> Client Information
+  <-> bounded Configuration requests/responses
+  <- Finish Configuration
+  -> Finish Configuration acknowledgement
+  <- initial Play Login packet
+  -> report Play reached and close
+```
+
+Login Plugin Requests are declined and cookie requests receive an empty cookie. Configuration Keep Alive and Ping are echoed correctly. Known Packs receives an empty list, which tells vanilla to transmit full registry data; Cubic accepts the complete bounded registry frame but does not parse or retain registries because Phase 11 owns that model. Other complete future-state packets listed in `PROTOCOL.md` are bounded and skipped. Encryption Request and Set Compression produce errors that name `online-mode=false` and `network-compression-threshold=-1` respectively. Server resource packs, transfer, and configured code-of-conduct prompts are also explicit unsupported errors.
+
+The built-in `DevLoginProtocolProfile` uses `MinecraftVersionId("26.1.2")` and `ProtocolVersion(775)` from `cubic-version`; it is the sole selection point. The packet IDs remain in `cubic_protocol::bootstrap::v775`. This boundary is temporary until Phase 12 packet generation and does not require an installed Phase 6 dataset.
 
 ## Address and protocol behavior
 
@@ -41,6 +62,8 @@ Default policy is:
 
 The JSON-wide cap is enforced before JSON parsing. More specific caps are enforced after structural decoding, while still operating within that global bound. Errors distinguish invalid addresses, resolution/connect failures, connect timeout, phase timeout, overall timeout, I/O failure, premature disconnect, malformed framing, oversized Status frames, malformed/invalid JSON or packet data, and Pong mismatch. Tokio exposes name-resolution and connect failures through the same connection operation, so those share one source-bearing error category.
 
+Development-login defaults are a 3-second connect timeout, a 5-second deadline for each read or write, and a 20-second overall Login-plus-Configuration deadline. Uncompressed frames are capped at 2,097,151 bytes and accumulated framed input at 4 MiB. Usernames are 1-16 ASCII letters, digits, or underscores. Login profile properties and Known Packs are capped at 64 entries; disconnect reasons are capped at 32 KiB on input and 512 displayed characters; custom payloads are bounded; Login and Configuration also have 64- and 2,048-packet progress limits. Malformed input, unexpected state packet IDs, EOF, per-operation timeout, overall timeout, server disconnect, unsupported settings/features, profile mismatch, and invalid state transitions have structured errors.
+
 Required JSON fields are `version`, `players`, and `description`. The player sample and favicon are optional. Unknown top-level fields and the original bounded JSON text are preserved. Rich descriptions remain JSON values because chat-component interpretation belongs to a later UI/text phase. Cubic never decodes or renders favicon data in Phase 5.
 
 ## Running and testing
@@ -57,8 +80,17 @@ A status query is explicit:
 cargo run -p cubic-app -- status <host[:port]> [--protocol <number>]
 ```
 
-Automated coverage uses only an in-process mock TCP server and never reaches a public Minecraft server. A tester must run the command against an authorized real Java Edition server and compare the output with expected server-list data before Phase 5 can move from partial to complete.
+Automated coverage uses only an in-process mock TCP server and never reaches a public Minecraft server. Phase 5's separate authorized real-server smoke test is recorded as complete.
+
+A Phase 7 development login is explicit and does not open the graphical window:
+
+```text
+cargo run -p cubic-app -- dev-login localhost:25565
+cargo run -p cubic-app -- dev-login localhost:25565 --username CubicTest
+```
+
+The real acceptance test passed against vanilla Java Edition 26.1.2 at `localhost:25565`, configured with `online-mode=false` and `network-compression-threshold=-1`. Cubic completed Login and Configuration, reported `State: Play`, and the vanilla server logged that `CubicTest` joined and spawned into the world before Cubic deliberately disconnected. The first setting avoided Phase 9 authentication/encryption and the second kept framing uncompressed. Automated tests still never start, download, or contact a real server.
 
 ## Deliberate exclusions
 
-Phase 5 does not implement DNS SRV records, reusable/persistent connections, compression, encryption, authentication, login/play configuration states, packet generation, NBT-over-network use, proxy protocols, server icons, rich text rendering, automatic version selection, or any gameplay. It does not modify the render thread or graphical lifecycle.
+Phase 7 does not implement DNS SRV records, persistent Play connections, compression, encryption, authentication, session servers, packet generation, registry models, resource packs, proxy protocols, rich text rendering, automatic version selection, or any gameplay. It does not modify the render thread or graphical lifecycle. Phase 8 will own the first useful persistent post-login behavior.

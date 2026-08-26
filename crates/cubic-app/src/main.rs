@@ -1,6 +1,9 @@
 use std::{process::ExitCode, str::FromStr};
 
-use cubic_network::{ServerAddress, StatusQueryOptions, query_server_status};
+use cubic_network::{
+    DevelopmentLoginOptions, DevelopmentUsername, ServerAddress, StatusQueryOptions,
+    development_login, query_server_status,
+};
 
 fn main() -> ExitCode {
     if let Err(error) = tracing_subscriber::fmt()
@@ -17,7 +20,7 @@ fn main() -> ExitCode {
         Ok(command) => command,
         Err(message) => {
             eprintln!(
-                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]"
+                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]\n  cubic-app dev-login <host[:port]> [--username <name>]"
             );
             return ExitCode::FAILURE;
         }
@@ -26,6 +29,41 @@ fn main() -> ExitCode {
     match command {
         Command::Graphical => run_graphical(),
         Command::Status { address, protocol } => run_status(&address, protocol),
+        Command::DevLogin { address, username } => run_development_login(&address, &username),
+    }
+}
+
+fn run_development_login(address: &ServerAddress, username: &DevelopmentUsername) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "could not create development-login runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(development_login(
+        address,
+        username,
+        &DevelopmentLoginOptions::default(),
+    )) {
+        Ok(result) => {
+            println!("Cubic Development Login\n");
+            println!("Address: {}", result.address);
+            println!("Version: {}", result.minecraft_version);
+            println!("Protocol: {}", result.protocol_version);
+            println!("Username: {}", result.username);
+            println!("Login: success");
+            println!("Configuration: complete");
+            println!("State: {}", result.state);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            tracing::error!(%error, address = %address, "development login failed");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -104,6 +142,10 @@ enum Command {
         address: ServerAddress,
         protocol: i32,
     },
+    DevLogin {
+        address: ServerAddress,
+        username: DevelopmentUsername,
+    },
 }
 
 fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command, String> {
@@ -111,6 +153,9 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     let Some(command) = arguments.next() else {
         return Ok(Command::Graphical);
     };
+    if command == "dev-login" {
+        return parse_development_login(arguments);
+    }
     if command != "status" {
         return Err(format!("unknown command {command:?}"));
     }
@@ -134,6 +179,27 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         return Err(format!("unexpected argument {extra:?}"));
     }
     Ok(Command::Status { address, protocol })
+}
+
+fn parse_development_login(mut arguments: impl Iterator<Item = String>) -> Result<Command, String> {
+    let target = arguments
+        .next()
+        .ok_or_else(|| "dev-login command requires a server address".to_owned())?;
+    let address = ServerAddress::from_str(&target).map_err(|error| error.to_string())?;
+    let mut username = DevelopmentUsername::new("CubicTest").map_err(|error| error.to_string())?;
+    if let Some(option) = arguments.next() {
+        if option != "--username" {
+            return Err(format!("unknown dev-login option {option:?}"));
+        }
+        let value = arguments
+            .next()
+            .ok_or_else(|| "--username requires a value".to_owned())?;
+        username = DevelopmentUsername::new(value).map_err(|error| error.to_string())?;
+    }
+    if let Some(extra) = arguments.next() {
+        return Err(format!("unexpected argument {extra:?}"));
+    }
+    Ok(Command::DevLogin { address, username })
 }
 
 #[cfg(test)]
@@ -171,6 +237,42 @@ mod tests {
                 "status".to_owned(),
                 "localhost".to_owned(),
                 "--protocol".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn development_login_defaults_and_accepts_an_explicit_username() {
+        let default = parse_command(["dev-login".to_owned(), "localhost".to_owned()]).unwrap();
+        let Command::DevLogin { address, username } = default else {
+            panic!("expected development login command");
+        };
+        assert_eq!(address.port(), 25_565);
+        assert_eq!(username.as_str(), "CubicTest");
+
+        let explicit = parse_command([
+            "dev-login".to_owned(),
+            "localhost:25570".to_owned(),
+            "--username".to_owned(),
+            "Cubic_7".to_owned(),
+        ])
+        .unwrap();
+        let Command::DevLogin { username, .. } = explicit else {
+            panic!("expected development login command");
+        };
+        assert_eq!(username.as_str(), "Cubic_7");
+    }
+
+    #[test]
+    fn development_login_rejects_invalid_arguments() {
+        assert!(parse_command(["dev-login".to_owned()]).is_err());
+        assert!(
+            parse_command([
+                "dev-login".to_owned(),
+                "localhost".to_owned(),
+                "--username".to_owned(),
+                "bad name".to_owned(),
             ])
             .is_err()
         );

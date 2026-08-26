@@ -48,14 +48,22 @@ Phase 6 adds 19 tests in `cubic-version` and 3 integration tests in `version-gen
 
 All tests use synthetic fixtures under `crates/cubic-version/tests/fixtures/version-data`: two releases (`cubic-test-release-a` with protocol 9000, `cubic-test-release-b` with protocol 9001 and one compatibility profile) and one snapshot (`cubic-test-snapshot` with protocol 9000 and one compatibility profile). The two versions sharing protocol 9000 exercise multi-result lookup. Tests that mutate fixtures copy them to temporary directories and clean up on drop.
 
+## Phase 7
+
+Phase 7 adds independent hand-authored protocol-775 vectors for the Login Handshake, Login Start, Login Success, acknowledgements, plugin/cookie responses, Client Information, Keep Alive, Pong, Known Packs, Finish Configuration, and initial Play Login identification. Malformed Login Success, unexpected IDs, excessive Known Packs, malformed disconnect NBT, and empty/wrong initial Play packets assert structured failures.
+
+`cubic-network` tests use only an in-process Tokio TCP listener. They verify the exact handshake protocol/host/port/Login next-state and Login Start username/zero UUID, successful Login-to-Configuration-to-Play progression, Login Acknowledged, Client Information, declined plugin negotiation, empty Known Packs, keepalive/ping replies, bounded skip behavior, fragmented packets, coalesced packets, Login and Configuration disconnects, unexpected and malformed packets, Encryption/Compression rejection, EOF in each state, individual and overall timeouts, and oversized framing. The existing Phase 5 Status suite runs unchanged against the extracted shared transport.
+
+No automated test downloads, starts, or contacts a Minecraft server. The required manual Phase 7 acceptance test passed against vanilla 26.1.2 at `localhost:25565` with `online-mode=false` and `network-compression-threshold=-1`. Running `cargo run -p cubic-app -- dev-login localhost:25565 --username CubicTest` completed Login and Configuration and reported `State: Play`; the vanilla server logged that `CubicTest` joined and spawned into the world before Cubic deliberately disconnected.
+
 ## Future testing
 
 - Unit tests will cover isolated logic and error cases.
 - Property tests will cover parsers, codecs, and other invariant-heavy code where suitable.
 - Integration tests will verify interactions across crate boundaries.
 - Full packet-schema fixtures will later cover known valid and malformed packets without containing copyrighted game assets. Phase 3 already includes small public wire-format vectors for primitive codecs.
-- Mock-server tests already exercise the Phase 5 Status exchange; broader state and adverse-network simulations remain future work.
-- Real vanilla-server tests will validate end-to-end compatibility in controlled environments. The Phase 5 manual smoke test is not yet recorded as complete.
+- Mock-server tests exercise the Phase 5 Status and Phase 7 development Login/Configuration exchanges; persistent Play simulations remain future work.
+- Real vanilla-server tests validate end-to-end compatibility in controlled environments. The Phase 5 and Phase 7 manual smoke tests passed.
 - Rendering regression tests will later compare deterministic scenes or render outputs.
 - Performance benchmarks will later track hot paths and memory behavior.
 - Every previously supported Minecraft version must eventually remain regression-tested as new versions are added.

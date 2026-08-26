@@ -1,6 +1,6 @@
 # Protocol Primitive Foundation
 
-Phase 3 implements synchronous Minecraft: Java Edition binary primitives and uncompressed packet framing in `cubic-protocol`. Phase 4 adds raw Java Edition NBT. Phase 5 adds only the small Handshake and Status packet codecs required for a server-list query. TCP and timeout policy remain in `cubic-network`.
+Phase 3 implements synchronous Minecraft: Java Edition binary primitives and uncompressed packet framing in `cubic-protocol`. Phase 4 adds raw Java Edition NBT. Phase 5 adds the small Status codecs. Phase 7 generalizes Handshake next-state selection and adds one isolated, temporary Java 26.1.2 / protocol 775 Login/Configuration bootstrap profile. TCP and timeout policy remain in `cubic-network`.
 
 ## Layer boundary
 
@@ -11,7 +11,15 @@ future TCP transport -> uncompressed frame decoder -> completed frame body
                      -> raw packet ID/payload split -> future packet schema codec
 ```
 
-The framing, primitive-codec, raw NBT, and isolated Status codecs exist. The raw packet helper otherwise separates a VarInt ID from uninterpreted payload bytes without assigning meaning to it. NBT can decode directly from a `CodecReader`, leaving subsequent packet fields unread. General packet schemas, compression, encryption, login, and play-state semantics are not implemented.
+The framing, primitive-codec, raw NBT, Status, and temporary protocol-775 bootstrap codecs exist. The raw packet helper otherwise separates a VarInt ID from uninterpreted payload bytes without assigning meaning to it. NBT can decode directly from a `CodecReader`, leaving subsequent packet fields unread. General generated packet schemas, compression, encryption, authentication, and Play semantics are not implemented.
+
+## Phase 7 protocol-775 bootstrap profile
+
+`cubic_protocol::bootstrap::v775` is the only production module containing the manually authored packet IDs and layouts needed by Phase 7. It implements Login Start with a bounded 16-character ASCII development username and a 128-bit UUID, Login Disconnect, Encryption Request classification, Login Success, Set Compression classification, Login Plugin Request, Login Cookie Request, and their minimal responses. The client supplies an all-zero UUID in Login Start so the offline-mode vanilla server performs its normal offline profile assignment; Login Success must return the requested name and a non-zero UUID.
+
+Configuration semantically handles Client Information, cookie requests, bounded custom payloads, Disconnect NBT, Finish Configuration, Keep Alive, Ping/Pong, and Known Packs. Cubic answers Known Packs with an empty list because it possesses no generated packs yet. Complete bounded Reset Chat, Registry Data, Resource Pack Pop, Store Cookie, Enabled Features, Update Tags, Report Details, Server Links, Clear Dialog, and Show Dialog frames are skipped without constructing future registry/UI models. Resource Pack Push, Transfer, and Code of Conduct are explicit Phase 7 unsupported errors rather than being silently accepted. After acknowledging Finish Configuration, the bootstrap validates protocol 775's initial clientbound Play Login packet (`0x31`) and then stops; it does not decode that packet's fields or implement Play networking.
+
+The packet mapping was cross-checked against the [VoidMC 26.1.2 Handshake](https://voidminecraft.github.io/VoidMC/reference/protocol-specs/v26.1.2/handshake.html), [Login](https://voidminecraft.github.io/VoidMC/reference/protocol-specs/v26.1.2/login.html), [Configuration](https://voidminecraft.github.io/VoidMC/reference/protocol-specs/v26.1.2/configuration.html), and [Play clientbound](https://voidminecraft.github.io/VoidMC/reference/protocol-specs/v26.1.2/play-clientbound.html) tables, plus the independently generated [go-theft-craft v26_1 package](https://pkg.go.dev/github.com/go-theft-craft/minecraft-protocol/generated/java/v26_1). The [PrismarineJS protocol-775 tracking issue](https://github.com/PrismarineJS/mineflayer/issues/3888) was used as a caution that carried-forward packet mappings can be wrong, not as the sole packet source. Mojang source code is not copied.
 
 ## Phase 5 Status packets
 
@@ -55,4 +63,4 @@ The decoder does not provide transport backpressure or connection recovery polic
 - `RawPacket` and `split_raw_packet`: schema-neutral packet ID/payload separation.
 - `nbt`: raw Java Edition NBT values, Modified UTF-8, explicit named/unnamed compound roots, and bounded encoding/decoding. See `NBT.md`.
 
-Minecraft-version-specific packet IDs and behavior do not belong in this layer. If a future protocol version changes a primitive representation, it should gain an isolated version-specific codec rather than silently changing unrelated primitives.
+Minecraft-version-specific packet IDs and behavior must not be scattered through this layer. Phase 7's single `bootstrap::v775` exception is intentionally isolated and temporary. If a future protocol version changes a primitive representation, it should gain an isolated version-specific codec rather than silently changing unrelated primitives; general packet mappings belong to Phase 12 generation.

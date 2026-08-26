@@ -1,8 +1,11 @@
 //! Safe, synchronous Minecraft Java binary protocol primitives.
 //!
-//! This crate contains no transport, packet schemas, packet IDs, compression,
-//! encryption, authentication, or version-specific behavior.
+//! This crate contains no transport, compression, encryption, authentication,
+//! or general generated packet schemas. The manually authored protocol-775
+//! bootstrap is a narrow Phase 7 exception that Phase 12 will replace or absorb.
 
+pub mod bootstrap;
+pub mod handshake;
 pub mod nbt;
 pub mod status;
 

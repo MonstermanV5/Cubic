@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 cubic-protocol = { path = "../cubic-protocol" }
+cubic-version = { path = "../cubic-version" }
 thiserror.workspace = true
 tokio.workspace = true
 

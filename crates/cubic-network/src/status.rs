@@ -4,23 +4,21 @@ use std::{
 };
 
 use cubic_protocol::{
-    CodecError, FrameDecoder, FrameLimits,
+    CodecError, FrameLimits,
     status::{
         MAX_STATUS_FRAME_SIZE, STATUS_PROBE_PROTOCOL_VERSION, StatusHandshake, StatusJsonLimits,
         StatusResponse, decode_status_pong, decode_status_response, encode_status_handshake,
         encode_status_ping, encode_status_request,
     },
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    time::{Instant, timeout},
+use tokio::time::{Instant, timeout};
+
+use crate::{
+    ServerAddress, StatusQueryError,
+    connection::{ConnectionError, MinecraftConnection},
 };
 
-use crate::{ServerAddress, StatusQueryError};
-
 const MAX_STATUS_BUFFERED_BYTES: usize = 256 * 1024;
-const READ_BUFFER_SIZE: usize = 8 * 1024;
 static NEXT_PING_NONCE: AtomicI64 = AtomicI64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,25 +67,12 @@ async fn query_inner(
     address: &ServerAddress,
     options: &StatusQueryOptions,
 ) -> Result<ServerStatus, StatusQueryError> {
-    if options.connect_timeout.is_zero() {
-        return Err(StatusQueryError::ConnectTimeout {
-            timeout: options.connect_timeout,
-        });
-    }
-    let mut stream = match timeout(
-        options.connect_timeout,
-        TcpStream::connect(address.socket_target()),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(source)) => return Err(StatusQueryError::ConnectFailed { source }),
-        Err(_) => {
-            return Err(StatusQueryError::ConnectTimeout {
-                timeout: options.connect_timeout,
-            });
-        }
-    };
+    let limits = FrameLimits::new(MAX_STATUS_FRAME_SIZE, MAX_STATUS_BUFFERED_BYTES)
+        .map_err(StatusQueryError::Framing)?;
+    let mut connection =
+        MinecraftConnection::connect(address, options.connect_timeout, options.io_timeout, limits)
+            .await
+            .map_err(map_connection_error)?;
 
     let handshake = encode_status_handshake(&StatusHandshake {
         protocol_version: options.handshake_protocol_version,
@@ -96,31 +81,19 @@ async fn query_inner(
     })
     .map_err(StatusQueryError::Framing)?;
     let request = encode_status_request().map_err(StatusQueryError::Framing)?;
-    write_all(
-        &mut stream,
-        &handshake,
-        options.io_timeout,
-        "Handshake write",
-    )
-    .await?;
-    write_all(
-        &mut stream,
-        &request,
-        options.io_timeout,
-        "Status Request write",
-    )
-    .await?;
+    connection
+        .write_all(&handshake, "Handshake write")
+        .await
+        .map_err(map_connection_error)?;
+    connection
+        .write_all(&request, "Status Request write")
+        .await
+        .map_err(map_connection_error)?;
 
-    let limits = FrameLimits::new(MAX_STATUS_FRAME_SIZE, MAX_STATUS_BUFFERED_BYTES)
-        .map_err(StatusQueryError::Framing)?;
-    let mut decoder = FrameDecoder::new(limits);
-    let response_frame = read_with_timeout(
-        &mut stream,
-        &mut decoder,
-        options.io_timeout,
-        "Status Response",
-    )
-    .await?;
+    let response_frame = connection
+        .read_frame("Status Response")
+        .await
+        .map_err(map_status_response_error)?;
     let response = decode_status_response(&response_frame, options.json_limits)?;
 
     let nonce = options
@@ -128,9 +101,14 @@ async fn query_inner(
         .unwrap_or_else(|| NEXT_PING_NONCE.fetch_add(1, Ordering::Relaxed));
     let ping = encode_status_ping(nonce).map_err(StatusQueryError::Framing)?;
     let ping_started = Instant::now();
-    write_all(&mut stream, &ping, options.io_timeout, "Ping write").await?;
-    let pong_frame =
-        read_with_timeout(&mut stream, &mut decoder, options.io_timeout, "Pong").await?;
+    connection
+        .write_all(&ping, "Ping write")
+        .await
+        .map_err(map_connection_error)?;
+    let pong_frame = connection
+        .read_frame("Pong")
+        .await
+        .map_err(map_connection_error)?;
     decode_status_pong(&pong_frame, nonce)?;
     let latency = ping_started.elapsed();
 
@@ -141,75 +119,30 @@ async fn query_inner(
     })
 }
 
-async fn write_all(
-    stream: &mut TcpStream,
-    bytes: &[u8],
-    duration: Duration,
-    operation: &'static str,
-) -> Result<(), StatusQueryError> {
-    match timeout(duration, stream.write_all(bytes)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(source)) => Err(StatusQueryError::Io { operation, source }),
-        Err(_) => Err(StatusQueryError::IoTimeout {
-            operation,
-            timeout: duration,
-        }),
+fn map_status_response_error(error: ConnectionError) -> StatusQueryError {
+    match error {
+        ConnectionError::Framing(CodecError::FrameTooLong { length, max }) => {
+            StatusQueryError::StatusResponseTooLarge { length, max }
+        }
+        other => map_connection_error(other),
     }
 }
 
-async fn read_with_timeout(
-    stream: &mut TcpStream,
-    decoder: &mut FrameDecoder,
-    duration: Duration,
-    phase: &'static str,
-) -> Result<Vec<u8>, StatusQueryError> {
-    match timeout(duration, read_next_frame(stream, decoder, phase)).await {
-        Ok(result) => result,
-        Err(_) => Err(StatusQueryError::IoTimeout {
-            operation: phase,
-            timeout: duration,
-        }),
-    }
-}
-
-async fn read_next_frame(
-    stream: &mut TcpStream,
-    decoder: &mut FrameDecoder,
-    phase: &'static str,
-) -> Result<Vec<u8>, StatusQueryError> {
-    let mut read_buffer = [0_u8; READ_BUFFER_SIZE];
-    loop {
-        match decoder.next_frame() {
-            Ok(Some(frame)) => return Ok(frame),
-            Ok(None) => {}
-            Err(CodecError::FrameTooLong { length, max }) if phase == "Status Response" => {
-                return Err(StatusQueryError::StatusResponseTooLarge { length, max });
-            }
-            Err(error) => return Err(StatusQueryError::Framing(error)),
+fn map_connection_error(error: ConnectionError) -> StatusQueryError {
+    match error {
+        ConnectionError::ConnectTimeout { timeout } => StatusQueryError::ConnectTimeout { timeout },
+        ConnectionError::ConnectFailed { source } => StatusQueryError::ConnectFailed { source },
+        ConnectionError::IoTimeout { operation, timeout } => {
+            StatusQueryError::IoTimeout { operation, timeout }
         }
-
-        let read = stream
-            .read(&mut read_buffer)
-            .await
-            .map_err(|source| StatusQueryError::Io {
-                operation: phase,
-                source,
-            })?;
-        if read == 0 {
-            return Err(StatusQueryError::PrematureDisconnect {
-                phase,
-                buffered_bytes: decoder.buffered_len(),
-            });
-        }
-        decoder
-            .push(
-                read_buffer
-                    .get(..read)
-                    .ok_or(StatusQueryError::PrematureDisconnect {
-                        phase,
-                        buffered_bytes: decoder.buffered_len(),
-                    })?,
-            )
-            .map_err(StatusQueryError::Framing)?;
+        ConnectionError::Io { operation, source } => StatusQueryError::Io { operation, source },
+        ConnectionError::PrematureDisconnect {
+            phase,
+            buffered_bytes,
+        } => StatusQueryError::PrematureDisconnect {
+            phase,
+            buffered_bytes,
+        },
+        ConnectionError::Framing(error) => StatusQueryError::Framing(error),
     }
 }
