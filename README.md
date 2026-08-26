@@ -1,3 +1,5 @@
+# Project made almost entirely by AI, including this file. I am testing current AI limits
+
 # Cubic
 
 Cubic is an independent project intended to become a Minecraft: Java Edition-compatible multiplayer client, primarily implemented in Rust.
