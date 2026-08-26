@@ -13,7 +13,7 @@ jobs:
     name: Rust validation
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -25,7 +25,7 @@ jobs:
     name: Windows cubic-app build
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build -p cubic-app
 
@@ -33,7 +33,7 @@ jobs:
     name: Unsigned iOS compile validation
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios

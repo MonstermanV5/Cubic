@@ -18,6 +18,14 @@ Phase 3 adds deterministic known-vector and boundary tests for fixed-width primi
 
 Property tests exercise arbitrary integer and floating-point bit-pattern round trips, bounded Unicode strings, UUID values, representable positions, byte arrays, BitSets, and frame streams split at generated fragmentation boundaries. The framing property verifies exact, ordered reconstruction of multiple frames. Normal tests remain synchronous and headless; no socket, native window, or GPU is needed for protocol tests.
 
+## Phase 4
+
+Phase 4 adds independent hand-authored NBT vectors for named and unnamed roots, numeric payloads, nested compounds, lists, arrays, and Modified UTF-8 edge cases. Round-trip tests cover every tag type and compare floating-point values by raw bits. Modified UTF-8 vectors include NUL, BMP text, supplementary surrogate pairs, and unpaired surrogates.
+
+Malformed-input tests assert structured failures for bad roots and type IDs, truncated names and payloads, malformed Modified UTF-8, invalid and oversized collection lengths, illegal positive TAG_End lists, unknown list types, unterminated compounds, trailing standalone input, excessive depth, total-tag exhaustion, and cumulative resource-budget exhaustion. The reader-based root APIs are separately tested to leave later packet fields available.
+
+Property tests cover arbitrary numeric values and floating-point bits, arbitrary bounded `u16` sequences for lossless Java strings, all array types, homogeneous lists, shallow compounds, and bounded nested compound/list structures. All Phase 4 tests are raw, synchronous, and headless; no Minecraft files, server, socket, compression layer, window, or GPU is involved.
+
 ## Future testing
 
 - Unit tests will cover isolated logic and error cases.
@@ -30,4 +38,4 @@ Property tests exercise arbitrary integer and floating-point bit-pattern round t
 - Performance benchmarks will later track hot paths and memory behavior.
 - Every previously supported Minecraft version must eventually remain regression-tested as new versions are added.
 
-The future suites above do not yet exist unless explicitly identified as Phase 3 coverage. Tests must not be weakened, skipped, deleted, or rewritten simply to make an implementation pass.
+The future suites above do not yet exist unless explicitly identified as Phase 3 or Phase 4 coverage. Tests must not be weakened, skipped, deleted, or rewritten simply to make an implementation pass.

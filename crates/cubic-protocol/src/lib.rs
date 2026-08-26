@@ -3,6 +3,8 @@
 //! This crate contains no transport, packet schemas, packet IDs, compression,
 //! encryption, authentication, or version-specific behavior.
 
+pub mod nbt;
+
 mod bitset;
 mod error;
 mod frame;

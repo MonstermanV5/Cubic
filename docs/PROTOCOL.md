@@ -1,6 +1,6 @@
 # Protocol Primitive Foundation
 
-Phase 3 implements only synchronous Minecraft: Java Edition binary primitives and uncompressed packet framing in `cubic-protocol`. It is a byte-codec foundation for future generated packet schemas, not a network client.
+Phase 3 implements synchronous Minecraft: Java Edition binary primitives and uncompressed packet framing in `cubic-protocol`. Phase 4 adds raw Java Edition NBT on top of the same reader/writer infrastructure. These are byte-codec foundations for future generated packet schemas, not a network client.
 
 ## Layer boundary
 
@@ -11,7 +11,7 @@ future TCP transport -> uncompressed frame decoder -> completed frame body
                      -> raw packet ID/payload split -> future packet schema codec
 ```
 
-Only the framing and primitive-codec portions exist. The optional raw packet helper separates a VarInt ID from uninterpreted payload bytes but assigns no meaning to that ID. TCP, async I/O, connection states, packet schemas, compression, encryption, NBT, login, and status ping are not implemented.
+The framing, primitive-codec, and raw NBT portions exist. The optional raw packet helper separates a VarInt ID from uninterpreted payload bytes but assigns no meaning to that ID. NBT can decode directly from a `CodecReader`, leaving subsequent packet fields unread. TCP, async I/O, connection states, packet schemas, compression, encryption, login, and status ping are not implemented.
 
 ## Wire semantics
 
@@ -40,5 +40,6 @@ The decoder does not provide transport backpressure or connection recovery polic
 - `ProtocolUuid`, `BlockPosition`, and `BitSet`: strongly typed wire values.
 - `FrameDecoder` and `encode_frame`: incremental uncompressed framing.
 - `RawPacket` and `split_raw_packet`: schema-neutral packet ID/payload separation.
+- `nbt`: raw Java Edition NBT values, Modified UTF-8, explicit named/unnamed compound roots, and bounded encoding/decoding. See `NBT.md`.
 
 Minecraft-version-specific packet IDs and behavior do not belong in this layer. If a future protocol version changes a primitive representation, it should gain an isolated version-specific codec rather than silently changing unrelated primitives.
