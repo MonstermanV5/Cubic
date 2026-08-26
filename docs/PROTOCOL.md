@@ -1,6 +1,6 @@
 # Protocol Primitive Foundation
 
-Phase 3 implements synchronous Minecraft: Java Edition binary primitives and uncompressed packet framing in `cubic-protocol`. Phase 4 adds raw Java Edition NBT on top of the same reader/writer infrastructure. These are byte-codec foundations for future generated packet schemas, not a network client.
+Phase 3 implements synchronous Minecraft: Java Edition binary primitives and uncompressed packet framing in `cubic-protocol`. Phase 4 adds raw Java Edition NBT. Phase 5 adds only the small Handshake and Status packet codecs required for a server-list query. TCP and timeout policy remain in `cubic-network`.
 
 ## Layer boundary
 
@@ -11,7 +11,20 @@ future TCP transport -> uncompressed frame decoder -> completed frame body
                      -> raw packet ID/payload split -> future packet schema codec
 ```
 
-The framing, primitive-codec, and raw NBT portions exist. The optional raw packet helper separates a VarInt ID from uninterpreted payload bytes but assigns no meaning to that ID. NBT can decode directly from a `CodecReader`, leaving subsequent packet fields unread. TCP, async I/O, connection states, packet schemas, compression, encryption, login, and status ping are not implemented.
+The framing, primitive-codec, raw NBT, and isolated Status codecs exist. The raw packet helper otherwise separates a VarInt ID from uninterpreted payload bytes without assigning meaning to it. NBT can decode directly from a `CodecReader`, leaving subsequent packet fields unread. General packet schemas, compression, encryption, login, and play-state semantics are not implemented.
+
+## Phase 5 Status packets
+
+The implemented uncompressed packet bodies are deliberately limited to:
+
+- Handshake (`0x00`): protocol-version VarInt, bounded logical server host string, big-endian `u16` port, and next-state VarInt `1` for Status.
+- Status Request (`0x00`): no payload.
+- Status Response (`0x00`): one bounded Minecraft UTF-8 string containing JSON.
+- Ping (`0x01`) and Pong (`0x01`): one big-endian signed 64-bit nonce. A Pong must echo the exact nonce and contain no trailing bytes.
+
+The handshake default is protocol `-1`, a conventional generic status probe rather than a claim that it represents every server. Callers can explicitly select another signed 32-bit protocol number. Cubic does not yet have generated version data or protocol negotiation.
+
+Status JSON requires `version`, `players`, and `description`. Version name/protocol and non-negative online/maximum counts become typed values. The optional player sample and favicon are retained with explicit bounds. `description` remains a `serde_json::Value` so rich chat-component structures are not flattened; unknown top-level fields and the original JSON string are also retained. Favicon text is inert data and is neither decoded nor rendered.
 
 ## Wire semantics
 

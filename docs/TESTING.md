@@ -26,14 +26,22 @@ Malformed-input tests assert structured failures for bad roots and type IDs, tru
 
 Property tests cover arbitrary numeric values and floating-point bits, arbitrary bounded `u16` sequences for lossless Java strings, all array types, homogeneous lists, shallow compounds, and bounded nested compound/list structures. All Phase 4 tests are raw, synchronous, and headless; no Minecraft files, server, socket, compression layer, window, or GPU is involved.
 
+## Phase 5
+
+Phase 5 protocol tests use hand-authored packet vectors and cover Handshake, Status Request/Response, Ping/Pong nonce validation, rich and simple MOTDs, unknown JSON fields, malformed JSON, missing or invalid required fields, wrong packet IDs, trailing payloads, and configured JSON bounds.
+
+`cubic-network` integration tests run only against an in-process Tokio TCP listener. They validate logical handshake host/port preservation, default protocol selection, byte-by-byte fragmentation (including a split multi-byte length prefix), multiple buffered frames, successful ping timing, early EOF, partial frames, malformed and oversized frames, wrong packet IDs/nonces, malformed/invalid Status JSON, and connect/read/overall timeout categories. Address tests cover hostnames, IPv4, bracketed IPv6, default ports, and rejected ambiguous input. No public server is contacted by the automated tests.
+
+A real Java Edition server smoke test is still required before Phase 5 can be marked complete. Run `cargo run -p cubic-app -- status <host[:port]> [--protocol <number>]` only against a server the tester is authorized to query, then verify the reported version, protocol, players, MOTD, favicon presence, and plausible latency.
+
 ## Future testing
 
 - Unit tests will cover isolated logic and error cases.
 - Property tests will cover parsers, codecs, and other invariant-heavy code where suitable.
 - Integration tests will verify interactions across crate boundaries.
 - Full packet-schema fixtures will later cover known valid and malformed packets without containing copyrighted game assets. Phase 3 already includes small public wire-format vectors for primitive codecs.
-- Mock-server tests will later exercise connection behavior deterministically.
-- Real vanilla-server tests will later validate end-to-end compatibility in controlled environments.
+- Mock-server tests already exercise the Phase 5 Status exchange; broader state and adverse-network simulations remain future work.
+- Real vanilla-server tests will validate end-to-end compatibility in controlled environments. The Phase 5 manual smoke test is not yet recorded as complete.
 - Rendering regression tests will later compare deterministic scenes or render outputs.
 - Performance benchmarks will later track hot paths and memory behavior.
 - Every previously supported Minecraft version must eventually remain regression-tested as new versions are added.

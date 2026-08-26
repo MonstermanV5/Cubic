@@ -1,12 +1,13 @@
 # Architecture
 
-This document describes current and intended boundaries. Phases 1-4 implement the repository scaffold, native clear-frame graphics bootstrap, transport-independent protocol primitives, and raw Java Edition NBT. Packet schemas, networking, and Minecraft game systems remain unimplemented.
+This document describes current and intended boundaries. Phases 1-4 implement the repository scaffold, native clear-frame graphics bootstrap, transport-independent protocol primitives, and raw Java Edition NBT. Phase 5 adds only the Java Edition server-list Status exchange. Minecraft game systems remain unimplemented.
 
 ## Workspace responsibilities
 
-- `cubic-app`: final executable and application composition root. It initializes diagnostics and delegates to the platform layer without reusable engine logic.
+- `cubic-app`: final executable and application composition root. With no arguments it delegates to the graphical platform layer; its `status` subcommand creates the small async runtime used by `cubic-network`.
 - `cubic-core`: platform-independent, high-level client/engine state and shared abstractions.
-- `cubic-protocol`: owns the synchronous binary reader/writer, structured codec errors, bounded primitive codecs, incremental uncompressed packet framing, and Phase 4's bounded raw Java Edition NBT codec. It contains no transport, connection state, packet-schema semantics, compression, or version selection.
+- `cubic-protocol`: owns the synchronous binary reader/writer, structured codec errors, bounded primitive codecs, incremental uncompressed packet framing, bounded raw Java Edition NBT, and the isolated Phase 5 Handshake/Status packet codecs. It contains no sockets, async runtime, login/play schemas, compression, or version selection.
+- `cubic-network`: owns Phase 5's asynchronous TCP status-query workflow, strict server-address parsing, timeouts, frame-stream integration, and typed query errors. It does not own protocol byte layouts.
 - `cubic-version`: future Minecraft version metadata and loading of generated version data.
 - `cubic-resources`: future resource-pack resolution, resource lookup, and caching.
 - `cubic-world`: future world, chunk, block, biome, and entity state.
@@ -17,9 +18,18 @@ This document describes current and intended boundaries. Phases 1-4 implement th
 
 ## Dependency direction
 
-`cubic-app` is the composition root and currently depends on `cubic-core` and `cubic-platform`. `cubic-platform` depends on `cubic-render` to service native redraw events. `cubic-render` depends on cross-platform winit window handles and wgpu, but not on `cubic-platform` or `cubic-app`. `cubic-core` remains independent. Lower-level crates must not depend on `cubic-app`, and dependencies must remain acyclic.
+`cubic-app` is the composition root and currently depends on `cubic-core`, `cubic-platform`, and `cubic-network`. `cubic-network` depends on `cubic-protocol`; the protocol crate does not depend on the network crate or Tokio. `cubic-platform` depends on `cubic-render` to service native redraw events. `cubic-render` depends on cross-platform winit window handles and wgpu, but not on `cubic-platform` or `cubic-app`. `cubic-core` remains independent. Lower-level crates must not depend on `cubic-app`, and dependencies must remain acyclic.
 
-`cubic-protocol` is currently a leaf library with no dependency on the application, platform, renderer, async runtime, or network transport. A future transport may feed arbitrary byte fragments into its frame decoder, but the codec remains synchronous and independently testable. A future generated packet-schema layer may consume completed frame bodies and decode NBT directly from the same primitive reader without copying the remainder of a packet. Root-format selection is an explicit call-site choice, not a Minecraft-version check inside NBT.
+`cubic-protocol` remains independent of the application, platform, renderer, async runtime, and network transport. `cubic-network` feeds arbitrary TCP fragments into its synchronous frame decoder and gives completed frame bodies to the narrow Status codecs. A future generated packet-schema layer may consume completed frame bodies and decode NBT directly from the same primitive reader without copying the remainder of a packet. Root-format selection is an explicit call-site choice, not a Minecraft-version check inside NBT.
+
+The current Status path is deliberately separate from the graphical lifecycle:
+
+```text
+cubic-app status -> cubic-network -> Tokio TCP/DNS and timeouts
+                                 -> cubic-protocol framing and Status codecs
+```
+
+It performs no renderer, window, world, authentication, or resource work. See `NETWORKING.md` for the exact exchange and limitations.
 
 Platform-specific implementations belong in `cubic-platform` or clearly marked platform-specific modules. Shared engine and rendering code do not assume Windows or iOS APIs. The only current target-specific source is the future native-host handoff in `cubic-platform::ios`.
 

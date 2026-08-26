@@ -2,6 +2,7 @@
 members = [
     "crates/cubic-app",
     "crates/cubic-core",
+    "crates/cubic-network",
     "crates/cubic-platform",
     "crates/cubic-protocol",
     "crates/cubic-render",
@@ -21,9 +22,12 @@ rust-version = "1.98"
 
 [workspace.dependencies]
 pollster = "1.0.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
 thiserror = "2.0.20"
+tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "net", "rt", "time"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["dx12", "metal", "std"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 

@@ -6,7 +6,7 @@ Status markers: `[ ]` not started, `[~]` partial, `[x]` complete, `[!]` blocked.
 - [x] Phase 2 - Windows/iOS graphical bootstrap
 - [x] Phase 3 - protocol primitives
 - [x] Phase 4 - NBT
-- [ ] Phase 5 - server status ping
+- [~] Phase 5 - server status ping
 - [ ] Phase 6 - version-data architecture
 - [ ] Phase 7 - offline-mode development-server login
 - [ ] Phase 8 - Chat Mode MVP
@@ -39,4 +39,4 @@ Status markers: `[ ]` not started, `[~]` partial, `[x]` complete, `[!]` blocked.
 - [ ] Phase 35 - iPad soak/thermal/memory testing
 - [ ] Phase 36 - final acceptance testing
 
-Phases 1-4 are complete while their acceptance criteria and validation commands continue to pass. Phase 5 and later phases are intentionally left at a high level and have not begun.
+Phases 1-4 are complete while their acceptance criteria and validation commands continue to pass. Phase 5's implementation and deterministic mock-server coverage are complete, but its required real Java Edition server smoke test has not been performed, so it remains partial. Phase 6 and later phases have not begun.

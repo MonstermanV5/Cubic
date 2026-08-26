@@ -8,7 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 cubic-core = { path = "../cubic-core" }
+cubic-network = { path = "../cubic-network" }
 cubic-platform = { path = "../cubic-platform" }
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

@@ -4,6 +4,7 @@
 //! encryption, authentication, or version-specific behavior.
 
 pub mod nbt;
+pub mod status;
 
 mod bitset;
 mod error;
