@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "crates/cubic-app",
+    "crates/cubic-core",
+    "crates/cubic-platform",
+    "crates/cubic-protocol",
+    "crates/cubic-render",
+    "crates/cubic-resources",
+    "crates/cubic-ui",
+    "crates/cubic-version",
+    "crates/cubic-world",
+    "tools/version-generator",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+

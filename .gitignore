@@ -1,0 +1,44 @@
+# Rust build output
+/target/
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.iml
+*.suo
+*.user
+*.swp
+*.swo
+*~
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Environment files, credentials, and secrets
+.env
+.env.*
+!.env.example
+credentials/
+secrets/
+*.pem
+*.pfx
+*.key
+*access-token*
+*access_token*
+*refresh-token*
+*refresh_token*
+
+# Downloaded Minecraft content (never commit)
+assets/
+minecraft-assets/
+downloads/
+*.jar
+
+# Generated runtime data and caches
+cache/
+caches/
+runtime-cache/
+generated/runtime/
+
