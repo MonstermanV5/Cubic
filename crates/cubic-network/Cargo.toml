@@ -7,6 +7,7 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cubic-core = { path = "../cubic-core" }
 cubic-protocol = { path = "../cubic-protocol" }
 cubic-version = { path = "../cubic-version" }
 thiserror.workspace = true

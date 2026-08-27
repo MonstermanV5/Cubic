@@ -1,6 +1,6 @@
-# Phase 5 Status and Phase 7 Development Login Networking
+# Status, Development Login, and Chat Mode Networking
 
-Phase 5 implements the Java Edition server-list Status exchange. Phase 7 retains that behavior and extracts the shared TCP/framing mechanics into a small `MinecraftConnection`, then adds the narrowly scoped development-login state machine described below. This is still not persistent general Play networking.
+Phase 5 implements Status, Phase 7 adds the validated development login, and Phase 8 retains that connection for one narrowly scoped persistent Chat Mode session. This is not general Play networking.
 
 ## Ownership and flow
 
@@ -91,6 +91,26 @@ cargo run -p cubic-app -- dev-login localhost:25565 --username CubicTest
 
 The real acceptance test passed against vanilla Java Edition 26.1.2 at `localhost:25565`, configured with `online-mode=false` and `network-compression-threshold=-1`. Cubic completed Login and Configuration, reported `State: Play`, and the vanilla server logged that `CubicTest` joined and spawned into the world before Cubic deliberately disconnected. The first setting avoided Phase 9 authentication/encryption and the second kept framing uncompressed. Automated tests still never start, download, or contact a real server.
 
+## Phase 8 persistent Chat Mode
+
+`connect_to_play` is the reusable internal seam beneath the unchanged one-shot `dev-login` command. Chat Mode takes ownership of the resulting framed connection on a dedicated current-thread Tokio runtime. A `tokio::select!` loop independently awaits the next frame or a bounded UI command.
+
+The protocol-775 control plane handles Keep Alive, Ping/Pong, teleport confirmation, cookie absence, chunk-batch rate acknowledgement, one Player Loaded marker after the first discarded batch, and Play-to-Configuration re-entry. Initial Play Client Information is sent. Other complete frames—most notably chunks and world/entity traffic—are dropped immediately after the shared decoder has enforced the 2,097,151-byte frame and 4 MiB aggregate-buffer limits.
+
+Incoming Player Chat, Disguised Chat, System Chat, and Disconnect become stable `cubic-core` events. The regular event channel defaults to 128 entries; overflow drops the newest regular event and increments a counter surfaced as a warning. Disconnect/terminal state has a separate one-slot critical path and channel closure is observable. The outgoing command channel defaults to 16 entries. No attacker-controlled unbounded queue exists.
+
+The server settings remain:
+
+```text
+online-mode=false
+network-compression-threshold=-1
+resource-pack=
+require-resource-pack=false
+enable-code-of-conduct=false
+```
+
+Offline mode permits the absent authenticated chat session used by the MVP. Cubic sends ordinary Chat Message packets without a signature; it does not weaken or bypass secure-chat enforcement. Authentication and legitimate signing belong to Phase 9.
+
 ## Deliberate exclusions
 
-Phase 7 does not implement DNS SRV records, persistent Play connections, compression, encryption, authentication, session servers, packet generation, registry models, resource packs, proxy protocols, rich text rendering, automatic version selection, or any gameplay. It does not modify the render thread or graphical lifecycle. Phase 8 will own the first useful persistent post-login behavior.
+Phase 8 does not implement DNS SRV, compression, encryption, authentication, signing, automatic reconnect, general Play schemas, registries, world/chunk/entity state, movement, resource packs, or gameplay. Phase 12 will replace the manual packet profile; Phase 18 will add Chat/Play switching.

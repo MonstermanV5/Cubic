@@ -1,6 +1,6 @@
 # Protocol Primitive Foundation
 
-Phase 3 implements synchronous Minecraft: Java Edition binary primitives and uncompressed packet framing in `cubic-protocol`. Phase 4 adds raw Java Edition NBT. Phase 5 adds the small Status codecs. Phase 7 generalizes Handshake next-state selection and adds one isolated, temporary Java 26.1.2 / protocol 775 Login/Configuration bootstrap profile. TCP and timeout policy remain in `cubic-network`.
+Phase 8 extends the one isolated temporary Java 26.1.2 / protocol 775 bootstrap profile with the minimum bounded Play control/chat subset. TCP and session policy remain in `cubic-network`; general generated Play schemas remain deferred to Phase 12.
 
 ## Layer boundary
 
@@ -63,4 +63,8 @@ The decoder does not provide transport backpressure or connection recovery polic
 - `RawPacket` and `split_raw_packet`: schema-neutral packet ID/payload separation.
 - `nbt`: raw Java Edition NBT values, Modified UTF-8, explicit named/unnamed compound roots, and bounded encoding/decoding. See `NBT.md`.
 
-Minecraft-version-specific packet IDs and behavior must not be scattered through this layer. Phase 7's single `bootstrap::v775` exception is intentionally isolated and temporary. If a future protocol version changes a primitive representation, it should gain an isolated version-specific codec rather than silently changing unrelated primitives; general packet mappings belong to Phase 12 generation.
+Minecraft-version-specific packet IDs and behavior must not be scattered through this layer. The single `bootstrap::v775` exception is intentionally isolated and temporary. Phase 8 adds clientbound Keep Alive, Ping, Player Position, Chunk Batch Finished, Cookie Request, Player/Disguised/System Chat, Disconnect, Set Health, and Start Configuration classifications, plus their required responses and unsigned Chat Message encoding. Unknown complete Play frames remain bounded and are identified for immediate discard.
+
+Text Components in protocol 775 use an unnamed generic NBT root, so the raw NBT layer now exposes a bounded any-tag network-root decoder in addition to its compound-root API. The MVP projects strings, `text`, nested `extra`, and a conservative translation fallback to plain text while retaining a bounded protocol-independent tree. Unknown style/click/hover data is inert and never executed.
+
+Outgoing messages are limited to 256 Java UTF-16 units and reject empty/control-bearing input. Protocol 775 encodes the message, epoch-millisecond timestamp, salt, absent-signature discriminator, VarInt last-seen offset, fixed 20-bit acknowledgement window as three raw little-endian bit bytes, and a trailing checksum byte. Outgoing unsigned chat carries an empty update (`offset = 0`, three zero bytes) and checksum `0`, which disables checksum verification. Only a Player Chat packet carrying a message signature enters the server's tracked last-seen window and requires the dedicated acknowledgement; unsigned Player Chat, including Cubic's own vanilla-server echo, must not advance that window. System and Disguised Chat likewise do not enter it. No fake signature or chat session is created. Commands are rejected because Cubic does not yet retain the command graph needed to know whether arguments require signing.

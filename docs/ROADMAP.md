@@ -9,7 +9,7 @@ Status markers: `[ ]` not started, `[~]` partial, `[x]` complete, `[!]` blocked.
 - [x] Phase 5 - server status ping
 - [x] Phase 6 - version-data architecture
 - [x] Phase 7 - offline-mode development-server login
-- [ ] Phase 8 - Chat Mode MVP
+- [x] Phase 8 - Chat Mode MVP
 - [ ] Phase 9 - Microsoft/Minecraft authentication
 - [ ] Phase 10 - Minecraft version/resource bootstrap
 - [ ] Phase 11 - generated game registries/data
@@ -41,4 +41,6 @@ Status markers: `[ ]` not started, `[~]` partial, `[x]` complete, `[!]` blocked.
 
 Phases 1-6 are complete while their acceptance criteria and validation commands continue to pass. Phase 5's implementation, deterministic mock-server coverage, and required real Java Edition server smoke test against vanilla Java Edition 26.1.2 on localhost:25565 all passed. Phase 6 delivered the `cubic-version` runtime library and `version-generator` tool: path-safe opaque version IDs, typed protocol and schema versions, release/snapshot kinds, compatibility profile identifiers, bounded JSON loading, catalog validation, a filesystem-backed version-data store, an offline deterministic catalog builder, and synthetic fixtures including two releases and one snapshot with a shared protocol number.
 
-Phase 7 is complete. In addition to the isolated Java 26.1.2 / protocol 775 bootstrap profile, shared framed transport, explicit Login/Configuration state machine, development CLI, bounds, structured errors, and deterministic mock-server coverage, the required real local vanilla-server test passed with `online-mode=false` and `network-compression-threshold=-1`. Cubic completed Login and Configuration, entered Play, and the vanilla server spawned `CubicTest` into the world before Cubic deliberately disconnected. Phase 8 and later phases have not begun.
+Phase 7 is complete. In addition to the isolated Java 26.1.2 / protocol 775 bootstrap profile, shared framed transport, explicit Login/Configuration state machine, development CLI, bounds, structured errors, and deterministic mock-server coverage, the required real local vanilla-server test passed with `online-mode=false` and `network-compression-threshold=-1`. Cubic completed Login and Configuration, entered Play, and the vanilla server spawned `CubicTest` into the world before Cubic deliberately disconnected.
+
+Phase 8 is complete. Its final real-server and Windows Chat Mode acceptance passed against vanilla Java Edition 26.1.2, including persistent bidirectional chat, Unicode transport, common CJK glyph fallback, native clipboard interoperability in both directions, spam handling, bounded history, scrolling, resize/minimize/restore, Enter and button send actions, warnings, long idle operation, and clean disconnect. Release-mode idle resource use was acceptable for the MVP and is intentionally deferred from optimization work. Phase 9 and later phases have not begun.

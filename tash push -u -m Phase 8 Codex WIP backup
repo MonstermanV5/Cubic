@@ -1,0 +1,51 @@
+warning: in the working copy of 'Cargo.lock', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'Cargo.toml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-app/Cargo.toml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-app/src/main.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-core/src/lib.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-network/Cargo.toml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-network/src/connection.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-network/src/development_login/mod.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-network/src/lib.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-platform/Cargo.toml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-platform/src/lib.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-protocol/src/bootstrap/v775.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-protocol/src/nbt/decode.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-protocol/src/nbt/mod.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-render/Cargo.toml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-render/src/lib.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-ui/Cargo.toml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cubic-ui/src/lib.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docs/ARCHITECTURE.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docs/NETWORKING.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docs/PROTOCOL.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docs/ROADMAP.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docs/SECURITY.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docs/TESTING.md', LF will be replaced by CRLF the next time Git touches it
+ Cargo.lock                                        | 375 [32m++++++++++++++++++[m[31m-[m
+ Cargo.toml                                        |   5 [32m+[m[31m-[m
+ README.md                                         |  12 [32m+[m[31m-[m
+ crates/cubic-app/Cargo.toml                       |   1 [32m+[m
+ crates/cubic-app/src/main.rs                      | 130 [32m++++++[m[31m-[m
+ crates/cubic-core/src/lib.rs                      |   7 [32m+[m
+ crates/cubic-network/Cargo.toml                   |   1 [32m+[m
+ crates/cubic-network/src/connection.rs            |   7 [32m+[m
+ crates/cubic-network/src/development_login/mod.rs |  50 [32m++[m[31m-[m
+ crates/cubic-network/src/lib.rs                   |   5 [32m+[m
+ crates/cubic-platform/Cargo.toml                  |   3 [32m+[m
+ crates/cubic-platform/src/lib.rs                  | 175 [32m++++++++[m[31m-[m
+ crates/cubic-protocol/src/bootstrap/v775.rs       | 421 [32m+++++++++++++++++++++[m[31m-[m
+ crates/cubic-protocol/src/nbt/decode.rs           |  29 [32m++[m
+ crates/cubic-protocol/src/nbt/mod.rs              |   3 [32m+[m[31m-[m
+ crates/cubic-render/Cargo.toml                    |   2 [32m+[m
+ crates/cubic-render/src/lib.rs                    | 101 [32m++++++[m
+ crates/cubic-ui/Cargo.toml                        |   5 [32m+[m[31m-[m
+ crates/cubic-ui/src/lib.rs                        | 326 [32m++++++++++++++++[m[31m-[m
+ docs/ARCHITECTURE.md                              |  28 [32m+[m[31m-[m
+ docs/NETWORKING.md                                |  26 [32m+[m[31m-[m
+ docs/PROTOCOL.md                                  |   8 [32m+[m[31m-[m
+ docs/ROADMAP.md                                   |   6 [32m+[m[31m-[m
+ docs/SECURITY.md                                  |   4 [32m+[m[31m-[m
+ docs/TESTING.md                                   |  10 [32m+[m[31m-[m
+ 25 files changed, 1690 insertions(+), 50 deletions(-)

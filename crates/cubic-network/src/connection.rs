@@ -104,6 +104,13 @@ impl MinecraftConnection {
         }
     }
 
+    pub(crate) async fn read_frame_unbounded(
+        &mut self,
+        phase: &'static str,
+    ) -> Result<Vec<u8>, ConnectionError> {
+        self.read_next_frame(phase).await
+    }
+
     async fn read_next_frame(&mut self, phase: &'static str) -> Result<Vec<u8>, ConnectionError> {
         let mut read_buffer = [0_u8; READ_BUFFER_SIZE];
         loop {

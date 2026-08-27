@@ -7,6 +7,8 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+egui.workspace = true
+egui-wgpu.workspace = true
 tracing.workspace = true
 wgpu.workspace = true
 winit.workspace = true

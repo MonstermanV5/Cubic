@@ -124,7 +124,30 @@ pub async fn development_login(
 ) -> Result<DevelopmentLoginResult, DevelopmentLoginError> {
     match timeout(
         options.overall_timeout,
-        development_login_inner(address, username, options),
+        connect_to_play_inner(address, username, options),
+    )
+    .await
+    {
+        Ok(result) => result.map(|connected| connected.result),
+        Err(_) => Err(DevelopmentLoginError::OverallTimeout {
+            timeout: options.overall_timeout,
+        }),
+    }
+}
+
+pub(crate) struct ConnectedPlay {
+    pub(crate) connection: MinecraftConnection,
+    pub(crate) result: DevelopmentLoginResult,
+}
+
+pub(crate) async fn connect_to_play(
+    address: &ServerAddress,
+    username: &DevelopmentUsername,
+    options: &DevelopmentLoginOptions,
+) -> Result<ConnectedPlay, DevelopmentLoginError> {
+    match timeout(
+        options.overall_timeout,
+        connect_to_play_inner(address, username, options),
     )
     .await
     {
@@ -135,11 +158,11 @@ pub async fn development_login(
     }
 }
 
-async fn development_login_inner(
+async fn connect_to_play_inner(
     address: &ServerAddress,
     username: &DevelopmentUsername,
     options: &DevelopmentLoginOptions,
-) -> Result<DevelopmentLoginResult, DevelopmentLoginError> {
+) -> Result<ConnectedPlay, DevelopmentLoginError> {
     let profile = DevLoginProtocolProfile::protocol_775()
         .map_err(DevelopmentLoginError::InvalidBootstrapProfile)?;
     let limits = FrameLimits::new(MAX_BOOTSTRAP_FRAME_SIZE, MAX_CONFIGURATION_BUFFERED_BYTES)
@@ -180,14 +203,17 @@ async fn development_login_inner(
     let profile_uuid = run_login(&mut connection, username, &mut state).await?;
     let skipped_configuration_packets = run_configuration(&mut connection, &mut state).await?;
 
-    Ok(DevelopmentLoginResult {
-        address: address.clone(),
-        minecraft_version: profile.minecraft_version().clone(),
-        protocol_version: profile.protocol_version(),
-        username: username.clone(),
-        profile_uuid,
-        state,
-        skipped_configuration_packets,
+    Ok(ConnectedPlay {
+        connection,
+        result: DevelopmentLoginResult {
+            address: address.clone(),
+            minecraft_version: profile.minecraft_version().clone(),
+            protocol_version: profile.protocol_version(),
+            username: username.clone(),
+            profile_uuid,
+            state,
+            skipped_configuration_packets,
+        },
     })
 }
 
@@ -270,7 +296,7 @@ async fn run_login(
     })
 }
 
-async fn run_configuration(
+pub(crate) async fn run_configuration(
     connection: &mut MinecraftConnection,
     state: &mut ConnectionState,
 ) -> Result<usize, DevelopmentLoginError> {

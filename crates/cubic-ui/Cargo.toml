@@ -6,6 +6,9 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+cubic-core = { path = "../cubic-core" }
+egui.workspace = true
+
 [lints]
 workspace = true
-

@@ -4,11 +4,11 @@
 
 Cubic is an independent project intended to become a Minecraft: Java Edition-compatible multiplayer client, primarily implemented in Rust.
 
-Cubic does not contain Mojang or Microsoft code or assets. Minecraft gameplay has not yet been implemented. The repository currently contains the architectural scaffold, a native graphics bootstrap, low-level binary protocol primitives, a raw Java Edition NBT codec, a bounded server-list Status query, version-data architecture, and a development-only offline login bootstrap.
+Cubic does not contain Mojang or Microsoft code or assets. Minecraft gameplay and world rendering have not yet been implemented. The repository currently contains the architectural scaffold, native graphics bootstrap, low-level protocol/NBT foundations, bounded server-list Status query, version-data architecture, development-only offline login bootstrap, and the completed Phase 8 Chat Mode MVP. Its real-server and Windows UI acceptance passed against a local vanilla Java Edition 26.1.2 server.
 
 ## Current state
 
-With no arguments, `cubic-app` opens a native window and clears it through wgpu. Its `status` subcommand performs the unencrypted, uncompressed Java Edition server-list query. Its `dev-login` subcommand implements only the temporary Minecraft Java 26.1.2 / protocol 775 path needed to join a controlled offline-mode local server through Configuration and observe the initial Play Login packet. Persistent Play networking, compression, encryption, authentication, game state, Minecraft resources, and gameplay remain unimplemented.
+With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status` queries a server list entry, and `dev-login` retains the completed Phase 7 one-shot acceptance path. `chat` opens Cubic's full-window, low-idle-redraw Chat Mode and runs its persistent network task independently of the UI. This temporary development path targets only Java 26.1.2 / protocol 775 on an offline, uncompressed local server. Compression, encryption, authentication, game/world state, Minecraft resources, and 3D gameplay remain unimplemented.
 
 ## Build and validate
 
@@ -36,3 +36,11 @@ cargo run -p cubic-app -- dev-login localhost:25565 --username CubicTest
 ```
 
 This command deliberately disconnects after confirming the initial Play Login packet. It does not provide gameplay or a persistent client session.
+
+To exercise the Phase 8 Chat Mode MVP against that same controlled server:
+
+```text
+cargo run -p cubic-app -- chat localhost:25565 --username CubicTest
+```
+
+The server also needs `resource-pack=`, `require-resource-pack=false`, and `enable-code-of-conduct=false`. Chat Mode retains the connection, handles the required protocol-775 control plane, displays bounded chat history, and sends legitimate unsigned messages for the offline development profile. Its Windows integration uses the native system clipboard and an installed system CJK font fallback; Cubic redistributes no platform font files. Slash commands are deliberately unsupported because Cubic does not yet possess the generated command graph or authenticated signing session.

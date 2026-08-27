@@ -1,24 +1,24 @@
 # Architecture
 
-This document describes current and intended boundaries. Phases 1-4 implement the repository scaffold, native clear-frame graphics bootstrap, transport-independent protocol primitives, and raw Java Edition NBT. Phase 5 adds the Java Edition server-list Status exchange. Phase 6 adds the `cubic-version` runtime library and the `version-generator` offline tool. Phase 7 adds a narrow development-only offline login bootstrap for Java 26.1.2 / protocol 775. Minecraft game systems remain unimplemented.
+This document describes current and intended boundaries. Phases 1-7 provide the scaffold, graphics bootstrap, protocol/NBT foundations, Status, version data, and the validated development login. Phase 8 adds a narrow persistent Chat Mode candidate for Java 26.1.2 / protocol 775. Minecraft game systems and world rendering remain unimplemented.
 
 ## Workspace responsibilities
 
-- `cubic-app`: final executable and application composition root. With no arguments it delegates to the graphical platform layer; its `status` and `dev-login` subcommands create the small async runtime used by `cubic-network`.
-- `cubic-core`: platform-independent, high-level client/engine state and shared abstractions.
-- `cubic-protocol`: owns the synchronous binary reader/writer, structured codec errors, bounded primitive codecs, incremental uncompressed packet framing, bounded raw Java Edition NBT, a shared Handshake codec, Status codecs, and the isolated temporary protocol-775 Login/Configuration bootstrap profile. It contains no sockets, async runtime, compression, authentication, or general Play schemas.
-- `cubic-network`: owns asynchronous TCP connection, shared framed transport, strict server-address parsing, deadlines, Phase 5 Status sequencing, and the Phase 7 Login/Configuration state machine. It depends on typed identities from `cubic-version` but does not own protocol byte layouts.
+- `cubic-app`: composition root. It parses graphical, Status, one-shot development-login, and Chat Mode commands; Chat Mode starts the network runtime on a dedicated thread and passes only a bounded session port to the platform/UI side.
+- `cubic-core`: platform-independent shared concepts, including protocol-independent rich text, chat events, session commands, and connection presentation state.
+- `cubic-protocol`: owns synchronous codecs and the isolated temporary protocol-775 bootstrap profile, now including only the small Phase 8 Play control/chat subset. It contains no sockets, async runtime, compression, authentication, or general Play schema.
+- `cubic-network`: owns TCP, framing, deadlines, Status, Login/Configuration, and the persistent Chat Mode Play task. It converts bootstrap packets into stable `cubic-core` events and never touches UI/GPU state.
 - `cubic-version`: Minecraft version metadata, typed version/protocol/schema identifiers, release and snapshot kinds, compatibility profile identifiers, bounded filesystem-backed version-data store, catalog loading and validation. Synchronous, transport-independent, and free of rendering, world state, and platform dependencies.
 - `cubic-resources`: future resource-pack resolution, resource lookup, and caching.
 - `cubic-world`: future world, chunk, block, biome, and entity state.
-- `cubic-render`: owns the Phase 2 wgpu instance, adapter/device/queue, presentation surface, resizing, clear-frame submission, and surface recovery. Future rendering remains unimplemented.
-- `cubic-ui`: future application, HUD, menu, and chat UI.
+- `cubic-render`: owns wgpu surface/device submission and the direct `egui-wgpu` paint integration used by Chat Mode. It still contains no world renderer.
+- `cubic-ui`: owns the protocol-independent Chat Mode model and egui presentation: bounded history, text input, send action, scrolling, and connection/error state.
 - `cubic-platform`: owns the winit event loop, native window lifecycle, redraw scheduling, suspension, and the isolated future iOS host handoff.
 - `version-generator`: offline development/build utility that validates installed version datasets and builds a deterministic catalog from on-disk version data. Depends only on `cubic-version`; performs no network access.
 
 ## Dependency direction
 
-`cubic-app` is the composition root and currently depends on `cubic-core`, `cubic-platform`, and `cubic-network`. `cubic-network` depends on `cubic-protocol` and `cubic-version`; neither lower-level crate depends on the network crate or Tokio. `cubic-platform` depends on `cubic-render` to service native redraw events. `cubic-render` depends on cross-platform winit window handles and wgpu, but not on `cubic-platform` or `cubic-app`. `cubic-core` remains independent. Lower-level crates must not depend on `cubic-app`, and dependencies must remain acyclic.
+`cubic-app` composes `cubic-network` with `cubic-platform`/`cubic-ui`. `cubic-network` depends on `cubic-core`, `cubic-protocol`, and `cubic-version`. `cubic-ui` depends only on `cubic-core` and egui; its session-port trait prevents it from owning or naming TCP. `cubic-platform` depends on `cubic-ui` and `cubic-render`; `cubic-render` owns the wgpu/egui-wgpu integration. Dependencies remain acyclic.
 
 `cubic-protocol` remains independent of the application, platform, renderer, async runtime, and network transport. `cubic-network` feeds arbitrary TCP fragments into its synchronous frame decoder and gives completed frame bodies to state-specific codecs. A future generated packet-schema layer may consume completed frame bodies and decode NBT directly from the same primitive reader without copying the remainder of a packet. Root-format selection is an explicit call-site choice, not a Minecraft-version check inside NBT.
 
@@ -40,6 +40,18 @@ cubic-app dev-login -> cubic-network state machine and framed TCP transport
 ```
 
 All manually authored 26.1.2 packet IDs and layouts live in the single `cubic_protocol::bootstrap::v775` module. Phase 12 will replace or absorb that temporary profile with generated packet data. Network and engine code must not grow scattered version strings, numeric protocol checks, or giant version match statements.
+
+## Phase 8 Chat Mode lifecycle
+
+```text
+Tokio network thread -> bounded ChatEvent queue -> ChatSessionPort -> cubic-ui model
+UI send action       -> bounded command queue   -> network thread -> TCP
+winit events         -> egui input/layout       -> cubic-render   -> wgpu
+```
+
+The network task retains `MinecraftConnection` after Phase 7 reaches Play. It handles required control packets and selected chat packets, converts them to protocol-independent events, and discards other complete bounded frames immediately. No chunk, entity, inventory, or movement state is built. The UI never owns a socket and rendering never blocks on network I/O.
+
+winit waits rather than polls. A 200 ms low-frequency wake checks bounded cross-thread state, but requests a GPU redraw only for changed input/session presentation, resize/recovery, or direct window interaction. Networking remains active independently. `egui-winit` owns native clipboard event/output integration. `cubic-platform` may supply platform-installed font bytes to egui at Chat Mode startup; this target-specific font discovery remains outside `cubic-ui` and the renderer. See `CHAT_MODE.md` for the exact MVP boundary.
 
 Platform-specific implementations belong in `cubic-platform` or clearly marked platform-specific modules. Shared engine and rendering code do not assume Windows or iOS APIs. The only current target-specific source is the future native-host handoff in `cubic-platform::ios`.
 

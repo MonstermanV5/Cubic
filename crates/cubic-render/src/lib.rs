@@ -23,6 +23,32 @@ const CLEAR_COLOR: Color = Color {
     a: 1.0,
 };
 
+#[derive(Default)]
+struct TextureDeltaQueue {
+    pending: egui::TexturesDelta,
+}
+
+impl TextureDeltaQueue {
+    fn enqueue(&mut self, textures: egui::TexturesDelta) {
+        self.pending.append(textures);
+    }
+
+    fn take_for_paint(&mut self) -> egui::TexturesDelta {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+impl Drop for TextureDeltaQueue {
+    fn drop(&mut self) {
+        // Once the GPU renderer is being destroyed, no later frame can consume pending work.
+        self.pending.clear();
+    }
+}
+
 /// Owns the GPU objects needed to clear and present a window surface.
 pub struct Renderer {
     instance: Instance,
@@ -34,6 +60,8 @@ pub struct Renderer {
     size: PhysicalSize<u32>,
     configured: bool,
     out_of_memory: Arc<AtomicBool>,
+    ui_renderer: egui_wgpu::Renderer,
+    ui_textures: TextureDeltaQueue,
 }
 
 impl Renderer {
@@ -97,6 +125,12 @@ impl Renderer {
             "renderer initialized successfully"
         );
 
+        let ui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            egui_wgpu::RendererOptions::default(),
+        );
+
         Ok(Self {
             instance,
             window,
@@ -107,6 +141,8 @@ impl Renderer {
             size,
             configured,
             out_of_memory,
+            ui_renderer,
+            ui_textures: TextureDeltaQueue::default(),
         })
     }
 
@@ -130,6 +166,12 @@ impl Renderer {
     #[must_use]
     pub const fn is_renderable(&self) -> bool {
         self.configured
+    }
+
+    /// Returns whether egui texture work is waiting for a successful surface frame.
+    #[must_use]
+    pub fn has_pending_ui_textures(&self) -> bool {
+        !self.ui_textures.is_empty()
     }
 
     /// Clears and presents one frame, or recovers the surface when possible.
@@ -164,6 +206,100 @@ impl Renderer {
                 Ok(FrameStatus::Reconfigured)
             }
             CurrentSurfaceTexture::Validation => Err(RenderError::SurfaceValidation),
+        }
+    }
+
+    /// Renders one event-driven egui frame over Cubic's clear color.
+    pub fn render_ui(
+        &mut self,
+        paint_jobs: &[egui::ClippedPrimitive],
+        textures: egui::TexturesDelta,
+        pixels_per_point: f32,
+    ) -> Result<FrameStatus, RenderError> {
+        self.ui_textures.enqueue(textures);
+        if self.out_of_memory.load(Ordering::Acquire) {
+            return Err(RenderError::OutOfMemory);
+        }
+        if !self.configured {
+            return Ok(FrameStatus::Skipped);
+        }
+        match self.surface.get_current_texture() {
+            CurrentSurfaceTexture::Success(frame) => {
+                self.paint_ui(frame, paint_jobs, pixels_per_point);
+                Ok(FrameStatus::Presented)
+            }
+            CurrentSurfaceTexture::Suboptimal(frame) => {
+                self.paint_ui(frame, paint_jobs, pixels_per_point);
+                self.reconfigure();
+                Ok(FrameStatus::Reconfigured)
+            }
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => {
+                Ok(FrameStatus::Skipped)
+            }
+            CurrentSurfaceTexture::Outdated => {
+                self.reconfigure();
+                Ok(FrameStatus::Reconfigured)
+            }
+            CurrentSurfaceTexture::Lost => {
+                self.recreate_surface()?;
+                Ok(FrameStatus::Reconfigured)
+            }
+            CurrentSurfaceTexture::Validation => Err(RenderError::SurfaceValidation),
+        }
+    }
+
+    fn paint_ui(
+        &mut self,
+        frame: wgpu::SurfaceTexture,
+        paint_jobs: &[egui::ClippedPrimitive],
+        pixels_per_point: f32,
+    ) {
+        let mut textures = self.ui_textures.take_for_paint();
+        for (id, deltas) in textures.set.drain() {
+            for delta in deltas {
+                self.ui_renderer
+                    .update_texture(&self.device, &self.queue, id, &delta);
+            }
+        }
+        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Cubic Chat Mode encoder"),
+            });
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.size.width, self.size.height],
+            pixels_per_point,
+        };
+        let extra = self.ui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            paint_jobs,
+            &screen,
+        );
+        {
+            let pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Cubic Chat Mode pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(CLEAR_COLOR),
+                        store: StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            self.ui_renderer
+                .render(&mut pass.forget_lifetime(), paint_jobs, &screen);
+        }
+        self.queue
+            .submit(extra.into_iter().chain([encoder.finish()]));
+        self.queue.present(frame);
+        for id in textures.free.drain() {
+            self.ui_renderer.free_texture(&id);
         }
     }
 
@@ -304,7 +440,8 @@ const fn has_renderable_area(size: PhysicalSize<u32>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::has_renderable_area;
+    use super::{TextureDeltaQueue, has_renderable_area};
+    use egui::{Color32, ColorImage, TextureId, TextureOptions, epaint::ImageDelta};
     use winit::dpi::PhysicalSize;
 
     #[test]
@@ -313,5 +450,38 @@ mod tests {
         assert!(!has_renderable_area(PhysicalSize::new(0, 1)));
         assert!(!has_renderable_area(PhysicalSize::new(1, 0)));
         assert!(!has_renderable_area(PhysicalSize::new(0, 0)));
+    }
+
+    #[test]
+    fn texture_delta_queue_preserves_all_updates_until_paint() {
+        let texture = TextureId::Managed(1);
+        let retired = TextureId::Managed(2);
+        let image = || ColorImage::filled([1, 1], Color32::WHITE);
+
+        let mut first = egui::TexturesDelta::default();
+        first.push(texture, ImageDelta::full(image(), TextureOptions::LINEAR));
+        first.push(
+            texture,
+            ImageDelta::partial([0, 0], image(), TextureOptions::LINEAR),
+        );
+        first.free(retired);
+
+        let mut second = egui::TexturesDelta::default();
+        second.push(
+            texture,
+            ImageDelta::partial([0, 0], image(), TextureOptions::LINEAR),
+        );
+
+        let mut queue = TextureDeltaQueue::default();
+        queue.enqueue(first);
+        queue.enqueue(second);
+        let mut ready = queue.take_for_paint();
+        let update_count = ready.set.get(&texture).map_or(0, |updates| updates.len());
+        let retained_free = ready.free.contains(&retired);
+        ready.clear();
+
+        assert_eq!(update_count, 3);
+        assert!(retained_free);
+        assert!(queue.take_for_paint().is_empty());
     }
 }

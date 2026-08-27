@@ -10,6 +10,7 @@ rust-version.workspace = true
 cubic-core = { path = "../cubic-core" }
 cubic-network = { path = "../cubic-network" }
 cubic-platform = { path = "../cubic-platform" }
+cubic-ui = { path = "../cubic-ui" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

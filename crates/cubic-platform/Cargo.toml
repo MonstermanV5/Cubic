@@ -8,6 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 cubic-render = { path = "../cubic-render" }
+cubic-ui = { path = "../cubic-ui" }
+egui.workspace = true
+egui-winit.workspace = true
 pollster.workspace = true
 tracing.workspace = true
 winit.workspace = true

@@ -30,6 +30,25 @@ pub fn decode_unnamed_network_root(
     context.decode_compound(reader, 0)
 }
 
+/// Decodes the unnamed network form of any non-End NBT tag.
+///
+/// Modern text components use this generic root form rather than requiring a
+/// compound root. The same resource limits apply to the complete value.
+pub fn decode_unnamed_network_tag(
+    reader: &mut CodecReader<'_>,
+    limits: NbtLimits,
+) -> Result<NbtTag, NbtError> {
+    let id = read_type_id(reader, "NBT root type")?;
+    if id == NbtTagType::End.id() {
+        return Err(NbtError::UnexpectedEndTag {
+            context: "NBT root",
+        });
+    }
+    let tag_type = NbtTagType::from_id(id).ok_or(NbtError::InvalidTagId { id })?;
+    let mut context = DecodeContext::new(limits);
+    context.decode_payload(reader, tag_type, 0)
+}
+
 pub fn decode_named_root_complete(
     input: &[u8],
     limits: NbtLimits,
@@ -46,6 +65,16 @@ pub fn decode_unnamed_network_root_complete(
 ) -> Result<NbtCompound, NbtError> {
     let mut reader = CodecReader::new(input);
     let root = decode_unnamed_network_root(&mut reader, limits)?;
+    reject_trailing(&reader)?;
+    Ok(root)
+}
+
+pub fn decode_unnamed_network_tag_complete(
+    input: &[u8],
+    limits: NbtLimits,
+) -> Result<NbtTag, NbtError> {
+    let mut reader = CodecReader::new(input);
+    let root = decode_unnamed_network_tag(&mut reader, limits)?;
     reject_trailing(&reader)?;
     Ok(root)
 }

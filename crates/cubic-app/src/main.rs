@@ -1,9 +1,11 @@
 use std::{process::ExitCode, str::FromStr};
 
 use cubic_network::{
-    DevelopmentLoginOptions, DevelopmentUsername, ServerAddress, StatusQueryOptions,
-    development_login, query_server_status,
+    ChatSessionHandle, ChatSessionOptions, DevelopmentLoginOptions, DevelopmentUsername,
+    ServerAddress, StatusQueryOptions, development_login, query_server_status,
+    run_development_chat_session,
 };
+use cubic_ui::ChatSessionPort;
 
 fn main() -> ExitCode {
     if let Err(error) = tracing_subscriber::fmt()
@@ -20,7 +22,7 @@ fn main() -> ExitCode {
         Ok(command) => command,
         Err(message) => {
             eprintln!(
-                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]\n  cubic-app dev-login <host[:port]> [--username <name>]"
+                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]\n  cubic-app dev-login <host[:port]> [--username <name>]\n  cubic-app chat <host[:port]> [--username <name>]"
             );
             return ExitCode::FAILURE;
         }
@@ -30,6 +32,85 @@ fn main() -> ExitCode {
         Command::Graphical => run_graphical(),
         Command::Status { address, protocol } => run_status(&address, protocol),
         Command::DevLogin { address, username } => run_development_login(&address, &username),
+        Command::Chat { address, username } => run_chat(address, username),
+    }
+}
+
+fn run_chat(address: ServerAddress, username: DevelopmentUsername) -> ExitCode {
+    let options = ChatSessionOptions::default();
+    let (handle, runner) = ChatSessionHandle::bounded(&options);
+    let network_address = address.clone();
+    let network_username = username.clone();
+    let network = std::thread::Builder::new()
+        .name("cubic-chat-network".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let result = match runtime {
+                Ok(runtime) => runtime.block_on(run_development_chat_session(
+                    &network_address,
+                    &network_username,
+                    &options,
+                    runner,
+                )),
+                Err(error) => {
+                    tracing::error!(%error, "could not create Chat Mode runtime");
+                    return;
+                }
+            };
+            if let Err(error) = result {
+                tracing::error!(%error, "Chat Mode network task stopped");
+            }
+        });
+    let network = match network {
+        Ok(network) => network,
+        Err(error) => {
+            tracing::error!(%error, "could not start Chat Mode network thread");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    tracing::info!(address = %address, username = %username, "opening Chat Mode");
+    let result = cubic_platform::run_chat(Box::new(NetworkChatPort { handle }));
+    if network.join().is_err() {
+        tracing::error!("Chat Mode network thread panicked");
+        return ExitCode::FAILURE;
+    }
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "Cubic Chat Mode stopped because initialization failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+struct NetworkChatPort {
+    handle: ChatSessionHandle,
+}
+
+impl ChatSessionPort for NetworkChatPort {
+    fn try_next_event(&mut self) -> Option<cubic_core::ChatEvent> {
+        self.handle.try_next_event()
+    }
+
+    fn take_critical_event(&mut self) -> Option<cubic_core::ChatEvent> {
+        self.handle.take_critical_event()
+    }
+
+    fn dropped_event_count(&mut self) -> usize {
+        self.handle.dropped_event_count()
+    }
+
+    fn send_message(&mut self, message: String) -> Result<(), String> {
+        self.handle
+            .try_send_message(message)
+            .map_err(|error| error.to_string())
+    }
+
+    fn disconnect(&mut self) {
+        let _result = self.handle.disconnect();
     }
 }
 
@@ -146,6 +227,10 @@ enum Command {
         address: ServerAddress,
         username: DevelopmentUsername,
     },
+    Chat {
+        address: ServerAddress,
+        username: DevelopmentUsername,
+    },
 }
 
 fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command, String> {
@@ -155,6 +240,9 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     };
     if command == "dev-login" {
         return parse_development_login(arguments);
+    }
+    if command == "chat" {
+        return parse_chat(arguments);
     }
     if command != "status" {
         return Err(format!("unknown command {command:?}"));
@@ -181,10 +269,23 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     Ok(Command::Status { address, protocol })
 }
 
-fn parse_development_login(mut arguments: impl Iterator<Item = String>) -> Result<Command, String> {
+fn parse_chat(arguments: impl Iterator<Item = String>) -> Result<Command, String> {
+    parse_server_and_username("chat", arguments)
+        .map(|(address, username)| Command::Chat { address, username })
+}
+
+fn parse_development_login(arguments: impl Iterator<Item = String>) -> Result<Command, String> {
+    parse_server_and_username("dev-login", arguments)
+        .map(|(address, username)| Command::DevLogin { address, username })
+}
+
+fn parse_server_and_username(
+    command: &str,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(ServerAddress, DevelopmentUsername), String> {
     let target = arguments
         .next()
-        .ok_or_else(|| "dev-login command requires a server address".to_owned())?;
+        .ok_or_else(|| format!("{command} command requires a server address"))?;
     let address = ServerAddress::from_str(&target).map_err(|error| error.to_string())?;
     let mut username = DevelopmentUsername::new("CubicTest").map_err(|error| error.to_string())?;
     if let Some(option) = arguments.next() {
@@ -199,7 +300,7 @@ fn parse_development_login(mut arguments: impl Iterator<Item = String>) -> Resul
     if let Some(extra) = arguments.next() {
         return Err(format!("unexpected argument {extra:?}"));
     }
-    Ok(Command::DevLogin { address, username })
+    Ok((address, username))
 }
 
 #[cfg(test)]
@@ -276,6 +377,23 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn chat_command_uses_the_same_bounded_development_identity() {
+        let command = parse_command([
+            "chat".to_owned(),
+            "localhost:25565".to_owned(),
+            "--username".to_owned(),
+            "CubicChat".to_owned(),
+        ])
+        .unwrap();
+        let Command::Chat { address, username } = command else {
+            panic!("expected chat command")
+        };
+        assert_eq!(address.port(), 25_565);
+        assert_eq!(username.as_str(), "CubicChat");
+        assert!(parse_command(["chat".to_owned()]).is_err());
     }
 
     #[test]

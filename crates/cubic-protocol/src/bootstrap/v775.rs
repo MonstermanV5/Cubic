@@ -6,9 +6,12 @@
 use thiserror::Error;
 
 use crate::{
-    CodecError, CodecReader, CodecWriter, MINECRAFT_MAX_FRAME_SIZE, ProtocolUuid, StringLimits,
-    encode_frame,
-    nbt::{NbtCompound, NbtError, NbtLimits, decode_unnamed_network_root_complete},
+    BitSetLimits, CodecError, CodecReader, CodecWriter, MINECRAFT_MAX_FRAME_SIZE, ProtocolUuid,
+    StringLimits, encode_frame,
+    nbt::{
+        NbtCompound, NbtError, NbtLimits, NbtTag, decode_unnamed_network_root_complete,
+        decode_unnamed_network_tag,
+    },
     split_raw_packet,
 };
 
@@ -22,6 +25,10 @@ pub const MAX_LOGIN_PLUGIN_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_CONFIGURATION_CUSTOM_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_DISCONNECT_BYTES: usize = 32 * 1024;
 pub const MAX_KNOWN_PACKS: usize = 64;
+pub const MAX_CHAT_UTF16_UNITS: usize = 256;
+pub const MAX_CHAT_COMPONENT_BYTES: usize = 32 * 1024;
+pub const MAX_LAST_SEEN_MESSAGES: usize = 20;
+pub const CHAT_ACKNOWLEDGEMENT_BYTES: usize = 3;
 
 const LOGIN_START_ID: i32 = 0x00;
 const LOGIN_DISCONNECT_ID: i32 = 0x00;
@@ -64,6 +71,29 @@ const CONFIG_CODE_OF_CONDUCT_ID: i32 = 0x13;
 
 const INITIAL_PLAY_LOGIN_ID: i32 = 0x31;
 
+const PLAY_CONFIRM_TELEPORT_ID: i32 = 0x00;
+const PLAY_CHAT_ACKNOWLEDGEMENT_ID: i32 = 0x06;
+const PLAY_CHAT_MESSAGE_ID: i32 = 0x09;
+const PLAY_CHUNK_BATCH_RECEIVED_ID: i32 = 0x0b;
+const PLAY_CLIENT_INFORMATION_ID: i32 = 0x0e;
+const PLAY_ACKNOWLEDGE_CONFIGURATION_ID: i32 = 0x10;
+const PLAY_COOKIE_RESPONSE_ID: i32 = 0x15;
+const PLAY_KEEP_ALIVE_RESPONSE_ID: i32 = 0x1c;
+const PLAY_PLAYER_LOADED_ID: i32 = 0x2c;
+const PLAY_PONG_ID: i32 = 0x2d;
+
+const PLAY_CHUNK_BATCH_FINISHED_ID: i32 = 0x0b;
+const PLAY_COOKIE_REQUEST_ID: i32 = 0x15;
+const PLAY_DISCONNECT_ID: i32 = 0x20;
+const PLAY_DISGUISED_CHAT_ID: i32 = 0x21;
+const PLAY_KEEP_ALIVE_ID: i32 = 0x2c;
+const PLAY_PING_ID: i32 = 0x3d;
+const PLAY_PLAYER_CHAT_ID: i32 = 0x41;
+const PLAY_PLAYER_POSITION_ID: i32 = 0x48;
+const PLAY_SET_HEALTH_ID: i32 = 0x68;
+const PLAY_START_CONFIGURATION_ID: i32 = 0x76;
+const PLAY_SYSTEM_CHAT_ID: i32 = 0x79;
+
 const USERNAME_LIMITS: StringLimits = StringLimits::new(MAX_USERNAME_UTF16_UNITS, 48);
 const IDENTIFIER_LIMITS: StringLimits = StringLimits::new(32_767, 32_767);
 const DISCONNECT_LIMITS: StringLimits =
@@ -73,6 +103,7 @@ const PROPERTY_VALUE_LIMITS: StringLimits = StringLimits::new(16_384, 49_152);
 const KNOWN_PACK_NAMESPACE_LIMITS: StringLimits = StringLimits::new(64, 192);
 const KNOWN_PACK_ID_LIMITS: StringLimits = StringLimits::new(256, 768);
 const KNOWN_PACK_VERSION_LIMITS: StringLimits = StringLimits::new(128, 384);
+const CHAT_LIMITS: StringLimits = StringLimits::new(MAX_CHAT_UTF16_UNITS, 768);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoginSuccess<'a> {
@@ -154,6 +185,108 @@ pub enum ConfigurationClientbound<'a> {
     CodeOfConduct,
     Skipped {
         packet: SkippedConfigurationPacket,
+        payload_bytes: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextComponent {
+    pub value: NbtTag,
+    pub plain_text: String,
+}
+
+/// Protocol 775's fixed last-seen update embedded in an outgoing chat message.
+///
+/// The acknowledgement bytes are a Java `BitSet` encoding of exactly 20 bits:
+/// bit zero is the least-significant bit of byte zero, and the high four bits of
+/// byte two are unused. A checksum of zero disables checksum verification, as
+/// required by Cubic's unsigned Phase 8 development profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChatLastSeenUpdate {
+    offset: i32,
+    acknowledged: [u8; CHAT_ACKNOWLEDGEMENT_BYTES],
+    checksum: u8,
+}
+
+impl ChatLastSeenUpdate {
+    #[must_use]
+    pub const fn empty_with_disabled_checksum() -> Self {
+        Self {
+            offset: 0,
+            acknowledged: [0; CHAT_ACKNOWLEDGEMENT_BYTES],
+            checksum: 0,
+        }
+    }
+
+    pub fn new(
+        offset: i32,
+        acknowledged: [u8; CHAT_ACKNOWLEDGEMENT_BYTES],
+        checksum: u8,
+    ) -> Result<Self, BootstrapProtocolError> {
+        if offset < 0 {
+            return Err(BootstrapProtocolError::NegativeCount {
+                context: "Chat Message last-seen offset",
+                value: offset,
+            });
+        }
+        if acknowledged[2] & 0xf0 != 0 {
+            return Err(CodecError::ValueOutOfRange {
+                context: "Chat Message fixed 20-bit acknowledgement",
+                value: i128::from(acknowledged[2]),
+                min: 0,
+                max: 0x0f,
+            }
+            .into());
+        }
+        Ok(Self {
+            offset,
+            acknowledged,
+            checksum,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlayClientbound {
+    KeepAlive {
+        id: i64,
+    },
+    Ping {
+        id: i32,
+    },
+    PlayerPosition {
+        teleport_id: i32,
+    },
+    ChunkBatchFinished {
+        chunks: i32,
+    },
+    CookieRequest {
+        key: String,
+    },
+    PlayerChat {
+        sender_uuid: ProtocolUuid,
+        sender_name: String,
+        message: TextComponent,
+        global_index: i32,
+        acknowledgement_required: bool,
+    },
+    DisguisedChat {
+        sender_name: String,
+        message: TextComponent,
+    },
+    SystemChat {
+        message: TextComponent,
+        overlay: bool,
+    },
+    Disconnect {
+        reason: TextComponent,
+    },
+    Health {
+        health: f32,
+    },
+    StartConfiguration,
+    Ignored {
+        packet_id: i32,
         payload_bytes: usize,
     },
 }
@@ -294,6 +427,14 @@ pub fn encode_client_information(
 ) -> Result<Vec<u8>, BootstrapProtocolError> {
     let mut writer = CodecWriter::new();
     writer.write_var_int(CONFIG_CLIENT_INFORMATION_ID);
+    write_client_information_fields(&mut writer, information)?;
+    frame(writer)
+}
+
+fn write_client_information_fields(
+    writer: &mut CodecWriter,
+    information: &ClientInformation<'_>,
+) -> Result<(), BootstrapProtocolError> {
     writer.write_string(information.locale, StringLimits::new(16, 48))?;
     writer.write_i8(information.view_distance);
     writer.write_var_int(information.chat_mode);
@@ -303,7 +444,7 @@ pub fn encode_client_information(
     writer.write_bool(information.text_filtering);
     writer.write_bool(information.allows_server_listing);
     writer.write_var_int(information.particle_status);
-    frame(writer)
+    Ok(())
 }
 
 pub fn encode_configuration_cookie_response(key: &str) -> Result<Vec<u8>, BootstrapProtocolError> {
@@ -434,6 +575,334 @@ pub fn validate_initial_play_login(frame_body: &[u8]) -> Result<(), BootstrapPro
         return Err(BootstrapProtocolError::EmptyInitialPlayLogin);
     }
     Ok(())
+}
+
+pub fn decode_play_clientbound(
+    frame_body: &[u8],
+) -> Result<PlayClientbound, BootstrapProtocolError> {
+    let packet = split_raw_packet(frame_body)?;
+    let mut reader = CodecReader::new(packet.payload);
+    match packet.id {
+        PLAY_KEEP_ALIVE_ID => {
+            let id = reader.read_i64()?;
+            require_consumed(&reader, "Play Keep Alive")?;
+            Ok(PlayClientbound::KeepAlive { id })
+        }
+        PLAY_PING_ID => {
+            let id = reader.read_i32()?;
+            require_consumed(&reader, "Play Ping")?;
+            Ok(PlayClientbound::Ping { id })
+        }
+        PLAY_PLAYER_POSITION_ID => {
+            let teleport_id = reader.read_var_int()?;
+            if reader.remaining() < 60 {
+                return Err(CodecError::UnexpectedEnd {
+                    context: "Play Player Position",
+                    needed: 60,
+                    remaining: reader.remaining(),
+                }
+                .into());
+            }
+            Ok(PlayClientbound::PlayerPosition { teleport_id })
+        }
+        PLAY_CHUNK_BATCH_FINISHED_ID => {
+            let chunks = reader.read_var_int()?;
+            if chunks < 0 {
+                return Err(BootstrapProtocolError::NegativeCount {
+                    context: "Play chunk batch",
+                    value: chunks,
+                });
+            }
+            require_consumed(&reader, "Play Chunk Batch Finished")?;
+            Ok(PlayClientbound::ChunkBatchFinished { chunks })
+        }
+        PLAY_COOKIE_REQUEST_ID => {
+            let key = reader.read_string(IDENTIFIER_LIMITS)?.to_owned();
+            require_consumed(&reader, "Play Cookie Request")?;
+            Ok(PlayClientbound::CookieRequest { key })
+        }
+        PLAY_SYSTEM_CHAT_ID => {
+            let message = decode_text_component(&mut reader)?;
+            let overlay = reader.read_bool()?;
+            require_consumed(&reader, "System Chat")?;
+            Ok(PlayClientbound::SystemChat { message, overlay })
+        }
+        PLAY_DISGUISED_CHAT_ID => {
+            let message = decode_text_component(&mut reader)?;
+            let sender_name = decode_bound_chat_type(&mut reader)?;
+            require_consumed(&reader, "Disguised Chat")?;
+            Ok(PlayClientbound::DisguisedChat {
+                sender_name,
+                message,
+            })
+        }
+        PLAY_PLAYER_CHAT_ID => decode_player_chat(&mut reader),
+        PLAY_DISCONNECT_ID => {
+            let reason = decode_text_component(&mut reader)?;
+            require_consumed(&reader, "Play Disconnect")?;
+            Ok(PlayClientbound::Disconnect { reason })
+        }
+        PLAY_SET_HEALTH_ID => {
+            let health = reader.read_f32()?;
+            let _food = reader.read_var_int()?;
+            let _saturation = reader.read_f32()?;
+            require_consumed(&reader, "Set Health")?;
+            Ok(PlayClientbound::Health { health })
+        }
+        PLAY_START_CONFIGURATION_ID => {
+            require_consumed(&reader, "Start Configuration")?;
+            Ok(PlayClientbound::StartConfiguration)
+        }
+        packet_id => Ok(PlayClientbound::Ignored {
+            packet_id,
+            payload_bytes: packet.payload.len(),
+        }),
+    }
+}
+
+pub fn encode_play_keep_alive(id: i64) -> Result<Vec<u8>, BootstrapProtocolError> {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_KEEP_ALIVE_RESPONSE_ID);
+    writer.write_i64(id);
+    frame(writer)
+}
+
+pub fn encode_play_chat_acknowledgement(count: i32) -> Result<Vec<u8>, BootstrapProtocolError> {
+    if count <= 0 {
+        return Err(CodecError::ValueOutOfRange {
+            context: "chat acknowledgement count",
+            value: i128::from(count),
+            min: 1,
+            max: i128::from(i32::MAX),
+        }
+        .into());
+    }
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_CHAT_ACKNOWLEDGEMENT_ID);
+    writer.write_var_int(count);
+    frame(writer)
+}
+
+pub fn encode_play_pong(id: i32) -> Result<Vec<u8>, BootstrapProtocolError> {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_PONG_ID);
+    writer.write_i32(id);
+    frame(writer)
+}
+
+pub fn encode_play_teleport_confirmation(
+    teleport_id: i32,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_CONFIRM_TELEPORT_ID);
+    writer.write_var_int(teleport_id);
+    frame(writer)
+}
+
+pub fn encode_play_chunk_batch_received(
+    desired_chunks_per_tick: f32,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_CHUNK_BATCH_RECEIVED_ID);
+    writer.write_f32(desired_chunks_per_tick);
+    frame(writer)
+}
+
+pub fn encode_play_client_information(
+    information: &ClientInformation<'_>,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_CLIENT_INFORMATION_ID);
+    write_client_information_fields(&mut writer, information)?;
+    frame(writer)
+}
+
+pub fn encode_play_player_loaded() -> Result<Vec<u8>, BootstrapProtocolError> {
+    packet_without_payload(PLAY_PLAYER_LOADED_ID)
+}
+
+pub fn encode_play_cookie_response(key: &str) -> Result<Vec<u8>, BootstrapProtocolError> {
+    encode_empty_cookie_response(PLAY_COOKIE_RESPONSE_ID, key)
+}
+
+pub fn encode_play_acknowledge_configuration() -> Result<Vec<u8>, BootstrapProtocolError> {
+    packet_without_payload(PLAY_ACKNOWLEDGE_CONFIGURATION_ID)
+}
+
+pub fn encode_play_chat_message(
+    message: &str,
+    timestamp_millis: i64,
+    salt: i64,
+    last_seen: ChatLastSeenUpdate,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    if message.is_empty() {
+        return Err(CodecError::ValueOutOfRange {
+            context: "chat message UTF-16 length",
+            value: 0,
+            min: 1,
+            max: MAX_CHAT_UTF16_UNITS as i128,
+        }
+        .into());
+    }
+    if message.chars().any(char::is_control) {
+        return Err(CodecError::ValueOutOfRange {
+            context: "chat message control character",
+            value: 1,
+            min: 0,
+            max: 0,
+        }
+        .into());
+    }
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_CHAT_MESSAGE_ID);
+    writer.write_string(message, CHAT_LIMITS)?;
+    writer.write_i64(timestamp_millis);
+    writer.write_i64(salt);
+    writer.write_bool(false);
+    writer.write_var_int(last_seen.offset);
+    writer.write_bytes(&last_seen.acknowledged);
+    writer.write_u8(last_seen.checksum);
+    frame(writer)
+}
+
+fn decode_player_chat(
+    reader: &mut CodecReader<'_>,
+) -> Result<PlayClientbound, BootstrapProtocolError> {
+    let global_index = reader.read_var_int()?;
+    let sender_uuid = reader.read_uuid()?;
+    let _sender_index = reader.read_var_int()?;
+    let acknowledgement_required = reader.read_bool()?;
+    if acknowledgement_required {
+        let _signature = reader.read_bytes(256, "Player Chat signature")?;
+    }
+    let content = reader.read_string(CHAT_LIMITS)?.to_owned();
+    let _timestamp = reader.read_i64()?;
+    let _salt = reader.read_i64()?;
+    let last_seen = read_count(
+        reader,
+        "Player Chat last-seen messages",
+        MAX_LAST_SEEN_MESSAGES,
+    )?;
+    for _ in 0..last_seen {
+        let cached_id = reader.read_var_int()?;
+        if cached_id == 0 {
+            let _signature = reader.read_bytes(256, "Player Chat last-seen signature")?;
+        } else if cached_id < 0 {
+            return Err(BootstrapProtocolError::NegativeCount {
+                context: "Player Chat cached signature ID",
+                value: cached_id,
+            });
+        }
+    }
+    let unsigned = if reader.read_bool()? {
+        Some(decode_text_component(reader)?)
+    } else {
+        None
+    };
+    match reader.read_var_int()? {
+        0 | 1 => {}
+        2 => {
+            let _mask = reader.read_bitset(BitSetLimits::new(4, MAX_CHAT_UTF16_UNITS))?;
+        }
+        value => {
+            return Err(CodecError::ValueOutOfRange {
+                context: "Player Chat filter mask type",
+                value: i128::from(value),
+                min: 0,
+                max: 2,
+            }
+            .into());
+        }
+    }
+    let sender_name = decode_bound_chat_type(reader)?;
+    require_consumed(reader, "Player Chat")?;
+    let message = unsigned.unwrap_or(TextComponent {
+        value: NbtTag::String(crate::nbt::NbtString::from_utf16_units(
+            content.encode_utf16().collect(),
+        )),
+        plain_text: content,
+    });
+    Ok(PlayClientbound::PlayerChat {
+        sender_uuid,
+        sender_name,
+        message,
+        global_index,
+        acknowledgement_required,
+    })
+}
+
+fn decode_bound_chat_type(reader: &mut CodecReader<'_>) -> Result<String, BootstrapProtocolError> {
+    let holder = reader.read_var_int()?;
+    if holder < 0 {
+        return Err(BootstrapProtocolError::NegativeCount {
+            context: "Bound Chat Type holder",
+            value: holder,
+        });
+    }
+    if holder == 0 {
+        let _inline = decode_text_component(reader)?;
+    }
+    let sender = decode_text_component(reader)?;
+    if reader.read_bool()? {
+        let _target = decode_text_component(reader)?;
+    }
+    Ok(sender.plain_text)
+}
+
+fn decode_text_component(
+    reader: &mut CodecReader<'_>,
+) -> Result<TextComponent, BootstrapProtocolError> {
+    if reader.remaining() > MAX_CHAT_COMPONENT_BYTES {
+        return Err(BootstrapProtocolError::PayloadTooLarge {
+            context: "text component",
+            length: reader.remaining(),
+            max: MAX_CHAT_COMPONENT_BYTES,
+        });
+    }
+    let value = decode_unnamed_network_tag(reader, NbtLimits::default())
+        .map_err(BootstrapProtocolError::Nbt)?;
+    let mut plain_text = String::new();
+    project_plain_text(&value, &mut plain_text, 0);
+    if plain_text.is_empty() {
+        plain_text.push_str("<rich text>");
+    }
+    Ok(TextComponent { value, plain_text })
+}
+
+fn project_plain_text(value: &NbtTag, output: &mut String, depth: usize) {
+    if depth > 32 || output.len() >= MAX_CHAT_COMPONENT_BYTES {
+        return;
+    }
+    match value {
+        NbtTag::String(value) => output.push_str(&value.to_string_lossy()),
+        NbtTag::List(list) => {
+            for child in list.elements() {
+                project_plain_text(child, output, depth + 1);
+            }
+        }
+        NbtTag::Compound(compound) => {
+            if let Some(text) = compound.get_string("text") {
+                output.push_str(&text.to_string_lossy());
+            } else if let Some(translate) = compound.get_string("translate") {
+                output.push_str(&translate.to_string_lossy());
+                if let Some(NbtTag::List(arguments)) = compound.get_str("with") {
+                    output.push(' ');
+                    for argument in arguments.elements() {
+                        project_plain_text(argument, output, depth + 1);
+                    }
+                }
+            }
+            if let Some(NbtTag::List(extra)) = compound.get_str("extra") {
+                for child in extra.elements() {
+                    project_plain_text(child, output, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+    if output.len() > MAX_CHAT_COMPONENT_BYTES {
+        output.truncate(MAX_CHAT_COMPONENT_BYTES);
+    }
 }
 
 fn decode_login_success<'a>(

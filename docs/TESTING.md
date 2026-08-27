@@ -56,14 +56,22 @@ Phase 7 adds independent hand-authored protocol-775 vectors for the Login Handsh
 
 No automated test downloads, starts, or contacts a Minecraft server. The required manual Phase 7 acceptance test passed against vanilla 26.1.2 at `localhost:25565` with `online-mode=false` and `network-compression-threshold=-1`. Running `cargo run -p cubic-app -- dev-login localhost:25565 --username CubicTest` completed Login and Configuration and reported `State: Play`; the vanilla server logged that `CubicTest` joined and spawned into the world before Cubic deliberately disconnected.
 
+## Phase 8
+
+Nine independent protocol-775 Play vectors cover exact control replies, the complete unsigned outbound chat body and frame length (including offset, raw fixed 20-bit acknowledgement bytes, and trailing checksum), signed-versus-unsigned Player Chat acknowledgement classification, Player/Disguised/System Chat, simple/nested text, Unicode, malformed known packets, input bounds, and safe identification of irrelevant world frames. The persistent in-process mock server completes Login and Configuration, then checks Play Client Information, Keep Alive, Pong, teleport confirmation, chunk-batch acknowledgement, Player Loaded, fragmented Unicode System Chat, verifies that unsigned Player Chat does not produce an invalid acknowledgement, checks the complete outgoing unsigned chat payload with no trailing bytes, and performs a clean disconnect. Existing Status and one-shot development-login suites remain unchanged and passing.
+
+Five headless `cubic-ui` tests cover deterministic oldest-first history eviction, Java UTF-16 input bounds/control filtering, empty/nonempty send actions, visible connection/disconnection transitions, and byte-for-byte preservation of common Latin, Cyrillic, emoji, and CJK text. `cubic-platform` tests verify that its system CJK font is appended behind—not substituted for—egui's existing fallback chain and that Windows candidate priority is deterministic. Three network unit tests cover regular-event backpressure, the separate critical-event slot, and explicit Unicode/command/input policy. These tests do not create a GPU or native window. Native clipboard round trips and actual glyph appearance remain manual because headless tests cannot prove OS clipboard ownership or GPU text rendering.
+
+The final real Phase 8 server/UI acceptance passed against a local vanilla Java Edition 26.1.2 server. It verified persistent bidirectional chat, Unicode transport, visible common CJK fallback glyphs, message spam, bounded eviction, scrolling, resize/minimize/restore, Enter and button send actions, alerts, long idle operation, clean disconnect, external application → Cubic paste, and Cubic copy/cut → Windows system clipboard. Release-mode idle use on the tested Windows machine was approximately 5% CPU with brief spikes near 10%, 115 MiB RAM, and 1.3% GPU; this is accepted for the MVP, with deeper optimization deferred.
+
 ## Future testing
 
 - Unit tests will cover isolated logic and error cases.
 - Property tests will cover parsers, codecs, and other invariant-heavy code where suitable.
 - Integration tests will verify interactions across crate boundaries.
 - Full packet-schema fixtures will later cover known valid and malformed packets without containing copyrighted game assets. Phase 3 already includes small public wire-format vectors for primitive codecs.
-- Mock-server tests exercise the Phase 5 Status and Phase 7 development Login/Configuration exchanges; persistent Play simulations remain future work.
-- Real vanilla-server tests validate end-to-end compatibility in controlled environments. The Phase 5 and Phase 7 manual smoke tests passed.
+- Mock-server tests exercise Status, development Login/Configuration, and Phase 8's bounded persistent Play/chat subset.
+- Real vanilla-server tests validate end-to-end compatibility in controlled environments. The Phase 5, Phase 7, and Phase 8 manual acceptance tests passed.
 - Rendering regression tests will later compare deterministic scenes or render outputs.
 - Performance benchmarks will later track hot paths and memory behavior.
 - Every previously supported Minecraft version must eventually remain regression-tested as new versions are added.
