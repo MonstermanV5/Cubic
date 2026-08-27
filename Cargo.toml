@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/cubic-auth",
     "crates/cubic-app",
     "crates/cubic-core",
     "crates/cubic-network",
@@ -21,6 +22,20 @@ publish = false
 rust-version = "1.98"
 
 [workspace.dependencies]
+aes = { version = "0.9.2", features = ["zeroize"] }
+base64 = "0.22.1"
+cfb8 = { version = "0.9.1", features = ["zeroize"] }
+flate2 = "1.1.9"
+httpdate = "1.0.3"
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"] }
+rand = "0.9.2"
+rand_core_06 = { package = "rand_core", version = "0.6.4", features = ["getrandom"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "native-tls"] }
+rsa = { version = "0.9.10", default-features = false, features = ["std", "u64_digit"] }
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+url = "2.5.7"
+zeroize = { version = "1.9.0", features = ["derive"] }
 egui = { version = "0.36.1", default-features = false, features = ["default_fonts"] }
 egui-wgpu = { version = "0.36.1", default-features = false }
 egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard"] }
@@ -30,9 +45,11 @@ serde_json = "1.0.151"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
 thiserror = "2.0.20"
+tempfile = "3.27.0"
 tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["dx12", "metal", "std"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+wry = { version = "0.56.1", default-features = false }
 
 [workspace.dependencies.proptest]
 version = "1.11.0"

@@ -114,3 +114,11 @@ Offline mode permits the absent authenticated chat session used by the MVP. Cubi
 ## Deliberate exclusions
 
 Phase 8 does not implement DNS SRV, compression, encryption, authentication, signing, automatic reconnect, general Play schemas, registries, world/chunk/entity state, movement, resource packs, or gameplay. Phase 12 will replace the manual packet profile; Phase 18 will add Chat/Play switching.
+
+## Phase 9 online transport
+
+The in-progress authenticated path extends the same `MinecraftConnection`. Encryption and compression are explicit transport state changes: AES-128/CFB8 decrypts before outer framing, and zlib decompression occurs only after a complete bounded frame; writes reverse that order. Set Compression itself is decoded in the previous framing mode. Phase 5 Status and Phase 7/8 offline traffic use the same transport with both transforms disabled.
+
+Authentication providers remain outside this transport. `cubic-network` accepts an authenticated profile/token plus the narrow `MinecraftSessionJoiner` capability, so the existing RSA, session-server, AES, compression, Login, and Configuration pipeline is identical for `CubicEntra` and experimental `XalInterop`. The experimental backend therefore adds no XAL/SISU concepts to packet or transport code.
+
+`online-login` currently proves only the one-shot authenticated Login/Configuration boundary. Persistent authenticated Chat Mode and the protocol-775 player-certificate/session signing path remain incomplete; see `AUTHENTICATION.md`.

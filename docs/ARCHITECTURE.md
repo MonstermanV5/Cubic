@@ -4,6 +4,7 @@ This document describes current and intended boundaries. Phases 1-7 provide the 
 
 ## Workspace responsibilities
 
+- `cubic-auth`: UI-independent Microsoft/Xbox/Minecraft authentication with explicit `CubicEntra` and experimental `XalInterop` providers, token lifecycle, typed account identity, bounded HTTPS services, session-server join, proof-of-possession signing, and secure credential-store abstraction. It has no renderer or Minecraft packet codecs.
 - `cubic-app`: composition root. It parses graphical, Status, one-shot development-login, and Chat Mode commands; Chat Mode starts the network runtime on a dedicated thread and passes only a bounded session port to the platform/UI side.
 - `cubic-core`: platform-independent shared concepts, including protocol-independent rich text, chat events, session commands, and connection presentation state.
 - `cubic-protocol`: owns synchronous codecs and the isolated temporary protocol-775 bootstrap profile, now including only the small Phase 8 Play control/chat subset. It contains no sockets, async runtime, compression, authentication, or general Play schema.
@@ -13,12 +14,14 @@ This document describes current and intended boundaries. Phases 1-7 provide the 
 - `cubic-world`: future world, chunk, block, biome, and entity state.
 - `cubic-render`: owns wgpu surface/device submission and the direct `egui-wgpu` paint integration used by Chat Mode. It still contains no world renderer.
 - `cubic-ui`: owns the protocol-independent Chat Mode model and egui presentation: bounded history, text input, send action, scrolling, and connection/error state.
-- `cubic-platform`: owns the winit event loop, native window lifecycle, redraw scheduling, suspension, and the isolated future iOS host handoff.
+- `cubic-platform`: owns the winit event loop, native window lifecycle, redraw scheduling, suspension, the Windows-only private WebView2 navigation host for experimental XAL authorization capture, and the isolated future iOS host handoff.
 - `version-generator`: offline development/build utility that validates installed version datasets and builds a deterministic catalog from on-disk version data. Depends only on `cubic-version`; performs no network access.
 
 ## Dependency direction
 
 `cubic-app` composes `cubic-network` with `cubic-platform`/`cubic-ui`. `cubic-network` depends on `cubic-core`, `cubic-protocol`, and `cubic-version`. `cubic-ui` depends only on `cubic-core` and egui; its session-port trait prevents it from owning or naming TCP. `cubic-platform` depends on `cubic-ui` and `cubic-render`; `cubic-render` owns the wgpu/egui-wgpu integration. Dependencies remain acyclic.
+
+Phase 9 adds `cubic-app -> cubic-auth` for orchestration and `cubic-network -> cubic-auth` only for authenticated identity and the provider-neutral `MinecraftSessionJoiner` capability. The network path cannot distinguish whether an access token came from Cubic's Entra registration or experimental XAL interoperability. OAuth/Xbox HTTP concepts do not enter `cubic-protocol`, and authentication never touches rendering. See `AUTHENTICATION.md`.
 
 `cubic-protocol` remains independent of the application, platform, renderer, async runtime, and network transport. `cubic-network` feeds arbitrary TCP fragments into its synchronous frame decoder and gives completed frame bodies to state-specific codecs. A future generated packet-schema layer may consume completed frame bodies and decode NBT directly from the same primitive reader without copying the remainder of a packet. Root-format selection is an explicit call-site choice, not a Minecraft-version check inside NBT.
 

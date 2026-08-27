@@ -144,5 +144,8 @@ fn map_connection_error(error: ConnectionError) -> StatusQueryError {
             buffered_bytes,
         },
         ConnectionError::Framing(error) => StatusQueryError::Framing(error),
+        ConnectionError::Transform(error) => StatusQueryError::WireTransform {
+            reason: error.to_string(),
+        },
     }
 }

@@ -19,9 +19,11 @@ use winit::{
 
 #[cfg(target_os = "ios")]
 mod ios;
+mod xal_sign_in;
 
 #[cfg(target_os = "ios")]
 pub use ios::run_from_native_host;
+pub use xal_sign_in::{XalSignInWindowError, capture_xal_authorization};
 
 const WINDOW_TITLE: &str = "Cubic";
 const INITIAL_WIDTH: f64 = 1280.0;

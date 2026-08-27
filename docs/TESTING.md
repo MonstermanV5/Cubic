@@ -64,6 +64,14 @@ Five headless `cubic-ui` tests cover deterministic oldest-first history eviction
 
 The final real Phase 8 server/UI acceptance passed against a local vanilla Java Edition 26.1.2 server. It verified persistent bidirectional chat, Unicode transport, visible common CJK fallback glyphs, message spam, bounded eviction, scrolling, resize/minimize/restore, Enter and button send actions, alerts, long idle operation, clean disconnect, external application → Cubic paste, and Cubic copy/cut → Windows system clipboard. Release-mode idle use on the tested Windows machine was approximately 5% CPU with brief spikes near 10%, 115 MiB RAM, and 1.3% GPU; this is accepted for the MVP, with deeper optimization deferred.
 
+## Phase 9
+
+Headless `cubic-auth` tests cover the RFC 7636 S256 vector, random verifier/state shape, strict callback parsing, OAuth error callbacks, client/profile identifiers, redacted secret formatting, deterministic Xbox User Token and XSTS JSON vectors, known XSTS account-error mapping, and fake secure-store behavior. Experimental XAL tests cover provider selection, separate backend/device records, targeted logout, P-256 key generation and restoration, public JWK construction, the canonical signed-message bytes, raw ES256 signature verification, desktop redirect/state validation, duplicate/missing callback fields, misleading hosts, redacted captured codes, device and XSTS request shapes, missing SISU headers, malformed responses, entitlement failure, and refresh-token rotation. `cubic-platform` tests cover the exact initial authorization endpoint, reviewed HTTPS identity-host allowlist, cancellation, and timeout transitions without creating a browser. No automated test contains or contacts a real account.
+
+The experimental XAL backend passed a real account test through Xbox device authentication, SISU authenticate, Microsoft OAuth + PKCE, SISU authorize, XSTS, Minecraft launcher login, entitlement/profile validation, and secure credential persistence. Its initial manual redirect-copy mechanism proved the protocol; the replacement automatic WebView2 capture requires a focused Windows UX retest. Headless CI does not instantiate WebView2.
+
+Protocol/network tests add an independent Encryption Response vector, positive and negative Java-BigInteger server-hash vectors, continuous AES/CFB8 fragmentation, compression below/at threshold, and malformed declared-size/decompression rejection. Existing Status, offline Login, and Chat Mode suites remain regression coverage. A full mock XAL HTTP sequence plus encrypted Login integration suite, player-certificate/session signing tests, iOS Keychain host tests, and online-mode acceptance remain required before Phase 9 completion.
+
 ## Future testing
 
 - Unit tests will cover isolated logic and error cases.

@@ -1,11 +1,18 @@
-use std::{process::ExitCode, str::FromStr};
+use std::{process::ExitCode, str::FromStr, time::Duration};
 
+use cubic_auth::{
+    AuthBackend, AuthClient, AuthClientOptions, AuthenticatedMinecraftAccount, CredentialStore,
+    LoopbackAuthorization, MicrosoftClientId, MinecraftSessionJoiner, StoredAccount,
+    SystemCredentialStore, XalAuthClient, XalDeviceIdentity,
+};
 use cubic_network::{
-    ChatSessionHandle, ChatSessionOptions, DevelopmentLoginOptions, DevelopmentUsername,
-    ServerAddress, StatusQueryOptions, development_login, query_server_status,
-    run_development_chat_session,
+    AuthenticatedLoginOptions, ChatSessionHandle, ChatSessionOptions, DevelopmentLoginOptions,
+    DevelopmentUsername, ServerAddress, StatusQueryOptions, authenticated_login, development_login,
+    query_server_status, run_development_chat_session,
 };
 use cubic_ui::ChatSessionPort;
+
+const XAL_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 fn main() -> ExitCode {
     if let Err(error) = tracing_subscriber::fmt()
@@ -22,7 +29,7 @@ fn main() -> ExitCode {
         Ok(command) => command,
         Err(message) => {
             eprintln!(
-                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]\n  cubic-app dev-login <host[:port]> [--username <name>]\n  cubic-app chat <host[:port]> [--username <name>]"
+                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]\n  cubic-app dev-login <host[:port]> [--username <name>]\n  cubic-app chat <host[:port]> [--username <name>]\n  cubic-app auth login [--backend cubic-entra|xal]\n  cubic-app auth status [--backend cubic-entra|xal]\n  cubic-app auth logout [--backend cubic-entra|xal]\n  cubic-app online-login <host[:port]> [--backend cubic-entra|xal]"
             );
             return ExitCode::FAILURE;
         }
@@ -33,7 +40,348 @@ fn main() -> ExitCode {
         Command::Status { address, protocol } => run_status(&address, protocol),
         Command::DevLogin { address, username } => run_development_login(&address, &username),
         Command::Chat { address, username } => run_chat(address, username),
+        Command::Auth(action) => run_auth(action),
+        Command::OnlineLogin { address, backend } => run_online_login(&address, backend),
     }
+}
+
+fn configured_auth_client() -> Result<AuthClient, String> {
+    let raw = std::env::var("CUBIC_MSA_CLIENT_ID")
+        .map_err(|_| "CUBIC_MSA_CLIENT_ID is not configured".to_owned())?;
+    let client_id = MicrosoftClientId::new(raw).map_err(|error| error.to_string())?;
+    AuthClient::new(client_id, AuthClientOptions::default()).map_err(|error| error.to_string())
+}
+
+fn run_online_login(address: &ServerAddress, backend: AuthBackend) -> ExitCode {
+    let store = SystemCredentialStore;
+    let stored = match store.load_account(backend) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            tracing::error!(%backend, "not signed in with this backend; run `cubic-app auth login --backend ...` first");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            tracing::error!(%error, "could not read Cubic credentials");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "could not create online-login runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    match backend {
+        AuthBackend::CubicEntra => {
+            let client = match configured_auth_client() {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(%error, "authentication configuration is invalid");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let account = match runtime.block_on(client.refresh(&stored.refresh_token)) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(%error, "stored Cubic-Entra authentication could not be refreshed; run `auth login` again");
+                    return ExitCode::FAILURE;
+                }
+            };
+            complete_online_login(address, backend, &store, &runtime, &client, account)
+        }
+        AuthBackend::XalInterop => {
+            let credential = match store.load_xal_device() {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    tracing::error!(
+                        "XAL device identity is missing; run `auth login --backend xal`"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                Err(error) => {
+                    tracing::error!(%error, "could not read the XAL device identity");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let device = match XalDeviceIdentity::from_credential(&credential) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(%error, "stored XAL device identity is invalid");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let client = match XalAuthClient::new(AuthClientOptions::default()) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(%error, "could not initialize the XAL client");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let account = match runtime.block_on(client.refresh(&device, &stored.refresh_token)) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(%error, "stored XAL authentication could not be refreshed; run `auth login --backend xal` again");
+                    return ExitCode::FAILURE;
+                }
+            };
+            complete_online_login(address, backend, &store, &runtime, &client, account)
+        }
+    }
+}
+
+fn complete_online_login<J: MinecraftSessionJoiner>(
+    address: &ServerAddress,
+    backend: AuthBackend,
+    store: &dyn CredentialStore,
+    runtime: &tokio::runtime::Runtime,
+    joiner: &J,
+    account: AuthenticatedMinecraftAccount,
+) -> ExitCode {
+    let rotated = StoredAccount {
+        backend,
+        refresh_token: account.refresh_token.clone(),
+        profile: account.profile.clone(),
+    };
+    if let Err(error) = store.save_account(backend, &rotated) {
+        tracing::error!(%error, "refreshed credentials could not be stored safely");
+        return ExitCode::FAILURE;
+    }
+    match runtime.block_on(authenticated_login(
+        address,
+        &account,
+        joiner,
+        &AuthenticatedLoginOptions::default(),
+    )) {
+        Ok(result) => {
+            println!("Cubic Authenticated Login\n");
+            println!("Address: {}", result.address);
+            println!("Backend: {backend}");
+            println!("Profile: {}", result.profile_name);
+            println!("UUID: {:032x}", result.profile_uuid.as_u128());
+            println!(
+                "Compression: {}",
+                if result.compression_enabled {
+                    "enabled"
+                } else {
+                    "not requested"
+                }
+            );
+            println!("State: {}", result.state);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            tracing::error!(%error, address = %address, "authenticated online login failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_auth(action: AuthAction) -> ExitCode {
+    let store = SystemCredentialStore;
+    match action {
+        AuthAction::Status { backend } => run_auth_status(&store, backend),
+        AuthAction::Logout { backend } => match store.delete_account(backend) {
+            Ok(()) => {
+                println!("Cubic authentication credentials removed for {backend}.");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not remove Cubic credentials");
+                ExitCode::FAILURE
+            }
+        },
+        AuthAction::Login { backend } => match backend {
+            AuthBackend::CubicEntra => run_interactive_entra_auth(&store),
+            AuthBackend::XalInterop => run_interactive_xal_auth(&store),
+        },
+    }
+}
+
+fn run_auth_status(store: &dyn CredentialStore, selected: Option<AuthBackend>) -> ExitCode {
+    let backends: &[AuthBackend] = selected.as_ref().map_or(
+        &[AuthBackend::CubicEntra, AuthBackend::XalInterop],
+        std::slice::from_ref,
+    );
+    for backend in backends {
+        match store.load_account(*backend) {
+            Ok(Some(account)) => {
+                println!("Backend: {backend}");
+                println!("Signed in: yes");
+                println!("Minecraft profile: {}", account.profile.name);
+                println!("UUID: {}", account.profile.id);
+                println!("Token status: refresh required before online use\n");
+            }
+            Ok(None) => {
+                println!("Backend: {backend}");
+                println!("Signed in: no\n");
+            }
+            Err(error) => {
+                tracing::error!(%error, %backend, "could not read Cubic credentials");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_interactive_entra_auth(store: &dyn CredentialStore) -> ExitCode {
+    let client_id = match std::env::var("CUBIC_MSA_CLIENT_ID") {
+        Ok(value) => match MicrosoftClientId::new(value) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(%error, "invalid CUBIC_MSA_CLIENT_ID");
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(_) => {
+            tracing::error!("CUBIC_MSA_CLIENT_ID is not configured");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "could not create authentication runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async {
+        let pending = LoopbackAuthorization::begin(&client_id).await?;
+        let url = pending.authorization_url().as_str();
+        println!(
+            "Open this Microsoft authorization URL if the system browser does not open:\n{url}"
+        );
+        open_system_browser(url);
+        let code = pending.wait().await?;
+        let client = AuthClient::new(client_id, AuthClientOptions::default())?;
+        client.authenticate_code(code).await
+    });
+    match result {
+        Ok(account) => {
+            let stored = StoredAccount {
+                backend: AuthBackend::CubicEntra,
+                refresh_token: account.refresh_token,
+                profile: account.profile,
+            };
+            if let Err(error) = store.save_account(AuthBackend::CubicEntra, &stored) {
+                tracing::error!(%error, "authentication succeeded but secure credential storage failed");
+                return ExitCode::FAILURE;
+            }
+            println!("Cubic authentication succeeded.");
+            println!("Minecraft profile: {}", stored.profile.name);
+            println!("UUID: {}", stored.profile.id);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            tracing::error!(%error, "Cubic authentication failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_interactive_xal_auth(store: &dyn CredentialStore) -> ExitCode {
+    println!("EXPERIMENTAL: XAL/SISU interoperability is for development testing only.");
+    let device = match store.load_xal_device() {
+        Ok(Some(value)) => match XalDeviceIdentity::from_credential(&value) {
+            Ok(device) => device,
+            Err(error) => {
+                tracing::error!(%error, "stored XAL device identity is invalid");
+                return ExitCode::FAILURE;
+            }
+        },
+        Ok(None) => {
+            let device = XalDeviceIdentity::generate();
+            let credential = match device.to_credential() {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(%error, "could not encode the XAL device identity");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(error) = store.save_xal_device(&credential) {
+                tracing::error!(%error, "could not persist the XAL device identity securely");
+                return ExitCode::FAILURE;
+            }
+            device
+        }
+        Err(error) => {
+            tracing::error!(%error, "could not read the XAL device identity");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "could not create authentication runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    let client = match XalAuthClient::new(AuthClientOptions::default()) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "could not initialize the XAL client");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pending = match runtime.block_on(client.begin_interactive(&device)) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "XAL device/SISU authentication could not begin");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("Opening the dedicated Microsoft sign-in window...");
+    let authorization_code =
+        match cubic_platform::capture_xal_authorization(&pending, XAL_SIGN_IN_TIMEOUT) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(%error, "experimental XAL sign-in window failed");
+                return ExitCode::FAILURE;
+            }
+        };
+    let account =
+        match runtime.block_on(client.complete_interactive(&device, pending, authorization_code)) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(%error, "experimental XAL authentication failed");
+                return ExitCode::FAILURE;
+            }
+        };
+    let stored = StoredAccount {
+        backend: AuthBackend::XalInterop,
+        refresh_token: account.refresh_token,
+        profile: account.profile,
+    };
+    if let Err(error) = store.save_account(AuthBackend::XalInterop, &stored) {
+        tracing::error!(%error, "authentication succeeded but secure credential storage failed");
+        return ExitCode::FAILURE;
+    }
+    println!("Experimental XAL authentication succeeded.");
+    println!("Minecraft profile: {}", stored.profile.name);
+    println!("UUID: {}", stored.profile.id);
+    ExitCode::SUCCESS
+}
+
+#[cfg(windows)]
+fn open_system_browser(url: &str) {
+    if let Err(error) = webbrowser::open(url) {
+        tracing::warn!(%error, "could not open the system browser automatically");
+    }
+}
+
+#[cfg(not(windows))]
+fn open_system_browser(_url: &str) {
+    tracing::warn!("automatic browser opening is not implemented for this target");
 }
 
 fn run_chat(address: ServerAddress, username: DevelopmentUsername) -> ExitCode {
@@ -231,6 +579,18 @@ enum Command {
         address: ServerAddress,
         username: DevelopmentUsername,
     },
+    Auth(AuthAction),
+    OnlineLogin {
+        address: ServerAddress,
+        backend: AuthBackend,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthAction {
+    Login { backend: AuthBackend },
+    Status { backend: Option<AuthBackend> },
+    Logout { backend: AuthBackend },
 }
 
 fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command, String> {
@@ -238,6 +598,36 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     let Some(command) = arguments.next() else {
         return Ok(Command::Graphical);
     };
+    if command == "auth" {
+        let action_name = arguments.next();
+        let backend = parse_optional_backend(&mut arguments)?;
+        let action = match action_name.as_deref() {
+            Some("login") => AuthAction::Login {
+                backend: backend.unwrap_or(AuthBackend::CubicEntra),
+            },
+            Some("status") => AuthAction::Status { backend },
+            Some("logout") => AuthAction::Logout {
+                backend: backend.unwrap_or(AuthBackend::CubicEntra),
+            },
+            Some(value) => return Err(format!("unknown auth action {value:?}")),
+            None => return Err("auth command requires login, status, or logout".to_owned()),
+        };
+        if let Some(extra) = arguments.next() {
+            return Err(format!("unexpected auth argument {extra:?}"));
+        }
+        return Ok(Command::Auth(action));
+    }
+    if command == "online-login" {
+        let target = arguments
+            .next()
+            .ok_or_else(|| "online-login command requires a server address".to_owned())?;
+        let address = ServerAddress::from_str(&target).map_err(|error| error.to_string())?;
+        let backend = parse_optional_backend(&mut arguments)?.unwrap_or(AuthBackend::CubicEntra);
+        if let Some(extra) = arguments.next() {
+            return Err(format!("unexpected argument {extra:?}"));
+        }
+        return Ok(Command::OnlineLogin { address, backend });
+    }
     if command == "dev-login" {
         return parse_development_login(arguments);
     }
@@ -267,6 +657,23 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         return Err(format!("unexpected argument {extra:?}"));
     }
     Ok(Command::Status { address, protocol })
+}
+
+fn parse_optional_backend(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<Option<AuthBackend>, String> {
+    let Some(option) = arguments.next() else {
+        return Ok(None);
+    };
+    if option != "--backend" {
+        return Err(format!("unexpected auth argument {option:?}"));
+    }
+    let value = arguments
+        .next()
+        .ok_or_else(|| "--backend requires cubic-entra or xal".to_owned())?;
+    AuthBackend::from_str(&value)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn parse_chat(arguments: impl Iterator<Item = String>) -> Result<Command, String> {
@@ -305,7 +712,7 @@ fn parse_server_and_username(
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, bounded_preview, parse_command};
+    use super::{AuthAction, AuthBackend, Command, bounded_preview, parse_command};
 
     #[test]
     fn no_arguments_preserve_graphical_mode() {
@@ -401,5 +808,64 @@ mod tests {
         let preview = bounded_preview(&"x".repeat(600));
         assert_eq!(preview.chars().count(), 513);
         assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn authentication_commands_are_explicit_and_do_not_accept_secrets() {
+        assert_eq!(
+            parse_command(["auth".to_owned(), "status".to_owned()]),
+            Ok(Command::Auth(AuthAction::Status { backend: None }))
+        );
+        assert!(
+            parse_command(["auth".to_owned(), "login".to_owned(), "secret".to_owned()]).is_err()
+        );
+        let command =
+            parse_command(["online-login".to_owned(), "localhost:25565".to_owned()]).unwrap();
+        assert!(matches!(command, Command::OnlineLogin { .. }));
+        assert_eq!(
+            parse_command([
+                "auth".to_owned(),
+                "login".to_owned(),
+                "--backend".to_owned(),
+                "xal".to_owned(),
+            ]),
+            Ok(Command::Auth(AuthAction::Login {
+                backend: AuthBackend::XalInterop
+            }))
+        );
+        assert_eq!(
+            parse_command([
+                "auth".to_owned(),
+                "status".to_owned(),
+                "--backend".to_owned(),
+                "xal".to_owned(),
+            ]),
+            Ok(Command::Auth(AuthAction::Status {
+                backend: Some(AuthBackend::XalInterop)
+            }))
+        );
+        assert!(matches!(
+            parse_command([
+                "online-login".to_owned(),
+                "localhost:25565".to_owned(),
+                "--backend".to_owned(),
+                "xal".to_owned(),
+            ]),
+            Ok(Command::OnlineLogin {
+                backend: AuthBackend::XalInterop,
+                ..
+            })
+        ));
+        assert_eq!(
+            parse_command([
+                "auth".to_owned(),
+                "logout".to_owned(),
+                "--backend".to_owned(),
+                "xal".to_owned(),
+            ]),
+            Ok(Command::Auth(AuthAction::Logout {
+                backend: AuthBackend::XalInterop
+            }))
+        );
     }
 }

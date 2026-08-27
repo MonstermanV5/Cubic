@@ -37,6 +37,8 @@ pub enum StatusQueryError {
     },
     #[error("malformed Minecraft frame")]
     Framing(#[source] CodecError),
+    #[error("Minecraft wire transform failed: {reason}")]
+    WireTransform { reason: String },
     #[error("Status response frame has {length} bytes, exceeding limit {max}")]
     StatusResponseTooLarge { length: usize, max: usize },
     #[error(transparent)]
@@ -97,6 +99,8 @@ pub enum DevelopmentLoginError {
     },
     #[error("malformed Minecraft frame")]
     Framing(#[source] CodecError),
+    #[error("Minecraft wire transform failed: {reason}")]
+    WireTransform { reason: String },
     #[error(transparent)]
     Protocol(#[from] BootstrapProtocolError),
     #[error("server disconnected during {state}: {reason}")]

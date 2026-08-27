@@ -1,4 +1,4 @@
-mod profile;
+pub(crate) mod profile;
 
 use std::{fmt, time::Duration};
 
@@ -234,7 +234,7 @@ async fn run_login(
                     reason: bounded_preview(reason_json),
                 });
             }
-            LoginClientbound::EncryptionRequest => {
+            LoginClientbound::EncryptionRequest(_) => {
                 return Err(DevelopmentLoginError::UnsupportedForPhase7 {
                     feature: UnsupportedPhase7Feature::Encryption,
                     required_setting: "online-mode=false",
@@ -389,7 +389,7 @@ pub(crate) async fn run_configuration(
     })
 }
 
-fn transition(
+pub(crate) fn transition(
     state: &mut ConnectionState,
     expected: ConnectionState,
     next: ConnectionState,
@@ -434,6 +434,9 @@ fn map_connection_error(error: ConnectionError) -> DevelopmentLoginError {
             buffered_bytes,
         },
         ConnectionError::Framing(error) => DevelopmentLoginError::Framing(error),
+        ConnectionError::Transform(error) => DevelopmentLoginError::WireTransform {
+            reason: error.to_string(),
+        },
     }
 }
 

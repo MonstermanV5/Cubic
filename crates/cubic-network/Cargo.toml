@@ -7,9 +7,16 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aes.workspace = true
+cfb8.workspace = true
+cubic-auth = { path = "../cubic-auth" }
 cubic-core = { path = "../cubic-core" }
 cubic-protocol = { path = "../cubic-protocol" }
 cubic-version = { path = "../cubic-version" }
+flate2.workspace = true
+rand_core_06.workspace = true
+rsa.workspace = true
+sha1.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

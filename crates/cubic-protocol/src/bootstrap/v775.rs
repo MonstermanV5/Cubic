@@ -113,6 +113,14 @@ pub struct LoginSuccess<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncryptionRequest<'a> {
+    pub server_id: &'a str,
+    pub public_key_der: &'a [u8],
+    pub verify_token: &'a [u8],
+    pub should_authenticate: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GameProfileProperty<'a> {
     pub name: &'a str,
     pub value: &'a str,
@@ -131,7 +139,7 @@ pub enum LoginClientbound<'a> {
     Disconnect {
         reason_json: &'a str,
     },
-    EncryptionRequest,
+    EncryptionRequest(EncryptionRequest<'a>),
     Success(LoginSuccess<'a>),
     SetCompression {
         threshold: i32,
@@ -366,6 +374,17 @@ pub fn encode_login_acknowledged() -> Result<Vec<u8>, BootstrapProtocolError> {
     packet_without_payload(LOGIN_ACKNOWLEDGED_ID)
 }
 
+pub fn encode_encryption_response(
+    encrypted_secret: &[u8],
+    encrypted_verify_token: &[u8],
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(0x01);
+    writer.write_byte_array(encrypted_secret, 4 * 1024)?;
+    writer.write_byte_array(encrypted_verify_token, 4 * 1024)?;
+    frame(writer)
+}
+
 pub fn encode_login_plugin_response(
     transaction_id: i32,
 ) -> Result<Vec<u8>, BootstrapProtocolError> {
@@ -391,7 +410,16 @@ pub fn decode_login_clientbound(
             require_consumed(&reader, "Login Disconnect")?;
             Ok(LoginClientbound::Disconnect { reason_json })
         }
-        LOGIN_ENCRYPTION_REQUEST_ID => Ok(LoginClientbound::EncryptionRequest),
+        LOGIN_ENCRYPTION_REQUEST_ID => {
+            let request = EncryptionRequest {
+                server_id: reader.read_string(StringLimits::new(20, 60))?,
+                public_key_der: reader.read_byte_array(4 * 1024)?,
+                verify_token: reader.read_byte_array(64)?,
+                should_authenticate: reader.read_bool()?,
+            };
+            require_consumed(&reader, "Encryption Request")?;
+            Ok(LoginClientbound::EncryptionRequest(request))
+        }
         LOGIN_SUCCESS_ID => decode_login_success(&mut reader).map(LoginClientbound::Success),
         LOGIN_SET_COMPRESSION_ID => {
             let threshold = reader.read_var_int()?;

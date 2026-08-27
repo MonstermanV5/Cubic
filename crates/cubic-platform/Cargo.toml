@@ -7,13 +7,21 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cubic-auth = { path = "../cubic-auth" }
 cubic-render = { path = "../cubic-render" }
 cubic-ui = { path = "../cubic-ui" }
 egui.workspace = true
 egui-winit.workspace = true
 pollster.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
+url.workspace = true
 winit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+tempfile.workspace = true
+wry.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

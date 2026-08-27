@@ -9,6 +9,7 @@ use tokio::{
 };
 
 use crate::ServerAddress;
+use crate::transforms::{TransformError, WireTransforms};
 
 const READ_BUFFER_SIZE: usize = 8 * 1024;
 
@@ -39,12 +40,15 @@ pub(crate) enum ConnectionError {
     },
     #[error("malformed Minecraft frame")]
     Framing(#[source] CodecError),
+    #[error("Minecraft wire transform failed")]
+    Transform(#[source] TransformError),
 }
 
 pub(crate) struct MinecraftConnection {
     stream: TcpStream,
     decoder: FrameDecoder,
     io_timeout: Duration,
+    transforms: WireTransforms,
 }
 
 impl MinecraftConnection {
@@ -73,7 +77,20 @@ impl MinecraftConnection {
             stream,
             decoder: FrameDecoder::new(limits),
             io_timeout,
+            transforms: WireTransforms::new(limits),
         })
+    }
+
+    pub(crate) fn enable_encryption(&mut self, secret: &[u8; 16]) -> Result<(), ConnectionError> {
+        self.transforms
+            .enable_encryption(secret)
+            .map_err(ConnectionError::Transform)
+    }
+
+    pub(crate) fn enable_compression(&mut self, threshold: i32) -> Result<(), ConnectionError> {
+        self.transforms
+            .enable_compression(threshold)
+            .map_err(ConnectionError::Transform)
     }
 
     pub(crate) async fn write_all(
@@ -81,7 +98,11 @@ impl MinecraftConnection {
         bytes: &[u8],
         operation: &'static str,
     ) -> Result<(), ConnectionError> {
-        match timeout(self.io_timeout, self.stream.write_all(bytes)).await {
+        let bytes = self
+            .transforms
+            .encode_outbound(bytes)
+            .map_err(ConnectionError::Transform)?;
+        match timeout(self.io_timeout, self.stream.write_all(&bytes)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(source)) => Err(ConnectionError::Io { operation, source }),
             Err(_) => Err(ConnectionError::IoTimeout {
@@ -115,7 +136,12 @@ impl MinecraftConnection {
         let mut read_buffer = [0_u8; READ_BUFFER_SIZE];
         loop {
             match self.decoder.next_frame() {
-                Ok(Some(frame)) => return Ok(frame),
+                Ok(Some(frame)) => {
+                    return self
+                        .transforms
+                        .decode_frame_body(frame)
+                        .map_err(ConnectionError::Transform);
+                }
                 Ok(None) => {}
                 Err(error) => return Err(ConnectionError::Framing(error)),
             }
@@ -140,7 +166,11 @@ impl MinecraftConnection {
                     phase,
                     buffered_bytes: self.decoder.buffered_len(),
                 })?;
-            self.decoder.push(bytes).map_err(ConnectionError::Framing)?;
+            let mut bytes = bytes.to_vec();
+            self.transforms.decrypt_in_place(&mut bytes);
+            self.decoder
+                .push(&bytes)
+                .map_err(ConnectionError::Framing)?;
         }
     }
 }

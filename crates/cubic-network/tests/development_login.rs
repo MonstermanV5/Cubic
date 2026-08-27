@@ -80,7 +80,12 @@ async fn spawn_mock(mode: MockMode) -> (ServerAddress, JoinHandle<Observation>) 
                 return observation;
             }
             MockMode::Encryption => {
-                write_packet(&mut stream, 0x01, Vec::new()).await;
+                write_packet(
+                    &mut stream,
+                    0x01,
+                    vec![0x00, 0x01, 0x30, 0x04, 1, 2, 3, 4, 0x01],
+                )
+                .await;
                 return observation;
             }
             MockMode::Compression => {

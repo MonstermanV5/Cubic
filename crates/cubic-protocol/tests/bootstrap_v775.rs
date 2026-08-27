@@ -75,13 +75,21 @@ fn login_control_packets_have_independent_wire_vectors() {
         body(&v775::encode_login_cookie_response("a:b").unwrap()),
         [0x04, 0x03, b'a', b':', b'b', 0x00]
     );
+    assert_eq!(
+        body(&v775::encode_encryption_response(&[0xaa, 0xbb], &[1, 2, 3]).unwrap()),
+        [0x01, 0x02, 0xaa, 0xbb, 0x03, 1, 2, 3]
+    );
 }
 
 #[test]
 fn login_rejections_and_malformed_success_are_structured() {
     assert!(matches!(
-        v775::decode_login_clientbound(&[0x01]),
-        Ok(LoginClientbound::EncryptionRequest)
+        v775::decode_login_clientbound(&[0x01, 0x00, 0x01, 0x30, 0x04, 1, 2, 3, 4, 0x01]),
+        Ok(LoginClientbound::EncryptionRequest(request))
+            if request.server_id.is_empty()
+                && request.public_key_der == [0x30]
+                && request.verify_token == [1, 2, 3, 4]
+                && request.should_authenticate
     ));
     assert!(matches!(
         v775::decode_login_clientbound(&[0x03, 0x80, 0x02]),
