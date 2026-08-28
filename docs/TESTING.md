@@ -78,6 +78,12 @@ Real Phase 10 acceptance passed against the official Mojang metadata/artifact ch
 
 Persistent logging also passed manual acceptance for graphics, auth/network state transitions, encryption, compression, chat-session establishment, outgoing plaintext, decoded Player/System/Disguised Chat, and Phase 10 cache activity. Autcraft diagnostics proved its missing visible message body was caused by the deliberately incomplete plain-text component projection after correct protocol decoding; this is retained as a Phase 25 regression case. Autcraft is no longer an allowed Cubic test target.
 
+## Phase 11 generated game data
+
+Phase 11 tests use only small synthetic `registries.json`, `blocks.json`, client bytes, and metadata. They cover deterministic byte-for-byte generation, schema rejection, exact version identity, provenance hashes, verified source-client size/hash, malformed reports, duplicate keys and identifiers, duplicate raw/state IDs, sparse IDs, unknown registries and non-`minecraft` namespaces, block/default/property/state validation, item/entity lookups, version isolation, added/removed entries, narrow inspection, and generated-artifact validation. Tests do not use the developer's Phase 10 cache, execute Minecraft, contact Mojang, or connect to a server.
+
+Real Phase 11 acceptance used Mojang's official 26.1.2 Data Generator with the official 76-entry launcher classpath. Its 516,149-byte registry report and 6,239,720-byte block report generated 95 registries, 1,168 blocks, 29,873 block states, 1,506 items, and 157 entity types. The 7,763,125-byte artifact had content SHA-1 `936dcc94a71fc8006807819a88f45ec6bfd23f2c`; two identical generations, independent validation, and block/item/entity spot checks all passed. No real report or generated artifact is a test fixture.
+
 Logging unit tests use temporary directories to verify `latest.log` creation, five-launch retention, deterministic rotation, invalid destinations, and the deliberately small INFO/DEBUG configuration. Protocol coverage retains signed plaintext and optional decorated Player Chat components independently before UI presentation. Tests do not initialize the process-global subscriber or touch the user's log directory.
 
 `cubic-version` unit tests parse synthetic release/snapshot manifests, latest selection, forward-compatible version kinds, timestamps, unknown benign fields, selected version/download descriptors, malformed JSON, malformed hashes, and non-HTTPS URLs. Existing Phase 6 identity/store tests remain unchanged.

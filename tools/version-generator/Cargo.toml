@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 cubic-version = { path = "../../crates/cubic-version" }
+sha1.workspace = true
 
 [lints]
 workspace = true

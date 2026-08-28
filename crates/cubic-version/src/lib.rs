@@ -4,12 +4,19 @@
 //! performs no implicit network access.
 
 mod error;
+mod game_data;
 mod identity;
 mod model;
 mod official;
 mod store;
 
 pub use error::VersionError;
+pub use game_data::{
+    BlockDefinition, BlockProperty, BlockState, GAME_DATA_FILE_NAME, GameData, GameDataArtifact,
+    GameDataFormatVersion, GameDataProvenance, MAX_GAME_DATA_BYTES, MinecraftIdentifier,
+    RegistryEntry, RegistryTable, generate_game_data_from_reports, parse_game_data,
+    serialize_game_data,
+};
 pub use identity::{
     CompatibilityProfileId, MinecraftVersionId, ProtocolVersion, VersionDataFormatVersion,
 };

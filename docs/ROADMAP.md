@@ -12,7 +12,7 @@ Status markers: `[ ]` not started, `[~]` partial, `[x]` complete, `[!]` blocked.
 - [x] Phase 8 - Chat Mode MVP
 - [x] Phase 9 - Microsoft/Minecraft authentication
 - [x] Phase 10 - Minecraft version/resource bootstrap
-- [ ] Phase 11 - generated game registries/data
+- [x] Phase 11 - generated game registries/data
 - [ ] Phase 12 - generated packet codecs
 - [ ] Phase 13 - world state
 - [ ] Phase 14 - chunk decoding
@@ -49,4 +49,6 @@ Phase 9 is complete for its accepted Windows technical scope. Cubic's preferred 
 
 Known limitations remain explicit: XAL is experimental and not assumed authorized for public distribution; CubicEntra awaits external Minecraft Services approval; native iOS Keychain/callback support is incomplete; incoming signed messages are not cryptographically verified against other players' session-key graph; certificates are refreshed per launch rather than rotated inside exceptionally long sessions; slash-command signing awaits command-tree data; and complete rich-text/translation presentation remains Phase 25 work. Autcraft exposed examples of that presentation limitation.
 
-Phase 10 is complete. Real official-Mojang acceptance for exact version `26.1.2` passed: a fresh network bootstrap resolved Release metadata and asset index `30` with 4,750 logical assets; a second run reused the verified cache; invalid-version selection failed cleanly; explicit client-JAR acquisition verified the published 38,113,927-byte size and SHA-1 before promotion; a repeated JAR request reused the cache; and a fully offline metadata bootstrap succeeded from already-verified artifacts. Persistent runtime logging also passed real-use acceptance. Phase 11 and later phases have not begun.
+Phase 10 is complete. Real official-Mojang acceptance for exact version `26.1.2` passed: a fresh network bootstrap resolved Release metadata and asset index `30` with 4,750 logical assets; a second run reused the verified cache; invalid-version selection failed cleanly; explicit client-JAR acquisition verified the published 38,113,927-byte size and SHA-1 before promotion; a repeated JAR request reused the cache; and a fully offline metadata bootstrap succeeded from already-verified artifacts. Persistent runtime logging also passed real-use acceptance.
+
+Phase 11 is complete. Mojang's official 26.1.2 Data Generator ran with the official launcher-resolved classpath; its registry and block reports produced 95 registries, 1,168 blocks, 29,873 block states, 1,506 items, and 157 entity types. The deterministic 7,763,125-byte schema 1 artifact had SHA-1 `936dcc94a71fc8006807819a88f45ec6bfd23f2c` on both generations, independently validated, and passed representative block/item/entity spot checks. No client JAR, Mojang library/report, or real generated artifact is committed. Phase 12 and later phases have not begun.

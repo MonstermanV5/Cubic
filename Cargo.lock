@@ -3983,6 +3983,7 @@ name = "version-generator"
 version = "0.1.0"
 dependencies = [
  "cubic-version",
+ "sha1",
 ]
 
 [[package]]
