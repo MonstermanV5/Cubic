@@ -3,6 +3,7 @@
 use std::{
     error::Error,
     fmt,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -24,6 +25,34 @@ mod xal_sign_in;
 #[cfg(target_os = "ios")]
 pub use ios::run_from_native_host;
 pub use xal_sign_in::{XalSignInWindowError, capture_xal_authorization};
+
+/// Returns Cubic's platform-owned persistent data directory without relying on
+/// the process working directory.
+pub fn persistent_data_directory() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|root| root.join("Cubic"))
+    }
+    #[cfg(target_os = "ios")]
+    {
+        std::env::var_os("HOME").map(PathBuf::from).map(|root| {
+            root.join("Library")
+                .join("Application Support")
+                .join("Cubic")
+        })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "ios")))]
+    {
+        if let Some(root) = std::env::var_os("XDG_DATA_HOME") {
+            return Some(PathBuf::from(root).join("Cubic"));
+        }
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|root| root.join(".local").join("share").join("Cubic"))
+    }
+}
 
 const WINDOW_TITLE: &str = "Cubic";
 const INITIAL_WIDTH: f64 = 1280.0;

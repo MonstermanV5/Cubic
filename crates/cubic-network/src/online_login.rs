@@ -121,6 +121,7 @@ async fn establish_authenticated_play_inner<J: MinecraftSessionJoiner>(
 ) -> Result<AuthenticatedPlayConnection, AuthenticatedLoginError> {
     let profile = DevLoginProtocolProfile::protocol_775()
         .map_err(|_| AuthenticatedLoginError::InvalidProfile)?;
+    tracing::info!(target: "network", address = %address, version = %profile.minecraft_version(), protocol = profile.protocol_version().value(), "starting authenticated Minecraft Login");
     let limits = FrameLimits::new(MAX_BOOTSTRAP_FRAME_SIZE, MAX_CONFIGURATION_BUFFERED_BYTES)
         .map_err(|error| AuthenticatedLoginError::Transport(error.to_string()))?;
     let mut connection =
@@ -188,12 +189,14 @@ async fn establish_authenticated_play_inner<J: MinecraftSessionJoiner>(
                 connection
                     .enable_encryption(&material.shared_secret)
                     .map_err(|error| AuthenticatedLoginError::Transport(error.to_string()))?;
+                tracing::info!(target: "network", "authenticated transport encryption established");
             }
             LoginClientbound::SetCompression { threshold } => {
                 connection
                     .enable_compression(threshold)
                     .map_err(|error| AuthenticatedLoginError::Transport(error.to_string()))?;
                 compression_enabled = true;
+                tracing::info!(target: "network", threshold, "Minecraft compression enabled");
             }
             LoginClientbound::PluginRequest { transaction_id, .. } => {
                 let response = v775::encode_login_plugin_response(transaction_id)?;
@@ -226,6 +229,7 @@ async fn establish_authenticated_play_inner<J: MinecraftSessionJoiner>(
                     ConnectionState::Configuration,
                 )
                 .map_err(|error| AuthenticatedLoginError::Transport(error.to_string()))?;
+                tracing::info!(target: "network", "Login -> Configuration");
                 connection
                     .write_all(
                         &v775::encode_client_information(&ClientInformation::default())?,
@@ -236,6 +240,7 @@ async fn establish_authenticated_play_inner<J: MinecraftSessionJoiner>(
                 run_configuration(&mut connection, &mut state)
                     .await
                     .map_err(|error| AuthenticatedLoginError::Transport(error.to_string()))?;
+                tracing::info!(target: "network", "Configuration -> Play");
                 return Ok(AuthenticatedPlayConnection {
                     connection,
                     secure_chat_rules: profile.secure_chat_rules(),

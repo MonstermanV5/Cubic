@@ -6,6 +6,19 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+cubic-version = { path = "../cubic-version" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+
 [lints]
 workspace = true
-

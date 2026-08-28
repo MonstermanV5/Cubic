@@ -6,6 +6,7 @@
 mod error;
 mod identity;
 mod model;
+mod official;
 mod store;
 
 pub use error::VersionError;
@@ -15,6 +16,11 @@ pub use identity::{
 pub use model::{
     CatalogEntry, MinecraftVersionKind, VersionCatalog, VersionData, deserialize_catalog,
     deserialize_version_data, serialize_catalog, serialize_version_data,
+};
+pub use official::{
+    AssetIndexDescriptor, ClientDownloadDescriptor, OfficialVersionEntry, OfficialVersionKind,
+    OfficialVersionManifest, SelectedVersionMetadata, Sha1Digest, parse_official_manifest,
+    parse_selected_version_metadata,
 };
 pub use store::{
     CATALOG_FILE_NAME, MAX_CATALOG_FILE_BYTES, MAX_INSTALLED_VERSIONS, MAX_VERSION_FILE_BYTES,

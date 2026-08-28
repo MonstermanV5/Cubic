@@ -322,6 +322,8 @@ pub enum PlayClientbound {
     PlayerChat {
         sender_uuid: ProtocolUuid,
         sender_name: String,
+        signed_content: String,
+        unsigned_content: Option<TextComponent>,
         message: TextComponent,
         global_index: i32,
         sender_index: i32,
@@ -933,15 +935,17 @@ fn decode_player_chat(
     let sender_name = decode_bound_chat_type(reader)?;
     require_consumed(reader, "Player Chat")?;
     let modified = unsigned.is_some();
-    let message = unsigned.unwrap_or(TextComponent {
+    let message = unsigned.clone().unwrap_or(TextComponent {
         value: NbtTag::String(crate::nbt::NbtString::from_utf16_units(
             content.encode_utf16().collect(),
         )),
-        plain_text: content,
+        plain_text: content.clone(),
     });
     Ok(PlayClientbound::PlayerChat {
         sender_uuid,
         sender_name,
+        signed_content: content,
+        unsigned_content: unsigned,
         message,
         global_index,
         sender_index,

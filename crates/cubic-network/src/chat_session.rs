@@ -229,6 +229,7 @@ async fn run_play_session(
         .map_err(transport)?;
     if let ChatSecurity::Authenticated(session) = &security {
         write_session_update(connection, session).await?;
+        tracing::info!(target: "chat", "player chat session established");
     }
 
     let mut salt_counter = 0_i64;
@@ -282,41 +283,79 @@ async fn run_play_session(
                     }
                     PlayClientbound::PlayerChat {
                         sender_name,
+                        signed_content,
+                        unsigned_content,
                         message,
                         global_index,
                         signature,
                         modified,
-                        sender_index: _,
-                        sender_uuid: _,
+                        sender_index,
+                        sender_uuid,
                     } => {
                         let trust = match (signature.is_some(), modified) {
                             (true, true) => ChatMessageTrust::Modified,
                             (true, false) => ChatMessageTrust::SignedUnverified,
                             (false, _) => ChatMessageTrust::Unsigned,
                         };
+                        tracing::info!(
+                            target: "chat",
+                            category = "PlayerChat",
+                            sender = %sender_name,
+                            sender_uuid = ?sender_uuid,
+                            signed_content = %signed_content,
+                            global_index,
+                            sender_index,
+                            signature_present = signature.is_some(),
+                            trust = ?trust,
+                            "received decoded player chat"
+                        );
+                        tracing::debug!(
+                            target: "chat",
+                            unsigned_component = ?unsigned_content,
+                            projected_component = ?message,
+                            "decoded player-chat components before presentation"
+                        );
                         let event = message_event(ChatMessageKind::Player, Some(sender_name), message, trust);
                         match &mut security {
                             ChatSecurity::UnsignedDevelopment if signature.is_some() => {
-                                runner.event(event);
+                                if !runner.event(event) {
+                                    tracing::warn!(target: "chat", "decoded player chat dropped by bounded UI event queue");
+                                }
                                 write(connection, v775::encode_play_chat_acknowledgement(1)?, "Play Chat Acknowledgement write").await?;
                             }
                             ChatSecurity::Authenticated(session) => {
-                                session.accept_incoming(global_index, signature, || runner.event(event))?;
+                                session.accept_incoming(global_index, signature, || {
+                                    let delivered = runner.event(event);
+                                    if !delivered {
+                                        tracing::warn!(target: "chat", "decoded player chat dropped by bounded UI event queue");
+                                    }
+                                    delivered
+                                })?;
                                 if let Some(count) = session.standalone_acknowledgement() {
                                     write(connection, v775::encode_play_chat_acknowledgement(count)?, "Play Chat Acknowledgement write").await?;
                                 }
                             }
                             ChatSecurity::UnsignedDevelopment => {
-                                runner.event(event);
+                                if !runner.event(event) {
+                                    tracing::warn!(target: "chat", "decoded player chat dropped by bounded UI event queue");
+                                }
                             }
                         }
                     }
                     PlayClientbound::DisguisedChat { sender_name, message } => {
-                        runner.event(message_event(ChatMessageKind::Player, Some(sender_name), message, ChatMessageTrust::Unsigned));
+                        tracing::info!(target: "chat", category = "DisguisedChat", sender = %sender_name, text = %message.plain_text, "received decoded disguised chat");
+                        tracing::debug!(target: "chat", component = ?message.value, "decoded disguised-chat component before presentation");
+                        if !runner.event(message_event(ChatMessageKind::Player, Some(sender_name), message, ChatMessageTrust::Unsigned)) {
+                            tracing::warn!(target: "chat", "decoded disguised chat dropped by bounded UI event queue");
+                        }
                     }
                     PlayClientbound::SystemChat { message, overlay } => {
+                        tracing::info!(target: "chat", category = "SystemChat", text = %message.plain_text, overlay, "received decoded system chat");
+                        tracing::debug!(target: "chat", component = ?message.value, "decoded system-chat component before presentation");
                         let kind = if overlay { ChatMessageKind::ServerNotice } else { ChatMessageKind::System };
-                        runner.event(message_event(kind, None, message, ChatMessageTrust::NotApplicable));
+                        if !runner.event(message_event(kind, None, message, ChatMessageTrust::NotApplicable)) {
+                            tracing::warn!(target: "chat", "decoded system chat dropped by bounded UI event queue");
+                        }
                     }
                     PlayClientbound::Disconnect { reason } => {
                         runner.critical(ChatEvent::Disconnected { reason: reason.plain_text });
@@ -363,6 +402,7 @@ async fn send_chat(
     security: &mut ChatSecurity,
 ) -> Result<(), ChatSessionError> {
     validate_outgoing_chat(message)?;
+    tracing::info!(target: "chat", message, "sending outgoing chat plaintext");
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ChatSessionError::InvalidSystemClock)?;

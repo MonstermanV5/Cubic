@@ -4,6 +4,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum VersionError {
+    #[error("invalid official Minecraft metadata: {reason}")]
+    InvalidOfficialMetadata { reason: String },
     #[error("invalid Minecraft version ID: {reason}")]
     InvalidVersionId { reason: &'static str },
     #[error("invalid compatibility profile ID: {reason}")]

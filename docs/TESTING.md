@@ -72,6 +72,18 @@ The experimental XAL backend passed real account authentication, the automatic W
 
 Protocol/network tests add an independent Encryption Response vector, positive and negative Java-BigInteger server-hash vectors, continuous AES/CFB8 fragmentation, compression below/at threshold, malformed declared-size/decompression rejection, complete signed-chat/session-update wire vectors, signing-input field-order tests, a synthetic alternate secure-chat profile, bounded last-seen/checksum behavior, strict incoming indices, and the bounded early-Play handoff. A deterministic in-process persistent-Play test supplies a synthetic signing certificate, verifies the session-update and full signed outgoing packet, and closes through the bounded command channel. Authentication tests cover certificate response parsing, key-pair/algorithm/size validation, timestamps/expiry/refresh policy, deterministic RSA signing/verification, and secret redaction. Existing Status, offline Login, and Chat Mode suites remain regression coverage. A full mock XAL HTTP sequence, cryptographic verification of other players' chat, in-session certificate rotation, and iOS Keychain host tests remain deferred limitations.
 
+## Runtime logging and Phase 10
+
+Real Phase 10 acceptance passed against the official Mojang metadata/artifact chain for exact version `26.1.2`. The first metadata bootstrap resolved asset index `30` with 4,750 logical assets from the network; the second reused verified cache data. Invalid-version rejection, explicit 38,113,927-byte client-JAR acquisition with SHA-1 `4e618f09a0c649dde3fdf829df443ce0b8831e65`, repeated JAR cache reuse, and a fully offline cached bootstrap all passed. The downloaded JAR was never executed.
+
+Persistent logging also passed manual acceptance for graphics, auth/network state transitions, encryption, compression, chat-session establishment, outgoing plaintext, decoded Player/System/Disguised Chat, and Phase 10 cache activity. Autcraft diagnostics proved its missing visible message body was caused by the deliberately incomplete plain-text component projection after correct protocol decoding; this is retained as a Phase 25 regression case. Autcraft is no longer an allowed Cubic test target.
+
+Logging unit tests use temporary directories to verify `latest.log` creation, five-launch retention, deterministic rotation, invalid destinations, and the deliberately small INFO/DEBUG configuration. Protocol coverage retains signed plaintext and optional decorated Player Chat components independently before UI presentation. Tests do not initialize the process-global subscriber or touch the user's log directory.
+
+`cubic-version` unit tests parse synthetic release/snapshot manifests, latest selection, forward-compatible version kinds, timestamps, unknown benign fields, selected version/download descriptors, malformed JSON, malformed hashes, and non-HTTPS URLs. Existing Phase 6 identity/store tests remain unchanged.
+
+`cubic-resources` tests use an in-memory fetcher and synthetic bytes, never Mojang services. They cover first-network bootstrap, offline verified-cache reuse, corrupt-cache refetch, exact/missing/pathological version selection, deterministic asset lookup, content-addressed deduplication, hash/size failures, untrusted URLs, explicit client-JAR acquisition and cache reuse, and non-promoted partial files. No Mojang JAR or asset is present in fixtures.
+
 ## Future testing
 
 - Unit tests will cover isolated logic and error cases.

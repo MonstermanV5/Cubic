@@ -11,16 +11,16 @@ use cubic_network::{
     query_server_status, run_authenticated_chat_session, run_development_chat_session,
 };
 use cubic_ui::ChatSessionPort;
+use cubic_version::MinecraftVersionId;
+
+mod logging;
 
 const XAL_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 fn main() -> ExitCode {
-    if let Err(error) = tracing_subscriber::fmt()
-        .with_target(false)
-        .without_time()
-        .try_init()
-    {
+    if let Err(error) = logging::initialize() {
         eprintln!("failed to initialize diagnostics: {error}");
+        logging::initialize_stderr_only();
     }
 
     tracing::info!("{}", cubic_core::startup_message());
@@ -29,7 +29,7 @@ fn main() -> ExitCode {
         Ok(command) => command,
         Err(message) => {
             eprintln!(
-                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]\n  cubic-app dev-login <host[:port]> [--username <name>]\n  cubic-app chat <host[:port]> [--username <name> | --backend cubic-entra|xal]\n  cubic-app auth login [--backend cubic-entra|xal]\n  cubic-app auth status [--backend cubic-entra|xal]\n  cubic-app auth logout [--backend cubic-entra|xal]\n  cubic-app online-login <host[:port]> [--backend cubic-entra|xal]"
+                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]\n  cubic-app dev-login <host[:port]> [--username <name>]\n  cubic-app chat <host[:port]> [--username <name> | --backend cubic-entra|xal]\n  cubic-app auth login [--backend cubic-entra|xal]\n  cubic-app auth status [--backend cubic-entra|xal]\n  cubic-app auth logout [--backend cubic-entra|xal]\n  cubic-app online-login <host[:port]> [--backend cubic-entra|xal]\n  cubic-app bootstrap-version <version-id> [--client-jar]"
             );
             return ExitCode::FAILURE;
         }
@@ -46,7 +46,69 @@ fn main() -> ExitCode {
         } => run_chat(address, username, backend),
         Command::Auth(action) => run_auth(action),
         Command::OnlineLogin { address, backend } => run_online_login(&address, backend),
+        Command::BootstrapVersion {
+            version,
+            client_jar,
+        } => run_bootstrap_version(&version, client_jar),
     }
+}
+
+fn run_bootstrap_version(version: &MinecraftVersionId, ensure_client: bool) -> ExitCode {
+    let Some(data_root) = cubic_platform::persistent_data_directory() else {
+        tracing::error!("platform data directory is unavailable");
+        return ExitCode::FAILURE;
+    };
+    let cache_root = data_root.join("cache").join("minecraft");
+    let bootstrap = match cubic_resources::OfficialVersionBootstrap::new(&cache_root) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "could not initialize official version bootstrap");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "could not create version-bootstrap runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = match runtime.block_on(bootstrap.bootstrap(version)) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, version = %version, "official version bootstrap failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut client_cached = result.client_jar_cached;
+    if ensure_client {
+        match runtime.block_on(bootstrap.ensure_client_jar(&result.metadata)) {
+            Ok(artifact) => {
+                client_cached = true;
+                tracing::info!(path = %artifact.path().display(), "verified official client JAR cached without execution");
+            }
+            Err(error) => {
+                tracing::error!(%error, "official client JAR acquisition failed");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    println!("Cubic Official Version Bootstrap\n");
+    println!("Requested version: {version}");
+    println!("Resolved version: {}", result.metadata.id);
+    println!("Version type: {:?}", result.metadata.kind);
+    println!("Source: {:?}", result.source);
+    println!("Asset index: {}", result.metadata.asset_index.id);
+    println!("Indexed assets: {}", result.assets.len());
+    println!("Client JAR size: {}", result.metadata.client.size);
+    println!("Client JAR SHA-1: {}", result.metadata.client.sha1);
+    println!("Client JAR cached: {client_cached}");
+    println!("Cache root: {}", result.cache_root.display());
+    println!("Bootstrap: success");
+    ExitCode::SUCCESS
 }
 
 fn configured_auth_client() -> Result<AuthClient, String> {
@@ -685,6 +747,10 @@ enum Command {
         address: ServerAddress,
         backend: AuthBackend,
     },
+    BootstrapVersion {
+        version: MinecraftVersionId,
+        client_jar: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -728,6 +794,24 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command,
             return Err(format!("unexpected argument {extra:?}"));
         }
         return Ok(Command::OnlineLogin { address, backend });
+    }
+    if command == "bootstrap-version" {
+        let raw = arguments
+            .next()
+            .ok_or_else(|| "bootstrap-version requires a Minecraft version ID".to_owned())?;
+        let version = MinecraftVersionId::new(raw).map_err(|error| error.to_string())?;
+        let client_jar = match arguments.next().as_deref() {
+            None => false,
+            Some("--client-jar") => true,
+            Some(value) => return Err(format!("unknown bootstrap-version option {value:?}")),
+        };
+        if let Some(extra) = arguments.next() {
+            return Err(format!("unexpected argument {extra:?}"));
+        }
+        return Ok(Command::BootstrapVersion {
+            version,
+            client_jar,
+        });
     }
     if command == "dev-login" {
         return parse_development_login(arguments);
@@ -862,6 +946,21 @@ mod tests {
         assert_eq!(address.host(), "localhost");
         assert_eq!(address.port(), 25_570);
         assert_eq!(protocol, -1);
+    }
+
+    #[test]
+    fn bootstrap_version_is_typed_and_client_download_is_explicit() {
+        let command = parse_command([
+            "bootstrap-version".to_owned(),
+            "26.1.2".to_owned(),
+            "--client-jar".to_owned(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            command,
+            Command::BootstrapVersion { version, client_jar: true } if version.as_str() == "26.1.2"
+        ));
+        assert!(parse_command(["bootstrap-version".to_owned(), "../escape".to_owned()]).is_err());
     }
 
     #[test]

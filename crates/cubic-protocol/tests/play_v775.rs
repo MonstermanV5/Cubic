@@ -98,6 +98,32 @@ fn independent_player_chat_vector_tracks_sender_and_index() {
 }
 
 #[test]
+fn player_chat_retains_signed_and_decorated_content_before_presentation() {
+    let mut packet = vec![0x41, 0x07];
+    packet.extend_from_slice(&[0; 16]);
+    packet.extend_from_slice(&[0, 0, 5]);
+    packet.extend_from_slice(b"hello");
+    packet.extend_from_slice(&1_i64.to_be_bytes());
+    packet.extend_from_slice(&2_i64.to_be_bytes());
+    packet.extend_from_slice(&[0, 1]);
+    packet.extend(nbt_string("[Rank] Alice:"));
+    packet.extend_from_slice(&[0, 1]);
+    packet.extend(nbt_string("Alice"));
+    packet.push(0);
+    let decoded = v775::decode_play_clientbound(&packet).unwrap();
+    let v775::PlayClientbound::PlayerChat {
+        signed_content,
+        unsigned_content,
+        ..
+    } = decoded
+    else {
+        panic!("expected Player Chat")
+    };
+    assert_eq!(signed_content, "hello");
+    assert_eq!(unsigned_content.unwrap().plain_text, "[Rank] Alice:");
+}
+
+#[test]
 fn signed_player_chat_requires_acknowledgement_but_unsigned_chat_does_not() {
     let mut packet = vec![0x41, 0x07];
     packet.extend_from_slice(&[0; 16]);

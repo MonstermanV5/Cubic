@@ -11,10 +11,15 @@ cubic-auth = { path = "../cubic-auth" }
 cubic-core = { path = "../cubic-core" }
 cubic-network = { path = "../cubic-network" }
 cubic-platform = { path = "../cubic-platform" }
+cubic-resources = { path = "../cubic-resources" }
 cubic-ui = { path = "../cubic-ui" }
+cubic-version = { path = "../cubic-version" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 webbrowser = "1.2.4"
