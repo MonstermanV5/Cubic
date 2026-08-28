@@ -7,18 +7,25 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use cubic_core::{ChatEvent, ChatMessage, ChatMessageKind, ChatSessionCommand, StructuredText};
+use cubic_auth::{AuthenticatedMinecraftAccount, MinecraftSessionJoiner, PlayerCertificate};
+use cubic_core::{
+    ChatEvent, ChatMessage, ChatMessageKind, ChatMessageTrust, ChatSessionCommand, StructuredText,
+};
 use cubic_protocol::{
     bootstrap::v775::{self, ClientInformation, PlayClientbound, TextComponent},
     nbt::{NbtCompound, NbtTag},
 };
+use rand_core_06::{OsRng, RngCore};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::{
-    DevelopmentLoginError, DevelopmentLoginOptions, DevelopmentUsername, ServerAddress,
+    AuthenticatedLoginError, AuthenticatedLoginOptions, DevelopmentLoginError,
+    DevelopmentLoginOptions, DevelopmentUsername, ServerAddress,
     connection::ConnectionError,
     development_login::{ConnectionState, connect_to_play, run_configuration},
+    online_login::establish_authenticated_play,
+    secure_chat::{SecureChatError, SecureChatSession, system_time_millis},
 };
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 128;
@@ -133,6 +140,10 @@ pub enum ChatSessionError {
     #[error(transparent)]
     Login(#[from] DevelopmentLoginError),
     #[error(transparent)]
+    AuthenticatedLogin(#[from] AuthenticatedLoginError),
+    #[error("secure player-chat state failed: {0}")]
+    SecureChat(String),
+    #[error(transparent)]
     Protocol(#[from] v775::BootstrapProtocolError),
     #[error("persistent Play transport failed: {0}")]
     Transport(String),
@@ -140,6 +151,8 @@ pub enum ChatSessionError {
     InvalidSystemClock,
     #[error("invalid outgoing chat message: {reason}")]
     InvalidMessage { reason: &'static str },
+    #[error("persistent Chat Mode does not support server {feature}")]
+    UnsupportedServerFeature { feature: &'static str },
     #[error(
         "commands are not supported in Phase 8 because signable command arguments are not available"
     )]
@@ -150,7 +163,7 @@ pub async fn run_development_chat_session(
     address: &ServerAddress,
     username: &DevelopmentUsername,
     options: &ChatSessionOptions,
-    mut runner: ChatSessionRunner,
+    runner: ChatSessionRunner,
 ) -> Result<(), ChatSessionError> {
     let mut connected = match connect_to_play(address, username, &options.login).await {
         Ok(connected) => connected,
@@ -161,14 +174,62 @@ pub async fn run_development_chat_session(
             return Err(error.into());
         }
     };
+    run_play_session(
+        &mut connected.connection,
+        ChatSecurity::UnsignedDevelopment,
+        runner,
+    )
+    .await
+}
+
+pub async fn run_authenticated_chat_session<J: MinecraftSessionJoiner>(
+    address: &ServerAddress,
+    account: &AuthenticatedMinecraftAccount,
+    session_joiner: &J,
+    certificate: PlayerCertificate,
+    login_options: &AuthenticatedLoginOptions,
+    runner: ChatSessionRunner,
+) -> Result<(), ChatSessionError> {
+    let mut connected =
+        match establish_authenticated_play(address, account, session_joiner, login_options).await {
+            Ok(connected) => connected,
+            Err(error) => {
+                runner.critical(ChatEvent::Disconnected {
+                    reason: error.to_string(),
+                });
+                return Err(error.into());
+            }
+        };
+    let sender = connected.result.profile_uuid;
+    let security = ChatSecurity::Authenticated(Box::new(SecureChatSession::new(
+        connected.secure_chat_rules,
+        certificate,
+        sender,
+        random_session_uuid(),
+    )));
+    run_play_session(&mut connected.connection, security, runner).await
+}
+
+enum ChatSecurity {
+    UnsignedDevelopment,
+    Authenticated(Box<SecureChatSession>),
+}
+
+async fn run_play_session(
+    connection: &mut crate::connection::MinecraftConnection,
+    mut security: ChatSecurity,
+    mut runner: ChatSessionRunner,
+) -> Result<(), ChatSessionError> {
     runner.event(ChatEvent::Connected);
 
     let information = v775::encode_play_client_information(&ClientInformation::default())?;
-    connected
-        .connection
+    connection
         .write_all(&information, "Play Client Information write")
         .await
         .map_err(transport)?;
+    if let ChatSecurity::Authenticated(session) = &security {
+        write_session_update(connection, session).await?;
+    }
 
     let mut salt_counter = 0_i64;
     let mut sent_player_loaded = false;
@@ -179,9 +240,10 @@ pub async fn run_development_chat_session(
                 match command {
                     Some(ChatSessionCommand::SendMessage(message)) => {
                         if let Err(error) = send_chat(
-                            &mut connected.connection,
+                            connection,
                             &message,
                             &mut salt_counter,
+                            &mut security,
                         ).await {
                             runner.event(ChatEvent::Warning(error.to_string()));
                         }
@@ -189,7 +251,7 @@ pub async fn run_development_chat_session(
                     Some(ChatSessionCommand::Disconnect) | None => return Ok(()),
                 }
             }
-            frame = connected.connection.read_frame_unbounded("persistent Play packet read") => {
+            frame = connection.read_frame_unbounded("persistent Play packet read") => {
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(error) => {
@@ -200,41 +262,61 @@ pub async fn run_development_chat_session(
                 };
                 match v775::decode_play_clientbound(&frame)? {
                     PlayClientbound::KeepAlive { id } => {
-                        write(&mut connected.connection, v775::encode_play_keep_alive(id)?, "Play Keep Alive response write").await?;
+                        write(connection, v775::encode_play_keep_alive(id)?, "Play Keep Alive response write").await?;
                     }
                     PlayClientbound::Ping { id } => {
-                        write(&mut connected.connection, v775::encode_play_pong(id)?, "Play Pong write").await?;
+                        write(connection, v775::encode_play_pong(id)?, "Play Pong write").await?;
                     }
                     PlayClientbound::PlayerPosition { teleport_id } => {
-                        write(&mut connected.connection, v775::encode_play_teleport_confirmation(teleport_id)?, "Play Teleport Confirmation write").await?;
+                        write(connection, v775::encode_play_teleport_confirmation(teleport_id)?, "Play Teleport Confirmation write").await?;
                     }
                     PlayClientbound::ChunkBatchFinished { .. } => {
-                        write(&mut connected.connection, v775::encode_play_chunk_batch_received(1.0)?, "Play Chunk Batch Received write").await?;
+                        write(connection, v775::encode_play_chunk_batch_received(1.0)?, "Play Chunk Batch Received write").await?;
                         if !sent_player_loaded {
-                            write(&mut connected.connection, v775::encode_play_player_loaded()?, "Play Player Loaded write").await?;
+                            write(connection, v775::encode_play_player_loaded()?, "Play Player Loaded write").await?;
                             sent_player_loaded = true;
                         }
                     }
                     PlayClientbound::CookieRequest { key } => {
-                        write(&mut connected.connection, v775::encode_play_cookie_response(&key)?, "Play Cookie Response write").await?;
+                        write(connection, v775::encode_play_cookie_response(&key)?, "Play Cookie Response write").await?;
                     }
                     PlayClientbound::PlayerChat {
                         sender_name,
                         message,
-                        acknowledgement_required,
-                        ..
+                        global_index,
+                        signature,
+                        modified,
+                        sender_index: _,
+                        sender_uuid: _,
                     } => {
-                        if acknowledgement_required {
-                            write(&mut connected.connection, v775::encode_play_chat_acknowledgement(1)?, "Play Chat Acknowledgement write").await?;
+                        let trust = match (signature.is_some(), modified) {
+                            (true, true) => ChatMessageTrust::Modified,
+                            (true, false) => ChatMessageTrust::SignedUnverified,
+                            (false, _) => ChatMessageTrust::Unsigned,
+                        };
+                        let event = message_event(ChatMessageKind::Player, Some(sender_name), message, trust);
+                        match &mut security {
+                            ChatSecurity::UnsignedDevelopment if signature.is_some() => {
+                                runner.event(event);
+                                write(connection, v775::encode_play_chat_acknowledgement(1)?, "Play Chat Acknowledgement write").await?;
+                            }
+                            ChatSecurity::Authenticated(session) => {
+                                session.accept_incoming(global_index, signature, || runner.event(event))?;
+                                if let Some(count) = session.standalone_acknowledgement() {
+                                    write(connection, v775::encode_play_chat_acknowledgement(count)?, "Play Chat Acknowledgement write").await?;
+                                }
+                            }
+                            ChatSecurity::UnsignedDevelopment => {
+                                runner.event(event);
+                            }
                         }
-                        runner.event(message_event(ChatMessageKind::Player, Some(sender_name), message));
                     }
                     PlayClientbound::DisguisedChat { sender_name, message } => {
-                        runner.event(message_event(ChatMessageKind::Player, Some(sender_name), message));
+                        runner.event(message_event(ChatMessageKind::Player, Some(sender_name), message, ChatMessageTrust::Unsigned));
                     }
                     PlayClientbound::SystemChat { message, overlay } => {
                         let kind = if overlay { ChatMessageKind::ServerNotice } else { ChatMessageKind::System };
-                        runner.event(message_event(kind, None, message));
+                        runner.event(message_event(kind, None, message, ChatMessageTrust::NotApplicable));
                     }
                     PlayClientbound::Disconnect { reason } => {
                         runner.critical(ChatEvent::Disconnected { reason: reason.plain_text });
@@ -243,12 +325,29 @@ pub async fn run_development_chat_session(
                     PlayClientbound::Health { health } if health <= 6.0 => {
                         runner.event(ChatEvent::Warning(format!("Low health: {health:.1}")));
                     }
-                    PlayClientbound::Health { .. } | PlayClientbound::Ignored { .. } => {}
+                    PlayClientbound::Login
+                    | PlayClientbound::Health { .. }
+                    | PlayClientbound::CustomPayload { .. }
+                    | PlayClientbound::Ignored { .. } => {}
+                    PlayClientbound::ResourcePackPush => {
+                        return Err(ChatSessionError::UnsupportedServerFeature {
+                            feature: "resource-pack pushes",
+                        });
+                    }
+                    PlayClientbound::Transfer => {
+                        return Err(ChatSessionError::UnsupportedServerFeature {
+                            feature: "transfers",
+                        });
+                    }
                     PlayClientbound::StartConfiguration => {
-                        write(&mut connected.connection, v775::encode_play_acknowledge_configuration()?, "Play Configuration Acknowledged write").await?;
-                        write(&mut connected.connection, v775::encode_client_information(&ClientInformation::default())?, "Reconfiguration Client Information write").await?;
+                        write(connection, v775::encode_play_acknowledge_configuration()?, "Play Configuration Acknowledged write").await?;
+                        write(connection, v775::encode_client_information(&ClientInformation::default())?, "Reconfiguration Client Information write").await?;
                         let mut state = ConnectionState::Configuration;
-                        let _skipped = run_configuration(&mut connected.connection, &mut state).await?;
+                        let _skipped = run_configuration(connection, &mut state).await?;
+                        if let ChatSecurity::Authenticated(session) = &mut security {
+                            session.reset(random_session_uuid());
+                            write_session_update(connection, session).await?;
+                        }
                         runner.event(ChatEvent::Warning("Server reconfiguration completed".to_owned()));
                     }
                 }
@@ -261,6 +360,7 @@ async fn send_chat(
     connection: &mut crate::connection::MinecraftConnection,
     message: &str,
     salt_counter: &mut i64,
+    security: &mut ChatSecurity,
 ) -> Result<(), ChatSessionError> {
     validate_outgoing_chat(message)?;
     let duration = SystemTime::now()
@@ -268,13 +368,56 @@ async fn send_chat(
         .map_err(|_| ChatSessionError::InvalidSystemClock)?;
     let timestamp = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
     *salt_counter = salt_counter.wrapping_add(1);
-    let packet = v775::encode_play_chat_message(
-        message,
-        timestamp,
-        timestamp ^ *salt_counter,
-        v775::ChatLastSeenUpdate::empty_with_disabled_checksum(),
-    )?;
+    let salt = match security {
+        ChatSecurity::UnsignedDevelopment => timestamp ^ *salt_counter,
+        ChatSecurity::Authenticated(_) => random_salt(),
+    };
+    let (signature, last_seen) = match security {
+        ChatSecurity::UnsignedDevelopment => (
+            None,
+            v775::ChatLastSeenUpdate::empty_with_disabled_checksum(),
+        ),
+        ChatSecurity::Authenticated(session) => {
+            let prepared = session.prepare_outgoing(message, timestamp, salt)?;
+            (Some(prepared.signature), prepared.last_seen_update)
+        }
+    };
+    let packet = v775::encode_play_chat_message(message, timestamp, salt, signature, last_seen)?;
     write(connection, packet, "Play Chat Message write").await
+}
+
+impl From<SecureChatError> for ChatSessionError {
+    fn from(error: SecureChatError) -> Self {
+        Self::SecureChat(error.to_string())
+    }
+}
+
+async fn write_session_update(
+    connection: &mut crate::connection::MinecraftConnection,
+    session: &SecureChatSession,
+) -> Result<(), ChatSessionError> {
+    let expires_at = system_time_millis(session.certificate().expires_at())?;
+    let packet = v775::encode_play_chat_session_update(
+        session.session_id(),
+        expires_at,
+        session.certificate().public_key_der(),
+        session.certificate().public_key_signature(),
+    )?;
+    write(connection, packet, "Player Chat Session Update write").await
+}
+
+fn random_session_uuid() -> cubic_protocol::ProtocolUuid {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    cubic_protocol::ProtocolUuid::from_bytes(bytes)
+}
+
+fn random_salt() -> i64 {
+    let mut bytes = [0_u8; 8];
+    OsRng.fill_bytes(&mut bytes);
+    i64::from_ne_bytes(bytes)
 }
 
 fn validate_outgoing_chat(message: &str) -> Result<(), ChatSessionError> {
@@ -314,6 +457,7 @@ fn message_event(
     kind: ChatMessageKind,
     sender: Option<String>,
     component: TextComponent,
+    trust: ChatMessageTrust,
 ) -> ChatEvent {
     ChatEvent::Message {
         kind,
@@ -321,6 +465,7 @@ fn message_event(
         message: ChatMessage {
             plain_text: component.plain_text,
             structured: structured(&component.value),
+            trust,
         },
     }
 }
@@ -363,13 +508,14 @@ fn map_send_error(error: mpsc::error::TrySendError<ChatSessionCommand>) -> ChatS
 }
 
 impl ChatSessionRunner {
-    fn event(&self, event: ChatEvent) {
+    fn event(&self, event: ChatEvent) -> bool {
         match self.events.try_send(event) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.dropped_events.fetch_add(1, Ordering::Relaxed);
+                false
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 
@@ -383,6 +529,52 @@ impl ChatSessionRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{str::FromStr, time::Duration};
+
+    use cubic_auth::AuthError;
+    use cubic_protocol::{CodecReader, FrameDecoder, FrameLimits, split_raw_packet};
+    use tokio::{
+        io::AsyncReadExt,
+        net::{TcpListener, TcpStream},
+    };
+
+    use crate::secure_chat::{ChatCertificate, SecureChatRules};
+
+    struct SyntheticCertificate;
+
+    impl ChatCertificate for SyntheticCertificate {
+        fn public_key_der(&self) -> &[u8] {
+            &[0xaa, 0xbb]
+        }
+
+        fn public_key_signature(&self) -> &[u8] {
+            &[0xcc]
+        }
+
+        fn expires_at(&self) -> SystemTime {
+            SystemTime::now() + Duration::from_secs(60)
+        }
+
+        fn is_expired(&self, _now: SystemTime) -> bool {
+            false
+        }
+
+        fn sign_chat(&self, _input: &[u8]) -> Result<[u8; 256], AuthError> {
+            Ok([0x5a; 256])
+        }
+    }
+
+    async fn read_test_frame(stream: &mut TcpStream, decoder: &mut FrameDecoder) -> Vec<u8> {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            if let Some(frame) = decoder.next_frame().unwrap() {
+                return frame;
+            }
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert_ne!(read, 0, "test connection closed before a complete frame");
+            decoder.push(&buffer[..read]).unwrap();
+        }
+    }
 
     #[test]
     fn event_channel_is_bounded_and_reports_drops() {
@@ -392,7 +584,7 @@ mod tests {
         };
         let (mut handle, runner) = ChatSessionHandle::bounded(&options);
         runner.event(ChatEvent::Connected);
-        runner.event(ChatEvent::Warning("dropped".to_owned()));
+        assert!(!runner.event(ChatEvent::Warning("dropped".to_owned())));
         assert_eq!(handle.try_next_event(), Some(ChatEvent::Connected));
         assert_eq!(handle.dropped_event_count(), 1);
     }
@@ -430,5 +622,78 @@ mod tests {
                 Err(ChatSessionError::InvalidMessage { .. })
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn authenticated_play_loop_sends_session_and_signed_chat_then_closes_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let address = ServerAddress::from_str(&format!("127.0.0.1:{port}")).unwrap();
+        let limits = FrameLimits::new(v775::MAX_BOOTSTRAP_FRAME_SIZE, 4 * 1024 * 1024).unwrap();
+        let mut connection = crate::connection::MinecraftConnection::connect(
+            &address,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            limits,
+        )
+        .await
+        .unwrap();
+        let mut server = accept.await.unwrap();
+
+        let options = ChatSessionOptions::default();
+        let (mut handle, runner) = ChatSessionHandle::bounded(&options);
+        let security = ChatSecurity::Authenticated(Box::new(SecureChatSession::with_certificate(
+            SecureChatRules::new(1, 20, 64),
+            Box::new(SyntheticCertificate),
+            cubic_protocol::ProtocolUuid::from_u128(1),
+            cubic_protocol::ProtocolUuid::from_u128(2),
+        )));
+        let session =
+            tokio::spawn(async move { run_play_session(&mut connection, security, runner).await });
+
+        let mut decoder = FrameDecoder::new(limits);
+        assert_eq!(
+            split_raw_packet(&read_test_frame(&mut server, &mut decoder).await)
+                .unwrap()
+                .id,
+            0x0e
+        );
+        let update = read_test_frame(&mut server, &mut decoder).await;
+        let update = split_raw_packet(&update).unwrap();
+        assert_eq!(update.id, 0x0a);
+        let mut update_reader = CodecReader::new(update.payload);
+        assert_eq!(update_reader.read_uuid().unwrap().as_u128(), 2);
+        assert!(update_reader.read_i64().unwrap() > 0);
+        assert_eq!(update_reader.read_byte_array(512).unwrap(), [0xaa, 0xbb]);
+        assert_eq!(update_reader.read_byte_array(4096).unwrap(), [0xcc]);
+        assert_eq!(update_reader.remaining(), 0);
+
+        assert_eq!(handle.try_next_event(), Some(ChatEvent::Connected));
+        handle.try_send_message("signed smoke".to_owned()).unwrap();
+        let chat = read_test_frame(&mut server, &mut decoder).await;
+        let chat = split_raw_packet(&chat).unwrap();
+        assert_eq!(chat.id, 0x09);
+        let mut chat_reader = CodecReader::new(chat.payload);
+        assert_eq!(
+            chat_reader
+                .read_string(cubic_protocol::StringLimits::new(256, 768))
+                .unwrap(),
+            "signed smoke"
+        );
+        let _timestamp = chat_reader.read_i64().unwrap();
+        let _salt = chat_reader.read_i64().unwrap();
+        assert!(chat_reader.read_bool().unwrap());
+        assert_eq!(
+            chat_reader.read_bytes(256, "test signature").unwrap(),
+            [0x5a; 256]
+        );
+        assert_eq!(chat_reader.read_var_int().unwrap(), 0);
+        assert_eq!(chat_reader.read_bytes(3, "test last seen").unwrap(), [0; 3]);
+        assert_eq!(chat_reader.read_u8().unwrap(), 1);
+        assert_eq!(chat_reader.remaining(), 0);
+
+        handle.disconnect().unwrap();
+        session.await.unwrap().unwrap();
     }
 }

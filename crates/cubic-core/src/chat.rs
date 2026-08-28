@@ -16,6 +16,16 @@ pub enum StructuredText {
 pub struct ChatMessage {
     pub plain_text: String,
     pub structured: StructuredText,
+    pub trust: ChatMessageTrust,
+}
+
+/// Protocol-independent provenance without exposing signatures to the UI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatMessageTrust {
+    NotApplicable,
+    Unsigned,
+    SignedUnverified,
+    Modified,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

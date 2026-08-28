@@ -48,4 +48,8 @@ The final real-server and Windows UI acceptance passed: persistent bidirectional
 
 Phase 8 is complete. The limitations and ownership boundaries below remain in effect.
 
-Phase 9 owns authenticated accounts and legitimate secure-chat signing. Phase 18 owns seamless Chat Mode/Play Mode switching. Phase 25 owns complete text/UI/server-presentation semantics.
+Phase 9 reuses this exact UI with `chat <address> --backend xal`: stored credentials refresh silently, the app obtains a short-lived Mojang player certificate, the shared encrypted/compressed bootstrap reaches Play, and the selected version profile establishes/signs a persistent player chat session. Incoming message provenance is retained as system/not-applicable, unsigned, signed-but-not-yet-cryptographically-verified, or modified without exposing raw signatures to the UI. The real 26.1.2 test passed with `online-mode=true`, `enforce-secure-profile=true`, compression, signed outgoing chat, System Chat reception, and clean disconnect.
+
+Exploratory Autcraft testing showed that some independently decorated rank/pronoun/channel messages can retain their prefix while Cubic's current presentation loses the visible message body; translation keys can also remain untranslated. This is recorded as a Phase 25 presentation limitation rather than server-specific behavior. Cubic does not add proxy-specific rendering rules.
+
+Phase 18 owns seamless Chat Mode/Play Mode switching. Phase 25 owns complete text/UI/server-presentation semantics.

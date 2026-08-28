@@ -35,6 +35,9 @@ enum MockMode {
     EofConfiguration,
     TimeoutConfiguration,
     OversizedFrame,
+    EarlyPlayTraffic,
+    EarlyReconfiguration,
+    PlayAcceptanceDisconnect,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -151,8 +154,12 @@ async fn spawn_mock(mode: MockMode) -> (ServerAddress, JoinHandle<Observation>) 
             _ => {}
         }
 
-        let MockMode::Success { fragmented, .. } = mode else {
-            return observation;
+        let fragmented = match mode {
+            MockMode::Success { fragmented, .. } => fragmented,
+            MockMode::EarlyPlayTraffic
+            | MockMode::EarlyReconfiguration
+            | MockMode::PlayAcceptanceDisconnect => false,
+            _ => return observation,
         };
         let mut configuration = packet(0x01, custom_payload());
         configuration.extend_from_slice(&packet(0x07, vec![0xaa, 0xbb]));
@@ -169,6 +176,45 @@ async fn spawn_mock(mode: MockMode) -> (ServerAddress, JoinHandle<Observation>) 
         assert_i64_response(&reader.next(&mut stream).await, 0x04, 0x0102_0304_0506_0708);
         assert_i32_response(&reader.next(&mut stream).await, 0x05, 0x0102_0304);
         assert_packet_id(&reader.next(&mut stream).await, 0x03);
+        match mode {
+            MockMode::EarlyPlayTraffic => {
+                let mut early = packet(0x18, custom_payload());
+                early.extend_from_slice(&packet(
+                    0x2c,
+                    0x1122_3344_5566_7788_i64.to_be_bytes().to_vec(),
+                ));
+                early.extend_from_slice(&packet(0x3d, 0x1234_5678_i32.to_be_bytes().to_vec()));
+                let mut position = vec![0x2a];
+                position.extend_from_slice(&[0_u8; 60]);
+                early.extend_from_slice(&packet(0x48, position));
+                early.extend_from_slice(&packet(0x15, identifier_payload("minecraft:test")));
+                stream.write_all(&early).await.unwrap();
+
+                assert_i64_response(&reader.next(&mut stream).await, 0x1c, 0x1122_3344_5566_7788);
+                assert_i32_response(&reader.next(&mut stream).await, 0x2d, 0x1234_5678);
+                assert_var_int_response(&reader.next(&mut stream).await, 0x00, 42);
+                assert_cookie_response(&reader.next(&mut stream).await, "minecraft:test");
+            }
+            MockMode::PlayAcceptanceDisconnect => {
+                write_packet(
+                    &mut stream,
+                    0x20,
+                    vec![
+                        8, 0, 9, b'g', b'o', b' ', b'a', b'w', b'a', b'y', b'!', b'!',
+                    ],
+                )
+                .await;
+                return observation;
+            }
+            MockMode::EarlyReconfiguration => {
+                write_packet(&mut stream, 0x76, Vec::new()).await;
+                assert_packet_id(&reader.next(&mut stream).await, 0x10);
+                assert_client_information(&reader.next(&mut stream).await);
+                write_packet(&mut stream, 0x03, Vec::new()).await;
+                assert_packet_id(&reader.next(&mut stream).await, 0x03);
+            }
+            _ => {}
+        }
         write_packet(&mut stream, 0x31, vec![0x01]).await;
         observation
     });
@@ -203,6 +249,50 @@ async fn successful_offline_login_reaches_play_and_validates_outbound_fields() {
             supplied_uuid: 0,
         }
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn early_irrelevant_play_packet_is_skipped_and_controls_are_answered() {
+    let (address, server) = spawn_mock(MockMode::EarlyPlayTraffic).await;
+    let result = development_login(
+        &address,
+        &DevelopmentUsername::new("EarlyPlay").unwrap(),
+        &test_options(),
+    )
+    .await;
+    assert!(result.is_ok());
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disconnect_during_play_acceptance_retains_the_reason() {
+    let (address, server) = spawn_mock(MockMode::PlayAcceptanceDisconnect).await;
+    assert!(matches!(
+        development_login(
+            &address,
+            &DevelopmentUsername::new("PlayBye").unwrap(),
+            &test_options(),
+        )
+        .await,
+        Err(DevelopmentLoginError::ServerDisconnect {
+            state: "Play",
+            reason
+        }) if reason == "go away!!"
+    ));
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reconfiguration_during_play_acceptance_returns_to_play_cleanly() {
+    let (address, server) = spawn_mock(MockMode::EarlyReconfiguration).await;
+    let result = development_login(
+        &address,
+        &DevelopmentUsername::new("Reconfigure").unwrap(),
+        &test_options(),
+    )
+    .await;
+    assert!(result.is_ok());
+    server.await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -469,6 +559,14 @@ fn custom_payload() -> Vec<u8> {
     writer.into_inner()
 }
 
+fn identifier_payload(value: &str) -> Vec<u8> {
+    let mut writer = CodecWriter::new();
+    writer
+        .write_string(value, StringLimits::new(32, 96))
+        .unwrap();
+    writer.into_inner()
+}
+
 fn known_packs_payload() -> Vec<u8> {
     let limits = StringLimits::new(64, 192);
     let mut writer = CodecWriter::new();
@@ -562,5 +660,25 @@ fn assert_i32_response(frame: &[u8], expected_id: i32, expected_value: i32) {
     assert_eq!(packet.id, expected_id);
     let mut reader = CodecReader::new(packet.payload);
     assert_eq!(reader.read_i32().unwrap(), expected_value);
+    assert_eq!(reader.remaining(), 0);
+}
+
+fn assert_var_int_response(frame: &[u8], expected_id: i32, expected_value: i32) {
+    let packet = split_raw_packet(frame).unwrap();
+    assert_eq!(packet.id, expected_id);
+    let mut reader = CodecReader::new(packet.payload);
+    assert_eq!(reader.read_var_int().unwrap(), expected_value);
+    assert_eq!(reader.remaining(), 0);
+}
+
+fn assert_cookie_response(frame: &[u8], expected_key: &str) {
+    let packet = split_raw_packet(frame).unwrap();
+    assert_eq!(packet.id, 0x15);
+    let mut reader = CodecReader::new(packet.payload);
+    assert_eq!(
+        reader.read_string(StringLimits::new(32, 96)).unwrap(),
+        expected_key
+    );
+    assert!(!reader.read_bool().unwrap());
     assert_eq!(reader.remaining(), 0);
 }

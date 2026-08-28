@@ -6,7 +6,7 @@ use cubic_protocol::{
     FrameLimits, ProtocolUuid,
     bootstrap::v775::{
         self, ClientInformation, ConfigurationClientbound, LoginClientbound,
-        MAX_BOOTSTRAP_FRAME_SIZE, MAX_CONFIGURATION_BUFFERED_BYTES,
+        MAX_BOOTSTRAP_FRAME_SIZE, MAX_CONFIGURATION_BUFFERED_BYTES, PlayClientbound,
     },
     handshake::{Handshake, HandshakeNextState, encode_handshake},
 };
@@ -21,6 +21,8 @@ use crate::{
 
 const MAX_LOGIN_PACKETS: usize = 64;
 const MAX_CONFIGURATION_PACKETS: usize = 2_048;
+const MAX_PLAY_ACCEPTANCE_PACKETS: usize = 256;
+const MAX_RECONFIGURATIONS_DURING_ACCEPTANCE: usize = 8;
 const MAX_ERROR_PREVIEW_CHARS: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,6 +303,25 @@ pub(crate) async fn run_configuration(
     state: &mut ConnectionState,
 ) -> Result<usize, DevelopmentLoginError> {
     let mut skipped_packets = 0_usize;
+    for _ in 0..=MAX_RECONFIGURATIONS_DURING_ACCEPTANCE {
+        skipped_packets =
+            skipped_packets.saturating_add(run_configuration_phase(connection, state).await?);
+        match await_initial_play_login(connection, state).await? {
+            PlayAcceptance::Login => return Ok(skipped_packets),
+            PlayAcceptance::Reconfigure => {}
+        }
+    }
+    Err(DevelopmentLoginError::PacketLimitExceeded {
+        state: "Play/Configuration transitions",
+        max_packets: MAX_RECONFIGURATIONS_DURING_ACCEPTANCE,
+    })
+}
+
+async fn run_configuration_phase(
+    connection: &mut MinecraftConnection,
+    state: &mut ConnectionState,
+) -> Result<usize, DevelopmentLoginError> {
+    let mut skipped_packets = 0_usize;
     for _ in 0..MAX_CONFIGURATION_PACKETS {
         let frame = connection
             .read_frame("Configuration packet read")
@@ -335,11 +356,6 @@ pub(crate) async fn run_configuration(
                     .await
                     .map_err(map_connection_error)?;
                 transition(state, ConnectionState::Configuration, ConnectionState::Play)?;
-                let play_frame = connection
-                    .read_frame("initial Play Login read")
-                    .await
-                    .map_err(map_connection_error)?;
-                v775::validate_initial_play_login(&play_frame)?;
                 return Ok(skipped_packets);
             }
             ConfigurationClientbound::KeepAlive { id } => {
@@ -386,6 +402,125 @@ pub(crate) async fn run_configuration(
     Err(DevelopmentLoginError::PacketLimitExceeded {
         state: state.name(),
         max_packets: MAX_CONFIGURATION_PACKETS,
+    })
+}
+
+enum PlayAcceptance {
+    Login,
+    Reconfigure,
+}
+
+async fn await_initial_play_login(
+    connection: &mut MinecraftConnection,
+    state: &mut ConnectionState,
+) -> Result<PlayAcceptance, DevelopmentLoginError> {
+    let mut sent_player_loaded = false;
+    for _ in 0..MAX_PLAY_ACCEPTANCE_PACKETS {
+        let frame = connection
+            .read_frame("initial Play packet read")
+            .await
+            .map_err(map_connection_error)?;
+        match v775::decode_play_clientbound(&frame)? {
+            PlayClientbound::Login => return Ok(PlayAcceptance::Login),
+            PlayClientbound::KeepAlive { id } => {
+                connection
+                    .write_all(
+                        &v775::encode_play_keep_alive(id)?,
+                        "Play Keep Alive response write",
+                    )
+                    .await
+                    .map_err(map_connection_error)?;
+            }
+            PlayClientbound::Ping { id } => {
+                connection
+                    .write_all(&v775::encode_play_pong(id)?, "Play Pong write")
+                    .await
+                    .map_err(map_connection_error)?;
+            }
+            PlayClientbound::PlayerPosition { teleport_id } => {
+                connection
+                    .write_all(
+                        &v775::encode_play_teleport_confirmation(teleport_id)?,
+                        "Play Teleport Confirmation write",
+                    )
+                    .await
+                    .map_err(map_connection_error)?;
+            }
+            PlayClientbound::ChunkBatchFinished { .. } => {
+                connection
+                    .write_all(
+                        &v775::encode_play_chunk_batch_received(1.0)?,
+                        "Play Chunk Batch Received write",
+                    )
+                    .await
+                    .map_err(map_connection_error)?;
+                if !sent_player_loaded {
+                    connection
+                        .write_all(
+                            &v775::encode_play_player_loaded()?,
+                            "Play Player Loaded write",
+                        )
+                        .await
+                        .map_err(map_connection_error)?;
+                    sent_player_loaded = true;
+                }
+            }
+            PlayClientbound::CookieRequest { key } => {
+                connection
+                    .write_all(
+                        &v775::encode_play_cookie_response(&key)?,
+                        "Play Cookie Response write",
+                    )
+                    .await
+                    .map_err(map_connection_error)?;
+            }
+            PlayClientbound::Disconnect { reason } => {
+                return Err(DevelopmentLoginError::ServerDisconnect {
+                    state: state.name(),
+                    reason: bounded_preview(&reason.plain_text),
+                });
+            }
+            PlayClientbound::StartConfiguration => {
+                connection
+                    .write_all(
+                        &v775::encode_play_acknowledge_configuration()?,
+                        "Play Configuration Acknowledged write",
+                    )
+                    .await
+                    .map_err(map_connection_error)?;
+                transition(state, ConnectionState::Play, ConnectionState::Configuration)?;
+                connection
+                    .write_all(
+                        &v775::encode_client_information(&ClientInformation::default())?,
+                        "Reconfiguration Client Information write",
+                    )
+                    .await
+                    .map_err(map_connection_error)?;
+                return Ok(PlayAcceptance::Reconfigure);
+            }
+            PlayClientbound::ResourcePackPush => {
+                return Err(DevelopmentLoginError::UnsupportedForPhase7 {
+                    feature: UnsupportedPhase7Feature::ResourcePack,
+                    required_setting: "resource-pack= and require-resource-pack=false",
+                });
+            }
+            PlayClientbound::Transfer => {
+                return Err(DevelopmentLoginError::UnsupportedForPhase7 {
+                    feature: UnsupportedPhase7Feature::Transfer,
+                    required_setting: "connect directly to the development server",
+                });
+            }
+            PlayClientbound::PlayerChat { .. }
+            | PlayClientbound::DisguisedChat { .. }
+            | PlayClientbound::SystemChat { .. }
+            | PlayClientbound::Health { .. }
+            | PlayClientbound::CustomPayload { .. }
+            | PlayClientbound::Ignored { .. } => {}
+        }
+    }
+    Err(DevelopmentLoginError::PacketLimitExceeded {
+        state: "Play acceptance",
+        max_packets: MAX_PLAY_ACCEPTANCE_PACKETS,
     })
 }
 

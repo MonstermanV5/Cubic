@@ -264,7 +264,7 @@ fn retained_bytes(message: &DisplayedMessage) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cubic_core::{ChatMessage, StructuredText};
+    use cubic_core::{ChatMessage, ChatMessageTrust, StructuredText};
 
     fn message(text: &str) -> ChatEvent {
         ChatEvent::Message {
@@ -273,6 +273,7 @@ mod tests {
             message: ChatMessage {
                 plain_text: text.to_owned(),
                 structured: StructuredText::String(text.to_owned()),
+                trust: ChatMessageTrust::NotApplicable,
             },
         }
     }

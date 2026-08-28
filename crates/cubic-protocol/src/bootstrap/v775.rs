@@ -23,12 +23,16 @@ pub const MAX_USERNAME_UTF16_UNITS: usize = 16;
 pub const MAX_LOGIN_PROPERTIES: usize = 64;
 pub const MAX_LOGIN_PLUGIN_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_CONFIGURATION_CUSTOM_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub const MAX_PLAY_CUSTOM_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_DISCONNECT_BYTES: usize = 32 * 1024;
 pub const MAX_KNOWN_PACKS: usize = 64;
 pub const MAX_CHAT_UTF16_UNITS: usize = 256;
 pub const MAX_CHAT_COMPONENT_BYTES: usize = 32 * 1024;
 pub const MAX_LAST_SEEN_MESSAGES: usize = 20;
 pub const CHAT_ACKNOWLEDGEMENT_BYTES: usize = 3;
+pub const PLAYER_CHAT_SIGNATURE_BYTES: usize = 256;
+pub const MAX_PLAYER_PUBLIC_KEY_BYTES: usize = 512;
+pub const MAX_PLAYER_KEY_SIGNATURE_BYTES: usize = 4096;
 
 const LOGIN_START_ID: i32 = 0x00;
 const LOGIN_DISCONNECT_ID: i32 = 0x00;
@@ -74,6 +78,7 @@ const INITIAL_PLAY_LOGIN_ID: i32 = 0x31;
 const PLAY_CONFIRM_TELEPORT_ID: i32 = 0x00;
 const PLAY_CHAT_ACKNOWLEDGEMENT_ID: i32 = 0x06;
 const PLAY_CHAT_MESSAGE_ID: i32 = 0x09;
+const PLAY_CHAT_SESSION_UPDATE_ID: i32 = 0x0a;
 const PLAY_CHUNK_BATCH_RECEIVED_ID: i32 = 0x0b;
 const PLAY_CLIENT_INFORMATION_ID: i32 = 0x0e;
 const PLAY_ACKNOWLEDGE_CONFIGURATION_ID: i32 = 0x10;
@@ -84,6 +89,9 @@ const PLAY_PONG_ID: i32 = 0x2d;
 
 const PLAY_CHUNK_BATCH_FINISHED_ID: i32 = 0x0b;
 const PLAY_COOKIE_REQUEST_ID: i32 = 0x15;
+const PLAY_CUSTOM_PAYLOAD_ID: i32 = 0x18;
+const PLAY_RESOURCE_PACK_PUSH_ID: i32 = 0x51;
+const PLAY_TRANSFER_ID: i32 = 0x81;
 const PLAY_DISCONNECT_ID: i32 = 0x20;
 const PLAY_DISGUISED_CHAT_ID: i32 = 0x21;
 const PLAY_KEEP_ALIVE_ID: i32 = 0x2c;
@@ -216,6 +224,26 @@ pub struct ChatLastSeenUpdate {
     checksum: u8,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageSignature(Box<[u8; PLAYER_CHAT_SIGNATURE_BYTES]>);
+
+impl MessageSignature {
+    #[must_use]
+    pub fn new(bytes: [u8; PLAYER_CHAT_SIGNATURE_BYTES]) -> Self {
+        Self(Box::new(bytes))
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> [u8; PLAYER_CHAT_SIGNATURE_BYTES] {
+        *self.0
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; PLAYER_CHAT_SIGNATURE_BYTES] {
+        &self.0
+    }
+}
+
 impl ChatLastSeenUpdate {
     #[must_use]
     pub const fn empty_with_disabled_checksum() -> Self {
@@ -252,10 +280,26 @@ impl ChatLastSeenUpdate {
             checksum,
         })
     }
+
+    #[must_use]
+    pub const fn offset(self) -> i32 {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn acknowledged(self) -> [u8; CHAT_ACKNOWLEDGEMENT_BYTES] {
+        self.acknowledged
+    }
+
+    #[must_use]
+    pub const fn checksum(self) -> u8 {
+        self.checksum
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayClientbound {
+    Login,
     KeepAlive {
         id: i64,
     },
@@ -271,12 +315,18 @@ pub enum PlayClientbound {
     CookieRequest {
         key: String,
     },
+    CustomPayload {
+        channel: String,
+        payload_bytes: usize,
+    },
     PlayerChat {
         sender_uuid: ProtocolUuid,
         sender_name: String,
         message: TextComponent,
         global_index: i32,
-        acknowledgement_required: bool,
+        sender_index: i32,
+        signature: Option<MessageSignature>,
+        modified: bool,
     },
     DisguisedChat {
         sender_name: String,
@@ -293,6 +343,8 @@ pub enum PlayClientbound {
         health: f32,
     },
     StartConfiguration,
+    ResourcePackPush,
+    Transfer,
     Ignored {
         packet_id: i32,
         payload_bytes: usize,
@@ -591,26 +643,18 @@ pub fn decode_configuration_clientbound(
     }
 }
 
-pub fn validate_initial_play_login(frame_body: &[u8]) -> Result<(), BootstrapProtocolError> {
-    let packet = split_raw_packet(frame_body)?;
-    if packet.id != INITIAL_PLAY_LOGIN_ID {
-        return Err(BootstrapProtocolError::UnexpectedPacketId {
-            state: "Play acceptance",
-            id: packet.id,
-        });
-    }
-    if packet.payload.is_empty() {
-        return Err(BootstrapProtocolError::EmptyInitialPlayLogin);
-    }
-    Ok(())
-}
-
 pub fn decode_play_clientbound(
     frame_body: &[u8],
 ) -> Result<PlayClientbound, BootstrapProtocolError> {
     let packet = split_raw_packet(frame_body)?;
     let mut reader = CodecReader::new(packet.payload);
     match packet.id {
+        INITIAL_PLAY_LOGIN_ID => {
+            if packet.payload.is_empty() {
+                return Err(BootstrapProtocolError::EmptyInitialPlayLogin);
+            }
+            Ok(PlayClientbound::Login)
+        }
         PLAY_KEEP_ALIVE_ID => {
             let id = reader.read_i64()?;
             require_consumed(&reader, "Play Keep Alive")?;
@@ -649,6 +693,19 @@ pub fn decode_play_clientbound(
             require_consumed(&reader, "Play Cookie Request")?;
             Ok(PlayClientbound::CookieRequest { key })
         }
+        PLAY_CUSTOM_PAYLOAD_ID => {
+            let channel = reader.read_string(IDENTIFIER_LIMITS)?.to_owned();
+            let payload = reader.read_remaining();
+            check_payload(
+                "Play Custom Payload",
+                payload,
+                MAX_PLAY_CUSTOM_PAYLOAD_BYTES,
+            )?;
+            Ok(PlayClientbound::CustomPayload {
+                channel,
+                payload_bytes: payload.len(),
+            })
+        }
         PLAY_SYSTEM_CHAT_ID => {
             let message = decode_text_component(&mut reader)?;
             let overlay = reader.read_bool()?;
@@ -681,6 +738,8 @@ pub fn decode_play_clientbound(
             require_consumed(&reader, "Start Configuration")?;
             Ok(PlayClientbound::StartConfiguration)
         }
+        PLAY_RESOURCE_PACK_PUSH_ID => Ok(PlayClientbound::ResourcePackPush),
+        PLAY_TRANSFER_ID => Ok(PlayClientbound::Transfer),
         packet_id => Ok(PlayClientbound::Ignored {
             packet_id,
             payload_bytes: packet.payload.len(),
@@ -761,6 +820,7 @@ pub fn encode_play_chat_message(
     message: &str,
     timestamp_millis: i64,
     salt: i64,
+    signature: Option<MessageSignature>,
     last_seen: ChatLastSeenUpdate,
 ) -> Result<Vec<u8>, BootstrapProtocolError> {
     if message.is_empty() {
@@ -786,10 +846,29 @@ pub fn encode_play_chat_message(
     writer.write_string(message, CHAT_LIMITS)?;
     writer.write_i64(timestamp_millis);
     writer.write_i64(salt);
-    writer.write_bool(false);
+    writer.write_bool(signature.is_some());
+    if let Some(signature) = signature {
+        writer.write_bytes(signature.as_bytes());
+    }
     writer.write_var_int(last_seen.offset);
     writer.write_bytes(&last_seen.acknowledged);
     writer.write_u8(last_seen.checksum);
+    frame(writer)
+}
+
+/// Encodes protocol 775's Play-state player chat-session update (ID `0x0a`).
+pub fn encode_play_chat_session_update(
+    session_id: ProtocolUuid,
+    expires_at_millis: i64,
+    public_key_der: &[u8],
+    public_key_signature: &[u8],
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_CHAT_SESSION_UPDATE_ID);
+    writer.write_uuid(session_id);
+    writer.write_i64(expires_at_millis);
+    writer.write_byte_array(public_key_der, MAX_PLAYER_PUBLIC_KEY_BYTES)?;
+    writer.write_byte_array(public_key_signature, MAX_PLAYER_KEY_SIGNATURE_BYTES)?;
     frame(writer)
 }
 
@@ -798,11 +877,20 @@ fn decode_player_chat(
 ) -> Result<PlayClientbound, BootstrapProtocolError> {
     let global_index = reader.read_var_int()?;
     let sender_uuid = reader.read_uuid()?;
-    let _sender_index = reader.read_var_int()?;
-    let acknowledgement_required = reader.read_bool()?;
-    if acknowledgement_required {
-        let _signature = reader.read_bytes(256, "Player Chat signature")?;
-    }
+    let sender_index = reader.read_var_int()?;
+    let signature = if reader.read_bool()? {
+        let bytes = reader.read_bytes(PLAYER_CHAT_SIGNATURE_BYTES, "Player Chat signature")?;
+        Some(MessageSignature::new(bytes.try_into().map_err(|_| {
+            CodecError::ValueOutOfRange {
+                context: "Player Chat signature length",
+                value: bytes.len() as i128,
+                min: PLAYER_CHAT_SIGNATURE_BYTES as i128,
+                max: PLAYER_CHAT_SIGNATURE_BYTES as i128,
+            }
+        })?))
+    } else {
+        None
+    };
     let content = reader.read_string(CHAT_LIMITS)?.to_owned();
     let _timestamp = reader.read_i64()?;
     let _salt = reader.read_i64()?;
@@ -844,6 +932,7 @@ fn decode_player_chat(
     }
     let sender_name = decode_bound_chat_type(reader)?;
     require_consumed(reader, "Player Chat")?;
+    let modified = unsigned.is_some();
     let message = unsigned.unwrap_or(TextComponent {
         value: NbtTag::String(crate::nbt::NbtString::from_utf16_units(
             content.encode_utf16().collect(),
@@ -855,7 +944,9 @@ fn decode_player_chat(
         sender_name,
         message,
         global_index,
-        acknowledgement_required,
+        sender_index,
+        signature,
+        modified,
     })
 }
 

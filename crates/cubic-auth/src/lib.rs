@@ -4,6 +4,7 @@ mod error;
 mod http;
 mod model;
 mod oauth;
+mod player_certificate;
 mod provider;
 mod secret;
 mod store;
@@ -15,6 +16,7 @@ pub use model::{
     AuthenticatedMinecraftAccount, MicrosoftClientId, MinecraftProfile, MinecraftProfileId,
 };
 pub use oauth::{LoopbackAuthorization, OAuthAuthorizationCode, OAuthCallback};
+pub use player_certificate::{PlayerCertificate, PlayerCertificateClient};
 pub use provider::{AuthBackend, MinecraftSessionJoiner};
 pub use secret::SecretString;
 pub use store::{CredentialStore, StoredAccount, SystemCredentialStore, XalDeviceCredential};

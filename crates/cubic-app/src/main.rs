@@ -2,13 +2,13 @@ use std::{process::ExitCode, str::FromStr, time::Duration};
 
 use cubic_auth::{
     AuthBackend, AuthClient, AuthClientOptions, AuthenticatedMinecraftAccount, CredentialStore,
-    LoopbackAuthorization, MicrosoftClientId, MinecraftSessionJoiner, StoredAccount,
-    SystemCredentialStore, XalAuthClient, XalDeviceIdentity,
+    LoopbackAuthorization, MicrosoftClientId, MinecraftSessionJoiner, PlayerCertificateClient,
+    StoredAccount, SystemCredentialStore, XalAuthClient, XalDeviceIdentity,
 };
 use cubic_network::{
     AuthenticatedLoginOptions, ChatSessionHandle, ChatSessionOptions, DevelopmentLoginOptions,
     DevelopmentUsername, ServerAddress, StatusQueryOptions, authenticated_login, development_login,
-    query_server_status, run_development_chat_session,
+    query_server_status, run_authenticated_chat_session, run_development_chat_session,
 };
 use cubic_ui::ChatSessionPort;
 
@@ -29,7 +29,7 @@ fn main() -> ExitCode {
         Ok(command) => command,
         Err(message) => {
             eprintln!(
-                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]\n  cubic-app dev-login <host[:port]> [--username <name>]\n  cubic-app chat <host[:port]> [--username <name>]\n  cubic-app auth login [--backend cubic-entra|xal]\n  cubic-app auth status [--backend cubic-entra|xal]\n  cubic-app auth logout [--backend cubic-entra|xal]\n  cubic-app online-login <host[:port]> [--backend cubic-entra|xal]"
+                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]\n  cubic-app dev-login <host[:port]> [--username <name>]\n  cubic-app chat <host[:port]> [--username <name> | --backend cubic-entra|xal]\n  cubic-app auth login [--backend cubic-entra|xal]\n  cubic-app auth status [--backend cubic-entra|xal]\n  cubic-app auth logout [--backend cubic-entra|xal]\n  cubic-app online-login <host[:port]> [--backend cubic-entra|xal]"
             );
             return ExitCode::FAILURE;
         }
@@ -39,7 +39,11 @@ fn main() -> ExitCode {
         Command::Graphical => run_graphical(),
         Command::Status { address, protocol } => run_status(&address, protocol),
         Command::DevLogin { address, username } => run_development_login(&address, &username),
-        Command::Chat { address, username } => run_chat(address, username),
+        Command::Chat {
+            address,
+            username,
+            backend,
+        } => run_chat(address, username, backend),
         Command::Auth(action) => run_auth(action),
         Command::OnlineLogin { address, backend } => run_online_login(&address, backend),
     }
@@ -384,7 +388,11 @@ fn open_system_browser(_url: &str) {
     tracing::warn!("automatic browser opening is not implemented for this target");
 }
 
-fn run_chat(address: ServerAddress, username: DevelopmentUsername) -> ExitCode {
+fn run_chat(
+    address: ServerAddress,
+    username: DevelopmentUsername,
+    backend: Option<AuthBackend>,
+) -> ExitCode {
     let options = ChatSessionOptions::default();
     let (handle, runner) = ChatSessionHandle::bounded(&options);
     let network_address = address.clone();
@@ -396,12 +404,21 @@ fn run_chat(address: ServerAddress, username: DevelopmentUsername) -> ExitCode {
                 .enable_all()
                 .build();
             let result = match runtime {
-                Ok(runtime) => runtime.block_on(run_development_chat_session(
-                    &network_address,
-                    &network_username,
-                    &options,
-                    runner,
-                )),
+                Ok(runtime) => match backend {
+                    Some(backend) => runtime.block_on(run_authenticated_chat_backend(
+                        &network_address,
+                        backend,
+                        runner,
+                    )),
+                    None => runtime
+                        .block_on(run_development_chat_session(
+                            &network_address,
+                            &network_username,
+                            &options,
+                            runner,
+                        ))
+                        .map_err(|error| error.to_string()),
+                },
                 Err(error) => {
                     tracing::error!(%error, "could not create Chat Mode runtime");
                     return;
@@ -419,7 +436,14 @@ fn run_chat(address: ServerAddress, username: DevelopmentUsername) -> ExitCode {
         }
     };
 
-    tracing::info!(address = %address, username = %username, "opening Chat Mode");
+    match backend {
+        Some(backend) => {
+            tracing::info!(address = %address, %backend, "opening authenticated Chat Mode")
+        }
+        None => {
+            tracing::info!(address = %address, username = %username, "opening development Chat Mode")
+        }
+    }
     let result = cubic_platform::run_chat(Box::new(NetworkChatPort { handle }));
     if network.join().is_err() {
         tracing::error!("Chat Mode network thread panicked");
@@ -432,6 +456,82 @@ fn run_chat(address: ServerAddress, username: DevelopmentUsername) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+async fn run_authenticated_chat_backend(
+    address: &ServerAddress,
+    backend: AuthBackend,
+    runner: cubic_network::ChatSessionRunner,
+) -> Result<(), String> {
+    let store = SystemCredentialStore;
+    let stored = store
+        .load_account(backend)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!("not signed in with {backend}; run `auth login --backend ...` first")
+        })?;
+    match backend {
+        AuthBackend::CubicEntra => {
+            let client = configured_auth_client()?;
+            let account = client
+                .refresh(&stored.refresh_token)
+                .await
+                .map_err(|error| error.to_string())?;
+            complete_authenticated_chat(address, backend, &store, &client, account, runner).await
+        }
+        AuthBackend::XalInterop => {
+            let credential = store
+                .load_xal_device()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "XAL device identity is missing; run `auth login --backend xal`".to_owned()
+                })?;
+            let device = XalDeviceIdentity::from_credential(&credential)
+                .map_err(|error| error.to_string())?;
+            let client = XalAuthClient::new(AuthClientOptions::default())
+                .map_err(|error| error.to_string())?;
+            let account = client
+                .refresh(&device, &stored.refresh_token)
+                .await
+                .map_err(|error| error.to_string())?;
+            complete_authenticated_chat(address, backend, &store, &client, account, runner).await
+        }
+    }
+}
+
+async fn complete_authenticated_chat<J: MinecraftSessionJoiner>(
+    address: &ServerAddress,
+    backend: AuthBackend,
+    store: &dyn CredentialStore,
+    joiner: &J,
+    account: AuthenticatedMinecraftAccount,
+    runner: cubic_network::ChatSessionRunner,
+) -> Result<(), String> {
+    store
+        .save_account(
+            backend,
+            &StoredAccount {
+                backend,
+                refresh_token: account.refresh_token.clone(),
+                profile: account.profile.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let certificate = PlayerCertificateClient::new(AuthClientOptions::default())
+        .map_err(|error| error.to_string())?
+        .request(&account)
+        .await
+        .map_err(|error| error.to_string())?;
+    run_authenticated_chat_session(
+        address,
+        &account,
+        joiner,
+        certificate,
+        &AuthenticatedLoginOptions::default(),
+        runner,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 struct NetworkChatPort {
@@ -578,6 +678,7 @@ enum Command {
     Chat {
         address: ServerAddress,
         username: DevelopmentUsername,
+        backend: Option<AuthBackend>,
     },
     Auth(AuthAction),
     OnlineLogin {
@@ -677,8 +778,35 @@ fn parse_optional_backend(
 }
 
 fn parse_chat(arguments: impl Iterator<Item = String>) -> Result<Command, String> {
-    parse_server_and_username("chat", arguments)
-        .map(|(address, username)| Command::Chat { address, username })
+    let mut arguments = arguments;
+    let target = arguments
+        .next()
+        .ok_or_else(|| "chat command requires a server address".to_owned())?;
+    let address = ServerAddress::from_str(&target).map_err(|error| error.to_string())?;
+    let mut username = DevelopmentUsername::new("CubicTest").map_err(|error| error.to_string())?;
+    let mut backend = None;
+    if let Some(option) = arguments.next() {
+        let value = arguments
+            .next()
+            .ok_or_else(|| format!("{option} requires a value"))?;
+        match option.as_str() {
+            "--username" => {
+                username = DevelopmentUsername::new(value).map_err(|error| error.to_string())?;
+            }
+            "--backend" => {
+                backend = Some(AuthBackend::from_str(&value).map_err(|error| error.to_string())?);
+            }
+            _ => return Err(format!("unknown chat option {option:?}")),
+        }
+    }
+    if let Some(extra) = arguments.next() {
+        return Err(format!("unexpected argument {extra:?}"));
+    }
+    Ok(Command::Chat {
+        address,
+        username,
+        backend,
+    })
 }
 
 fn parse_development_login(arguments: impl Iterator<Item = String>) -> Result<Command, String> {
@@ -795,12 +923,33 @@ mod tests {
             "CubicChat".to_owned(),
         ])
         .unwrap();
-        let Command::Chat { address, username } = command else {
+        let Command::Chat {
+            address,
+            username,
+            backend,
+        } = command
+        else {
             panic!("expected chat command")
         };
         assert_eq!(address.port(), 25_565);
         assert_eq!(username.as_str(), "CubicChat");
+        assert_eq!(backend, None);
         assert!(parse_command(["chat".to_owned()]).is_err());
+
+        let authenticated = parse_command([
+            "chat".to_owned(),
+            "localhost:25565".to_owned(),
+            "--backend".to_owned(),
+            "xal".to_owned(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            authenticated,
+            Command::Chat {
+                backend: Some(AuthBackend::XalInterop),
+                ..
+            }
+        ));
     }
 
     #[test]

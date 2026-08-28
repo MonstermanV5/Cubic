@@ -1,7 +1,8 @@
 use cubic_protocol::{
     CodecError, FrameDecoder, FrameLimits, ProtocolUuid,
     bootstrap::v775::{
-        self, BootstrapProtocolError, ClientInformation, ConfigurationClientbound, LoginClientbound,
+        self, BootstrapProtocolError, ClientInformation, ConfigurationClientbound,
+        LoginClientbound, PlayClientbound,
     },
     handshake::{Handshake, HandshakeNextState, encode_handshake},
 };
@@ -191,17 +192,37 @@ fn known_pack_count_and_configuration_disconnect_are_bounded() {
 }
 
 #[test]
-fn initial_play_acceptance_requires_the_protocol_775_login_packet() {
-    assert!(v775::validate_initial_play_login(&[0x31, 0x01]).is_ok());
+fn play_decoder_identifies_login_without_rejecting_other_legal_packets() {
     assert!(matches!(
-        v775::validate_initial_play_login(&[0x31]),
-        Err(BootstrapProtocolError::EmptyInitialPlayLogin)
+        v775::decode_play_clientbound(&[0x31, 0x01]),
+        Ok(PlayClientbound::Login)
     ));
     assert!(matches!(
-        v775::validate_initial_play_login(&[0x30, 0x01]),
-        Err(BootstrapProtocolError::UnexpectedPacketId {
-            state: "Play acceptance",
-            ..
-        })
+        v775::decode_play_clientbound(&[0x31]),
+        Err(BootstrapProtocolError::EmptyInitialPlayLogin)
+    ));
+    let mut custom_payload = vec![0x18, 0x0f];
+    custom_payload.extend_from_slice(b"minecraft:brand");
+    custom_payload.push(0x01);
+    assert!(matches!(
+        v775::decode_play_clientbound(&custom_payload),
+        Ok(PlayClientbound::CustomPayload {
+            channel,
+            payload_bytes: 1
+        }) if channel == "minecraft:brand"
+    ));
+    assert!(matches!(
+        v775::decode_play_clientbound(&[0x18, 0x01]),
+        Err(BootstrapProtocolError::Codec(
+            CodecError::UnexpectedEnd { .. }
+        ))
+    ));
+    assert!(matches!(
+        v775::decode_play_clientbound(&[0x51]),
+        Ok(PlayClientbound::ResourcePackPush)
+    ));
+    assert!(matches!(
+        v775::decode_play_clientbound(&[0x81, 0x01]),
+        Ok(PlayClientbound::Transfer)
     ));
 }

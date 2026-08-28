@@ -1,6 +1,6 @@
 # Phase 9 Authentication
 
-Phase 9 is an in-progress public-native-client authentication implementation. Cubic never accepts a Microsoft password and has no client secret. It exposes two explicit providers that produce the same bounded `AuthenticatedMinecraftAccount` model:
+Phase 9 provides Cubic's accepted public-native-client authentication and secure-chat foundation. Cubic never accepts a Microsoft password and has no client secret. It exposes two explicit providers that produce the same bounded `AuthenticatedMinecraftAccount` model:
 
 - `CubicEntra` is the intended long-term production path and uses Cubic's own Entra application ID.
 - `XalInterop` is an experimental development/interoperability path using the public first-party Minecraft/Xbox launcher XAL/SISU protocol shape. Its identifiers are not Cubic's identity and their use is not assumed authorized for public or store distribution.
@@ -81,6 +81,10 @@ The transport ordering remains:
 TCP <-> AES/CFB8 <-> Minecraft outer frame <-> zlib packet body <-> packet codec
 ```
 
+The same provider-neutral account token requests `POST https://api.minecraftservices.com/player/certificates`. The live response contains `keyPair`, the legacy `publicKeySignature`, `publicKeySignatureV2`, `expiresAt`, and `refreshedAfter`; current protocol 775 consumes the V2 signature while the parser accepts the known legacy signature as optional compatibility metadata. Cubic accepts only a bounded, unexpired response containing a matching RSA-2048 PKCS#8 private key and X.509/SPKI public key. The service labels those PEM envelopes `RSA PRIVATE KEY` and `RSA PUBLIC KEY` even though their decoded DER uses PKCS#8 and SubjectPublicKeyInfo respectively, so Cubic validates the label and the actual DER structure independently. The short-lived private key remains in memory and is never added to persistent credential storage. Starting a later Chat Mode session performs the normal silent account refresh and obtains a fresh certificate, so `refreshedAfter` is respected without persisting session key material.
+
+After Play begins, the selected 26.1.2 profile establishes a random player chat-session UUID, sends the certificate/session update, and uses the version-neutral bounded signing/last-seen state. The profile owns protocol 775's IDs, field order, signing domain, 20-entry acknowledgement window, and threshold; core authentication and UI do not. This is Cubic's first reference implementation, not a permanent single-version design. Phases 10–12 will select/generated future packet and secure-chat rules without rewriting provider authentication or Chat Mode.
+
 ## Development commands
 
 ```text
@@ -94,6 +98,7 @@ cargo run -p cubic-app -- auth login --backend xal
 cargo run -p cubic-app -- auth status --backend xal
 cargo run -p cubic-app -- auth logout --backend xal
 cargo run -p cubic-app -- online-login localhost:25565 --backend xal
+cargo run -p cubic-app -- chat localhost:25565 --backend xal
 
 # Reports both backend slots without exposing tokens
 cargo run -p cubic-app -- auth status
@@ -103,6 +108,10 @@ Without `--backend`, login, logout, and online-login retain their original Cubic
 
 ## Current acceptance boundary
 
-Automated tests never use real credentials. The Cubic-Entra backend's real test is externally blocked at Minecraft Services `Invalid app registration` after successful Microsoft/Xbox/XSTS stages. The experimental XAL backend has now passed a real end-to-end account test: Xbox device authentication, SISU authenticate, Microsoft OAuth with PKCE, SISU authorize, XSTS, Minecraft `/launcher/login`, entitlement verification, profile retrieval, and secure credential persistence all succeeded. That interoperability result does not resolve Cubic's own registration approval or establish authorization to distribute under the first-party identity. The new automatic WebView2 redirect capture still requires a short real UX retest.
+Automated tests never use real credentials. The Cubic-Entra backend's real test is externally blocked at Minecraft Services `Invalid app registration` after successful Microsoft/Xbox/XSTS stages. The experimental XAL backend has passed a real end-to-end account test, automatic WebView2 redirect capture, secure persistence, restart-time silent refresh, Mojang session join, encrypted/compressed Login, Configuration, and Play against online-mode vanilla 26.1.2. That interoperability result does not resolve Cubic's own registration approval or establish authorization to distribute under the first-party identity.
 
-The Mojang player-certificate endpoint, protocol-775 Player Session establishment, authenticated secure-chat signing, persistent authenticated Chat Mode, native iOS Keychain/browser callback host, and a full deterministic mock HTTP sequence remain incomplete. Cubic does not claim compatibility with `enforce-secure-profile=true` Chat Mode. These limitations are not permission to disable or bypass server security. Phase 9 remains `[~]`, and Phase 10 has not begun.
+Player-certificate acquisition, protocol-775 Player Chat Session establishment, RSA-2048 signed outgoing chat, strict message indices, and bounded modern last-seen acknowledgements are implemented and wired into the existing persistent graphical Chat Mode. Real localhost vanilla 26.1.2 acceptance passed with `online-mode=true`, `enforce-secure-profile=true`, and compression enabled: Cubic silently refreshed stored XAL credentials, obtained the Mojang certificate, completed encrypted/compressed Login and Configuration, established the player chat session, remained connected in Play, sent signed chat accepted and broadcast by vanilla, received System Chat, and disconnected cleanly. The Login-to-Play handoff also accepts bounded legal early Play traffic; protocol 775 clientbound `0x18` is classified as Custom Payload rather than being mistaken for the initial Play Login packet.
+
+Exploratory authorized testing reached persistent authenticated Chat Mode through BlossomCraft's proxy/plugin stack and through Autcraft, where Cubic received live server/player chat. This is useful interoperability evidence, not a claim of general Phase 27 proxy/plugin compatibility. Autcraft also exposed deferred presentation limitations: some decorated messages showed rank/pronoun/channel prefixes without a visible body, and translated events could appear as raw keys such as `multiplayer.player.joined`. Complete rich text, translation, and decoration presentation remains Phase 25 work.
+
+Incoming signatures are distinguished from unsigned messages and drive acknowledgement state, but Cubic does not yet retain other players' session-key graph and therefore does not claim cryptographic verification of their messages. Player certificates are refreshed for each Chat Mode launch but are not rotated within an extremely long live session. Slash commands and signable command arguments remain deferred until command-tree data exists. Native iOS Keychain and native authentication callback support remain incomplete. CubicEntra remains externally blocked by Minecraft Services `Invalid app registration`, and XAL remains experimental and is not assumed authorized for public distribution. These limitations are not permission to disable or bypass server security. Phase 9's implemented Windows technical scope and real acceptance are complete; the limitations remain explicitly external or deferred.

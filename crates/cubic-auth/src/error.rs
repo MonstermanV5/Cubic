@@ -10,6 +10,7 @@ pub enum AuthStage {
     MinecraftToken,
     MinecraftEntitlements,
     MinecraftProfile,
+    PlayerCertificates,
     MinecraftSessionJoin,
     XboxDevice,
     SisuAuthenticate,
@@ -62,6 +63,27 @@ pub enum AuthError {
     ResponseTooLarge { stage: AuthStage, limit: usize },
     #[error("{stage:?} returned malformed or incomplete JSON")]
     InvalidResponse { stage: AuthStage },
+    #[error("Minecraft Services returned invalid JSON for the player certificate")]
+    MalformedPlayerCertificateJson,
+    #[error("Minecraft Services player certificate omitted required field {field}")]
+    MissingPlayerCertificateField { field: &'static str },
+    #[error(
+        "Minecraft Services player certificate field {field} has the wrong JSON type; expected {expected}"
+    )]
+    InvalidPlayerCertificateFieldType {
+        field: &'static str,
+        expected: &'static str,
+    },
+    #[error("Minecraft Services player certificate contains an unexpected JSON field")]
+    UnexpectedPlayerCertificateField,
+    #[error("Minecraft Services player certificate field {field} has an invalid timestamp")]
+    InvalidPlayerCertificateTimestamp { field: &'static str },
+    #[error("Minecraft Services returned an invalid player-certificate signature")]
+    InvalidPlayerCertificateSignature,
+    #[error("Minecraft Services player certificate field {field} contains invalid PEM")]
+    InvalidPlayerCertificatePem { field: &'static str },
+    #[error("Minecraft Services returned invalid player-certificate keys: {reason}")]
+    InvalidPlayerCertificateKey { reason: &'static str },
     #[error("{stage:?} response omitted required header {name}")]
     MissingHeader {
         stage: AuthStage,
@@ -73,6 +95,10 @@ pub enum AuthError {
     NoJavaEntitlement,
     #[error("Minecraft Services returned an invalid profile")]
     InvalidMinecraftProfile,
+    #[error("Minecraft Services returned an expired player certificate")]
+    ExpiredPlayerCertificate,
+    #[error("player chat signing failed")]
+    PlayerChatSigning,
     #[error("secure credential storage is unavailable")]
     SecureStoreUnavailable,
     #[error("stored Cubic credentials are corrupt; sign in again")]

@@ -3,8 +3,8 @@
 mod chat;
 
 pub use chat::{
-    ChatConnectionState, ChatEvent, ChatMessage, ChatMessageKind, ChatSessionCommand,
-    StructuredText,
+    ChatConnectionState, ChatEvent, ChatMessage, ChatMessageKind, ChatMessageTrust,
+    ChatSessionCommand, StructuredText,
 };
 
 /// Returns the message emitted by the Phase 1 application scaffold.

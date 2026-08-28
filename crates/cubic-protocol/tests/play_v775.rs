@@ -85,7 +85,7 @@ fn independent_player_chat_vector_tracks_sender_and_index() {
         global_index,
         sender_name,
         message,
-        acknowledgement_required,
+        signature,
         ..
     } = decoded
     else {
@@ -94,7 +94,7 @@ fn independent_player_chat_vector_tracks_sender_and_index() {
     assert_eq!(global_index, 7);
     assert_eq!(sender_name, "Alice");
     assert_eq!(message.plain_text, "hello");
-    assert!(!acknowledgement_required);
+    assert!(signature.is_none());
 }
 
 #[test]
@@ -111,14 +111,10 @@ fn signed_player_chat_requires_acknowledgement_but_unsigned_chat_does_not() {
     packet.push(0);
 
     let decoded = v775::decode_play_clientbound(&packet).unwrap();
-    let v775::PlayClientbound::PlayerChat {
-        acknowledgement_required,
-        ..
-    } = decoded
-    else {
+    let v775::PlayClientbound::PlayerChat { signature, .. } = decoded else {
         panic!("expected Player Chat")
     };
-    assert!(acknowledgement_required);
+    assert_eq!(signature.unwrap().bytes(), [0x5a; 256]);
 }
 
 #[test]
@@ -146,7 +142,7 @@ fn control_plane_vectors_are_exact() {
 #[test]
 fn outgoing_unsigned_chat_vector_and_validation() {
     let last_seen = v775::ChatLastSeenUpdate::new(300, [1, 2, 3], 0x7f).unwrap();
-    let framed = v775::encode_play_chat_message("Hi", 1, 2, last_seen).unwrap();
+    let framed = v775::encode_play_chat_message("Hi", 1, 2, None, last_seen).unwrap();
     assert_eq!(framed[0], 27);
     let encoded = body(&framed);
     assert_eq!(
@@ -176,12 +172,50 @@ fn outgoing_unsigned_chat_vector_and_validation() {
     assert_eq!(reader.remaining(), 0);
 
     let empty = v775::ChatLastSeenUpdate::empty_with_disabled_checksum();
-    assert!(v775::encode_play_chat_message("", 0, 0, empty).is_err());
-    assert!(v775::encode_play_chat_message("bad\nline", 0, 0, empty).is_err());
-    assert!(v775::encode_play_chat_message(&"x".repeat(257), 0, 0, empty).is_err());
-    assert!(v775::encode_play_chat_message(&"😀".repeat(128), 0, 0, empty).is_ok());
+    assert!(v775::encode_play_chat_message("", 0, 0, None, empty).is_err());
+    assert!(v775::encode_play_chat_message("bad\nline", 0, 0, None, empty).is_err());
+    assert!(v775::encode_play_chat_message(&"x".repeat(257), 0, 0, None, empty).is_err());
+    assert!(v775::encode_play_chat_message(&"😀".repeat(128), 0, 0, None, empty).is_ok());
     assert!(v775::ChatLastSeenUpdate::new(-1, [0; 3], 0).is_err());
     assert!(v775::ChatLastSeenUpdate::new(0, [0, 0, 0x10], 0).is_err());
+}
+
+#[test]
+fn signed_chat_and_session_update_vectors_include_every_trailing_field() {
+    let signature = v775::MessageSignature::new([0x5a; 256]);
+    let update = v775::ChatLastSeenUpdate::new(1, [0, 0, 8], 0x42).unwrap();
+    let encoded =
+        body(&v775::encode_play_chat_message("x", 2, 3, Some(signature), update).unwrap());
+    let mut reader = CodecReader::new(&encoded);
+    assert_eq!(reader.read_var_int().unwrap(), 0x09);
+    assert_eq!(
+        reader
+            .read_string(cubic_protocol::StringLimits::new(256, 768))
+            .unwrap(),
+        "x"
+    );
+    assert_eq!(reader.read_i64().unwrap(), 2);
+    assert_eq!(reader.read_i64().unwrap(), 3);
+    assert!(reader.read_bool().unwrap());
+    assert_eq!(reader.read_bytes(256, "signature").unwrap(), [0x5a; 256]);
+    assert_eq!(reader.read_var_int().unwrap(), 1);
+    assert_eq!(reader.read_bytes(3, "last seen").unwrap(), [0, 0, 8]);
+    assert_eq!(reader.read_u8().unwrap(), 0x42);
+    assert_eq!(reader.remaining(), 0);
+
+    let session = body(
+        &v775::encode_play_chat_session_update(
+            cubic_protocol::ProtocolUuid::from_u128(1),
+            2,
+            &[0xaa, 0xbb],
+            &[0xcc],
+        )
+        .unwrap(),
+    );
+    assert_eq!(session[0], 0x0a);
+    assert_eq!(&session[1..17], &1_u128.to_be_bytes());
+    assert_eq!(&session[17..25], &2_i64.to_be_bytes());
+    assert_eq!(&session[25..], &[2, 0xaa, 0xbb, 1, 0xcc]);
 }
 
 #[test]

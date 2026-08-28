@@ -7,13 +7,14 @@ mod development_login;
 mod error;
 mod online_crypto;
 mod online_login;
+mod secure_chat;
 mod status;
 mod transforms;
 
 pub use address::{DEFAULT_MINECRAFT_PORT, ServerAddress, ServerAddressError};
 pub use chat_session::{
     ChatSessionError, ChatSessionHandle, ChatSessionOptions, ChatSessionRunner,
-    ChatSessionSendError, run_development_chat_session,
+    ChatSessionSendError, run_authenticated_chat_session, run_development_chat_session,
 };
 pub use development_login::{
     ConnectionState, DevelopmentLoginOptions, DevelopmentLoginResult, DevelopmentUsername,

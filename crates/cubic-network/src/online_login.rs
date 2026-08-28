@@ -77,7 +77,32 @@ pub async fn authenticated_login<J: MinecraftSessionJoiner>(
 ) -> Result<AuthenticatedLoginResult, AuthenticatedLoginError> {
     match timeout(
         options.overall_timeout,
-        authenticated_login_inner(address, account, session_joiner, options),
+        establish_authenticated_play_inner(address, account, session_joiner, options),
+    )
+    .await
+    {
+        Ok(result) => result.map(|connected| connected.result),
+        Err(_) => Err(AuthenticatedLoginError::OverallTimeout(
+            options.overall_timeout,
+        )),
+    }
+}
+
+pub(crate) struct AuthenticatedPlayConnection {
+    pub(crate) connection: MinecraftConnection,
+    pub(crate) result: AuthenticatedLoginResult,
+    pub(crate) secure_chat_rules: crate::secure_chat::SecureChatRules,
+}
+
+pub(crate) async fn establish_authenticated_play<J: MinecraftSessionJoiner>(
+    address: &ServerAddress,
+    account: &AuthenticatedMinecraftAccount,
+    session_joiner: &J,
+    options: &AuthenticatedLoginOptions,
+) -> Result<AuthenticatedPlayConnection, AuthenticatedLoginError> {
+    match timeout(
+        options.overall_timeout,
+        establish_authenticated_play_inner(address, account, session_joiner, options),
     )
     .await
     {
@@ -88,12 +113,12 @@ pub async fn authenticated_login<J: MinecraftSessionJoiner>(
     }
 }
 
-async fn authenticated_login_inner<J: MinecraftSessionJoiner>(
+async fn establish_authenticated_play_inner<J: MinecraftSessionJoiner>(
     address: &ServerAddress,
     account: &AuthenticatedMinecraftAccount,
     session_joiner: &J,
     options: &AuthenticatedLoginOptions,
-) -> Result<AuthenticatedLoginResult, AuthenticatedLoginError> {
+) -> Result<AuthenticatedPlayConnection, AuthenticatedLoginError> {
     let profile = DevLoginProtocolProfile::protocol_775()
         .map_err(|_| AuthenticatedLoginError::InvalidProfile)?;
     let limits = FrameLimits::new(MAX_BOOTSTRAP_FRAME_SIZE, MAX_CONFIGURATION_BUFFERED_BYTES)
@@ -211,12 +236,16 @@ async fn authenticated_login_inner<J: MinecraftSessionJoiner>(
                 run_configuration(&mut connection, &mut state)
                     .await
                     .map_err(|error| AuthenticatedLoginError::Transport(error.to_string()))?;
-                return Ok(AuthenticatedLoginResult {
-                    address: address.clone(),
-                    profile_name: account.profile.name.clone(),
-                    profile_uuid: expected_uuid,
-                    state,
-                    compression_enabled,
+                return Ok(AuthenticatedPlayConnection {
+                    connection,
+                    secure_chat_rules: profile.secure_chat_rules(),
+                    result: AuthenticatedLoginResult {
+                        address: address.clone(),
+                        profile_name: account.profile.name.clone(),
+                        profile_uuid: expected_uuid,
+                        state,
+                        compression_enabled,
+                    },
                 });
             }
         }
