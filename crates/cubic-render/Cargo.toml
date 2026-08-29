@@ -9,8 +9,13 @@ rust-version.workspace = true
 [dependencies]
 bytemuck.workspace = true
 cubic-world = { path = "../cubic-world" }
+cubic-resources = { path = "../cubic-resources" }
+cubic-version = { path = "../cubic-version" }
 egui.workspace = true
 egui-wgpu.workspace = true
+png.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true

@@ -4,11 +4,11 @@
 
 Cubic is an independent project intended to become a Minecraft: Java Edition-compatible multiplayer client, primarily implemented in Rust.
 
-Cubic does not contain Mojang or Microsoft code or assets. Minecraft gameplay is not implemented. The repository currently contains the architectural scaffold, native graphics bootstrap, protocol/NBT and generated-data foundations, authenticated Chat Mode, semantic world/chunk state, and Phase 15's first diagnostic 3D terrain path.
+Cubic does not contain Mojang or Microsoft code or assets. Minecraft gameplay is not implemented. The repository currently contains the architectural scaffold, native graphics bootstrap, protocol/NBT and generated-data foundations, authenticated Chat Mode, semantic world/chunk state, and Phase 16's accepted runtime-only official block-resource/model terrain path.
 
 ## Current state
 
-With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status`, `dev-login`, and `chat` retain their accepted behavior. `world <server> --username <name>` opens a separate offline-development window that renders bounded decoded chunks as colored exposed cube faces from the authoritative player camera. It requires the exact Phase 11 generated game-data artifact under Cubic's platform data directory. This is diagnostic terrain—not Minecraft models, textures, movement, entities, collision, or Play Mode—and Chat Mode remains independent. See `docs/WORLD_RENDERING.md`.
+With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status`, `dev-login`, and `chat` retain their accepted behavior. `world <server> --username <name>` opens a separate offline-development window that renders bounded decoded chunks from the authoritative player camera using official exact-version block resources verified and cached by Cubic. It requires the Phase 11 generated game-data artifact and may populate the Phase 10 official client cache before opening the window. Movement, entities, collision, and Play Mode remain unimplemented; Chat Mode remains independent. See `docs/WORLD_RENDERING.md` and `docs/BLOCK_RESOURCES.md`.
 
 ## Build and validate
 

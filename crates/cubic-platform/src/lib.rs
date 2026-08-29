@@ -8,9 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cubic_render::{FrameStatus, Renderer, RendererInitError};
+use cubic_render::{BlockResources, FrameStatus, Renderer, RendererInitError};
 use cubic_ui::{ChatMode, ChatSessionPort};
-use cubic_world::{BlockVisualProfile, WorldRenderUpdate};
+use cubic_world::WorldRenderUpdate;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -136,11 +136,11 @@ pub trait WorldSessionPort {
 /// Starts the Phase 15 diagnostic 3D world window.
 pub fn run_world(
     port: Box<dyn WorldSessionPort>,
-    visual: BlockVisualProfile,
+    resources: BlockResources,
 ) -> Result<(), PlatformError> {
     let event_loop = EventLoop::new().map_err(PlatformError::CreateEventLoop)?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut application = WorldApplication::new(port, visual);
+    let mut application = WorldApplication::new(port, resources);
     event_loop
         .run_app(&mut application)
         .map_err(PlatformError::RunEventLoop)?;
@@ -155,18 +155,18 @@ struct WorldApplication {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     port: Box<dyn WorldSessionPort>,
-    visual: BlockVisualProfile,
+    resources: BlockResources,
     startup_error: Option<StartupError>,
     occluded: bool,
 }
 
 impl WorldApplication {
-    fn new(port: Box<dyn WorldSessionPort>, visual: BlockVisualProfile) -> Self {
+    fn new(port: Box<dyn WorldSessionPort>, resources: BlockResources) -> Self {
         Self {
             window: None,
             renderer: None,
             port,
-            visual,
+            resources,
             startup_error: None,
             occluded: false,
         }
@@ -183,7 +183,7 @@ impl WorldApplication {
         );
         let mut renderer = pollster::block_on(Renderer::new(Arc::clone(&window)))
             .map_err(StartupError::InitializeRenderer)?;
-        renderer.enable_world(self.visual.clone());
+        renderer.enable_world(self.resources.clone());
         self.window = Some(Arc::clone(&window));
         self.renderer = Some(renderer);
         window.request_redraw();

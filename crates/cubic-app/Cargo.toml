@@ -11,11 +11,13 @@ cubic-auth = { path = "../cubic-auth" }
 cubic-core = { path = "../cubic-core" }
 cubic-network = { path = "../cubic-network" }
 cubic-platform = { path = "../cubic-platform" }
+cubic-render = { path = "../cubic-render" }
 cubic-resources = { path = "../cubic-resources" }
 cubic-ui = { path = "../cubic-ui" }
 cubic-version = { path = "../cubic-version" }
 cubic-world = { path = "../cubic-world" }
 tokio.workspace = true
+time = { workspace = true, features = ["local-offset"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

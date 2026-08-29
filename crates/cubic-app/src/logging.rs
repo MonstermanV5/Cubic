@@ -4,9 +4,9 @@ use std::{
     io::{self, Write},
     path::Path,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
+use time::OffsetDateTime;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
 
@@ -72,7 +72,7 @@ pub(crate) fn initialize() -> Result<(), LoggingError> {
         .with_writer(TeeMakeWriter {
             file: Arc::new(Mutex::new(file)),
         })
-        .with_timer(UtcTime)
+        .with_timer(SystemLocalTime)
         .with_thread_names(true)
         .with_target(true)
         .with_ansi(false)
@@ -83,7 +83,7 @@ pub(crate) fn initialize() -> Result<(), LoggingError> {
 
 pub(crate) fn initialize_stderr_only() {
     let _ = tracing_subscriber::fmt()
-        .with_timer(UtcTime)
+        .with_timer(SystemLocalTime)
         .with_thread_names(true)
         .with_target(true)
         .with_ansi(false)
@@ -185,23 +185,26 @@ impl Write for TeeWriter {
     }
 }
 
-struct UtcTime;
+struct SystemLocalTime;
 
-impl FormatTime for UtcTime {
+impl FormatTime for SystemLocalTime {
     fn format_time(&self, writer: &mut Writer<'_>) -> fmt::Result {
-        let seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            % 86_400;
-        write!(
-            writer,
-            "[{:02}:{:02}:{:02}]",
-            seconds / 3_600,
-            (seconds / 60) % 60,
-            seconds % 60
-        )
+        // `now_local` asks the operating system for its current timezone rules,
+        // including daylight-saving transitions. UTC is a safe formatting
+        // fallback only on platforms where the local offset cannot be obtained.
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        write_wall_clock(writer, now)
     }
+}
+
+fn write_wall_clock(writer: &mut impl fmt::Write, time: OffsetDateTime) -> fmt::Result {
+    write!(
+        writer,
+        "[{:02}:{:02}:{:02}]",
+        time.hour(),
+        time.minute(),
+        time.second()
+    )
 }
 
 #[cfg(test)]
@@ -213,6 +216,15 @@ mod tests {
         assert_eq!(LogLevel::parse("info"), Some(LogLevel::Info));
         assert_eq!(LogLevel::parse("DEBUG"), Some(LogLevel::Debug));
         assert_eq!(LogLevel::parse("trace"), None);
+    }
+
+    #[test]
+    fn wall_clock_format_uses_the_supplied_local_offset_and_stays_compact() {
+        let utc = OffsetDateTime::from_unix_timestamp(55_738).unwrap();
+        let local = utc.to_offset(time::UtcOffset::from_hms(1, 0, 0).unwrap());
+        let mut rendered = String::new();
+        write_wall_clock(&mut rendered, local).unwrap();
+        assert_eq!(rendered, "[16:28:58]");
     }
 
     #[test]

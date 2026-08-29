@@ -33,6 +33,8 @@ Bootstrap is cache-first. A valid cached manifest, version metadata, and asset i
 
 Metadata-only bootstrap does not download the asset universe or client JAR. `--client-jar` explicitly requests the official client artifact. Cubic never executes or redistributes that JAR, and downloaded Mojang metadata/assets/JARs remain runtime cache content excluded from source control. Phase 11 owns generated registries/game data, Phase 12 generated packet codecs, and Phase 16 resource/model application.
 
+Phase 16 reuses this exact verified client artifact automatically in World Mode. `cubic-resources` exposes only validated relative archive paths and bounded reads; it does not parse blockstate/model JSON. `cubic-render` independently interprets those factual resources before window creation. No extracted Mojang resource is written into or committed from the repository. See `BLOCK_RESOURCES.md`.
+
 ## Phase 10 manual acceptance
 
 The official-Mojang acceptance passed for exact version `26.1.2`. A fresh bootstrap resolved a Release dataset from the network, verified asset index `30`, exposed 4,750 logical asset descriptors, and left the client JAR optional. The published client descriptor was 38,113,927 bytes with SHA-1 `4e618f09a0c649dde3fdf829df443ce0b8831e65`.

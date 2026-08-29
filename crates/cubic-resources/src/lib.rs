@@ -23,6 +23,7 @@ use reqwest::{Client, Url, redirect::Policy};
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use thiserror::Error;
+use zip::ZipArchive;
 
 pub const OFFICIAL_MANIFEST_URL: &str =
     "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
@@ -31,6 +32,7 @@ pub const MAX_VERSION_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_ASSET_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_ASSET_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_CLIENT_JAR_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_VANILLA_RESOURCE_BYTES: u64 = 4 * 1024 * 1024;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -77,6 +79,10 @@ pub enum ResourceError {
         artifact: &'static str,
         reason: String,
     },
+    #[error("invalid vanilla resource path `{path}`")]
+    InvalidResourcePath { path: String },
+    #[error("could not open verified client resource archive: {source}")]
+    InvalidClientArchive { source: zip::result::ZipError },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +147,118 @@ pub struct VerifiedArtifact {
 impl VerifiedArtifact {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// A validated logical resource path inside an official client archive.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct VanillaResourcePath(String);
+
+impl VanillaResourcePath {
+    pub fn new(path: impl Into<String>) -> Result<Self, ResourceError> {
+        let path = path.into();
+        let valid = !path.is_empty()
+            && path.len() <= 512
+            && !path.starts_with('/')
+            && !path.starts_with('\\')
+            && !path.contains('\\')
+            && !path.contains(':')
+            && !path.chars().any(char::is_control)
+            && path
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != "..");
+        if !valid {
+            return Err(ResourceError::InvalidResourcePath { path });
+        }
+        Ok(Self(path))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Read-only bounded access to resources in a hash-verified official client JAR.
+pub trait VanillaResourceSource {
+    fn read_resource(
+        &mut self,
+        path: &VanillaResourcePath,
+        maximum: u64,
+    ) -> Result<Option<Vec<u8>>, ResourceError>;
+}
+
+pub struct VanillaClientResources {
+    archive: ZipArchive<File>,
+}
+
+impl fmt::Debug for VanillaClientResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VanillaClientResources")
+            .field("entries", &self.archive.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl VanillaClientResources {
+    pub fn open(artifact: &VerifiedArtifact) -> Result<Self, ResourceError> {
+        let metadata = fs::symlink_metadata(artifact.path()).map_err(|source| {
+            io_error("inspect verified client archive", artifact.path(), source)
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(ResourceError::CacheSymlink {
+                path: artifact.path().to_owned(),
+            });
+        }
+        let file = File::open(artifact.path())
+            .map_err(|source| io_error("open verified client archive", artifact.path(), source))?;
+        let archive = ZipArchive::new(file)
+            .map_err(|source| ResourceError::InvalidClientArchive { source })?;
+        Ok(Self { archive })
+    }
+}
+
+impl VanillaResourceSource for VanillaClientResources {
+    fn read_resource(
+        &mut self,
+        path: &VanillaResourcePath,
+        maximum: u64,
+    ) -> Result<Option<Vec<u8>>, ResourceError> {
+        let maximum = maximum.min(MAX_VANILLA_RESOURCE_BYTES);
+        let entry = match self.archive.by_name(path.as_str()) {
+            Ok(entry) => entry,
+            Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+            Err(source) => return Err(ResourceError::InvalidClientArchive { source }),
+        };
+        if entry.is_dir() || entry.size() > maximum {
+            return Err(ResourceError::Oversized {
+                context: "vanilla client resource",
+                maximum,
+            });
+        }
+        let capacity = usize::try_from(entry.size()).map_err(|_| ResourceError::Oversized {
+            context: "vanilla client resource",
+            maximum,
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        entry
+            .take(maximum.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|source| {
+                io_error(
+                    "read verified client resource",
+                    Path::new(path.as_str()),
+                    source,
+                )
+            })?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum {
+            return Err(ResourceError::Oversized {
+                context: "vanilla client resource",
+                maximum,
+            });
+        }
+        Ok(Some(bytes))
     }
 }
 
@@ -1061,5 +1179,51 @@ mod tests {
         fs::write(&temporary, b"partial").unwrap();
         assert!(!target.exists());
         fs::remove_file(temporary).unwrap();
+    }
+
+    #[test]
+    fn vanilla_resource_paths_reject_traversal_absolute_and_drive_escapes() {
+        assert_eq!(
+            VanillaResourcePath::new("assets/minecraft/models/block/cube.json")
+                .unwrap()
+                .as_str(),
+            "assets/minecraft/models/block/cube.json"
+        );
+        for invalid in [
+            "../client.json",
+            "assets/../client.json",
+            "/assets/client.json",
+            r"C:\assets\client.json",
+            "assets//client.json",
+        ] {
+            assert!(VanillaResourcePath::new(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn verified_client_resource_reads_are_bounded() {
+        use zip::{ZipWriter, write::SimpleFileOptions};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("client.jar");
+        let file = File::create(&path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        writer
+            .start_file(
+                "assets/minecraft/models/block/test.json",
+                SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(br#"{"parent":"block/cube"}"#).unwrap();
+        writer.finish().unwrap();
+        let artifact = VerifiedArtifact { path };
+        let resource = VanillaResourcePath::new("assets/minecraft/models/block/test.json").unwrap();
+        let mut source = VanillaClientResources::open(&artifact).unwrap();
+
+        assert!(source.read_resource(&resource, 128).unwrap().is_some());
+        assert!(matches!(
+            source.read_resource(&resource, 4),
+            Err(ResourceError::Oversized { .. })
+        ));
     }
 }

@@ -11,9 +11,9 @@ use cubic_network::{
     development_login, query_server_status, run_authenticated_chat_session,
     run_development_chat_session, run_development_world_session,
 };
+use cubic_render::BlockResources;
 use cubic_ui::ChatSessionPort;
 use cubic_version::{GameData, MinecraftVersionId};
-use cubic_world::BlockVisualProfile;
 
 mod logging;
 
@@ -583,13 +583,58 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
             return ExitCode::FAILURE;
         }
     };
-    let visual = match BlockVisualProfile::from_game_data(&data) {
-        Ok(visual) => visual,
+    let cache_root = data_root.join("cache").join("minecraft");
+    let bootstrap = match cubic_resources::OfficialVersionBootstrap::new(&cache_root) {
+        Ok(bootstrap) => bootstrap,
         Err(error) => {
-            tracing::error!(%error, "could not classify renderable block states");
+            tracing::error!(%error, "could not initialize official block-resource bootstrap");
             return ExitCode::FAILURE;
         }
     };
+    let resource_runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "could not create block-resource bootstrap runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bootstrap_result = match resource_runtime.block_on(bootstrap.bootstrap(&version)) {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, "official block-resource metadata bootstrap failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    if data.artifact().provenance.client_jar_sha1 != bootstrap_result.metadata.client.sha1 {
+        tracing::error!("generated game data and official client resource versions do not match");
+        return ExitCode::FAILURE;
+    }
+    let client =
+        match resource_runtime.block_on(bootstrap.ensure_client_jar(&bootstrap_result.metadata)) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::error!(%error, "official client resources are unavailable");
+                return ExitCode::FAILURE;
+            }
+        };
+    let mut source = match cubic_resources::VanillaClientResources::open(&client) {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::error!(%error, "could not open verified vanilla resource source");
+            return ExitCode::FAILURE;
+        }
+    };
+    let resources = match BlockResources::load(&data, &mut source) {
+        Ok(resources) => resources,
+        Err(error) => {
+            tracing::error!(%error, "could not resolve vanilla block resources");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(version = %version, blockstates = resources.blockstate_count, models = resources.model_count, textures = resources.texture_count, atlas_width = resources.atlas.width, atlas_height = resources.atlas.height, atlas_bytes = resources.atlas.rgba.len(), fallbacks = resources.fallback_count, "vanilla block resources prepared");
     let options = ChatSessionOptions::default();
     let (chat_handle, chat_runner) = ChatSessionHandle::bounded(&options);
     let (world_handle, world_runner) = WorldRenderHandle::new();
@@ -629,7 +674,7 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
             chat: chat_handle,
             world: world_handle,
         }),
-        visual,
+        resources,
     );
     if network.join().is_err() {
         tracing::error!("World Mode network thread panicked");

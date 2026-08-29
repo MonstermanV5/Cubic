@@ -1,7 +1,10 @@
 //! Minimal cross-platform wgpu renderer for the graphical bootstrap.
 
+mod block_resources;
 mod mesher;
 mod world;
+
+pub use block_resources::{BlockResourceError, BlockResources, TextureAtlasData};
 
 use std::{
     error::Error,
@@ -12,7 +15,7 @@ use std::{
     },
 };
 
-use cubic_world::{BlockVisualProfile, WorldRenderUpdate};
+use cubic_world::WorldRenderUpdate;
 use wgpu::{
     Color, CommandEncoderDescriptor, CurrentSurfaceTexture, Device, DeviceDescriptor, Instance,
     InstanceDescriptor, LoadOp, Operations, Queue, RenderPassColorAttachment, RenderPassDescriptor,
@@ -182,14 +185,15 @@ impl Renderer {
         tracing::debug!(width = size.width, height = size.height, "surface resized");
     }
 
-    /// Enables the Phase 15 diagnostic terrain path with version-selected block semantics.
-    pub fn enable_world(&mut self, visual: BlockVisualProfile) {
+    /// Enables textured terrain using preloaded, exact-version block resources.
+    pub fn enable_world(&mut self, resources: BlockResources) {
         self.world_renderer = Some(WorldRenderer::new(
             &self.device,
+            &self.queue,
             self.config.format,
             self.size.width,
             self.size.height,
-            visual,
+            resources,
         ));
     }
 
