@@ -8,17 +8,142 @@ use std::{
     process::ExitCode,
 };
 
+use cubic_protocol::{
+    bootstrap::v775,
+    packet_schema::{
+        MAX_PACKET_SCHEMA_BYTES, PacketDirection, PacketLayout, PacketRegistry,
+        ProtoDefIdentityAlias, ProtoDefSource, ProtocolState, generate_packet_schema_from_report,
+        merge_protodef_layouts, parse_packet_schema, serialize_packet_schema,
+    },
+};
 use cubic_version::{
     GameData, GameDataProvenance, MAX_GAME_DATA_BYTES, MinecraftIdentifier, MinecraftVersionId,
     Sha1Digest, VersionDataStore, generate_game_data_from_reports, parse_game_data,
     parse_selected_version_metadata, serialize_game_data, write_catalog,
 };
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 
 const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 const REGISTRIES_REPORT: &str = "registries.json";
 const BLOCKS_REPORT: &str = "blocks.json";
 const GAME_DATA_FILE: &str = "game-data.json";
+const PACKETS_REPORT: &str = "packets.json";
+const PACKET_SCHEMA_FILE: &str = "packet-schema.json";
+const PRISMARINE_REVISION: &str = "8a80816cbfb3fe2b609f2cde4e57796c8033af61";
+const PRISMARINE_PROTOCOL_SHA256: &str =
+    "2dd1dcde27d5a48e8658ae3333179370a589fdbb69e6c78aadf64f7485e4723f";
+const PRISMARINE_VERSION_INDEX_SHA256: &str =
+    "ce7bd7523c8e3a2b27f7e84cf961ab86519426db1fcfa4c82d82cfa61eb85913";
+const PRISMARINE_PROTOCOL_PATH: &str = "data/pc/26.1/protocol.json";
+const PRISMARINE_VERSION_INDEX_PATH: &str = "data/pc/common/protocolVersions.json";
+
+const V775_ALIASES: &[ProtoDefIdentityAlias] = &[
+    alias(
+        ProtocolState::Handshake,
+        PacketDirection::Serverbound,
+        "set_protocol",
+        "minecraft:intention",
+    ),
+    alias(
+        ProtocolState::Status,
+        PacketDirection::Serverbound,
+        "ping_start",
+        "minecraft:status_request",
+    ),
+    alias(
+        ProtocolState::Status,
+        PacketDirection::Serverbound,
+        "ping",
+        "minecraft:ping_request",
+    ),
+    alias(
+        ProtocolState::Status,
+        PacketDirection::Clientbound,
+        "server_info",
+        "minecraft:status_response",
+    ),
+    alias(
+        ProtocolState::Status,
+        PacketDirection::Clientbound,
+        "ping",
+        "minecraft:pong_response",
+    ),
+    alias(
+        ProtocolState::Login,
+        PacketDirection::Serverbound,
+        "login_start",
+        "minecraft:hello",
+    ),
+    alias(
+        ProtocolState::Login,
+        PacketDirection::Clientbound,
+        "encryption_begin",
+        "minecraft:hello",
+    ),
+    alias(
+        ProtocolState::Login,
+        PacketDirection::Clientbound,
+        "success",
+        "minecraft:login_finished",
+    ),
+    alias(
+        ProtocolState::Login,
+        PacketDirection::Clientbound,
+        "compress",
+        "minecraft:login_compression",
+    ),
+    alias(
+        ProtocolState::Configuration,
+        PacketDirection::Serverbound,
+        "settings",
+        "minecraft:client_information",
+    ),
+    alias(
+        ProtocolState::Play,
+        PacketDirection::Serverbound,
+        "teleport_confirm",
+        "minecraft:accept_teleportation",
+    ),
+    alias(
+        ProtocolState::Play,
+        PacketDirection::Serverbound,
+        "message_acknowledgement",
+        "minecraft:chat_ack",
+    ),
+    alias(
+        ProtocolState::Play,
+        PacketDirection::Serverbound,
+        "chat_message",
+        "minecraft:chat",
+    ),
+    alias(
+        ProtocolState::Play,
+        PacketDirection::Clientbound,
+        "profileless_chat",
+        "minecraft:disguised_chat",
+    ),
+    alias(
+        ProtocolState::Play,
+        PacketDirection::Clientbound,
+        "update_health",
+        "minecraft:set_health",
+    ),
+];
+
+const fn alias(
+    state: ProtocolState,
+    direction: PacketDirection,
+    source: &'static str,
+    official: &'static str,
+) -> ProtoDefIdentityAlias {
+    ProtoDefIdentityAlias {
+        state,
+        direction,
+        source,
+        official,
+    }
+}
 
 fn main() -> ExitCode {
     match run(std::env::args_os().skip(1)) {
@@ -41,7 +166,307 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<String, String> 
         Some("game-data") => run_game_data(arguments),
         Some("validate-game-data") => run_validate_game_data(arguments),
         Some("inspect-game-data") => run_inspect_game_data(arguments),
+        Some("packet-schema") => run_packet_schema(arguments),
+        Some("validate-packet-schema") => run_validate_packet_schema(arguments),
+        Some("inspect-packet-schema") => run_inspect_packet_schema(arguments),
         _ => Err(usage()),
+    }
+}
+
+fn run_packet_schema(mut arguments: impl Iterator<Item = OsString>) -> Result<String, String> {
+    let cache_root = required_path(&mut arguments)?;
+    let version = required_utf8(&mut arguments, "Minecraft version ID")?
+        .parse::<MinecraftVersionId>()
+        .map_err(|error| error.to_string())?;
+    let protocol = required_utf8(&mut arguments, "protocol version")?
+        .parse::<i32>()
+        .map_err(|error| format!("protocol version is invalid: {error}"))?;
+    let reports_root = required_path(&mut arguments)?;
+    let structural_root = required_path(&mut arguments)?;
+    let output_root = required_path(&mut arguments)?;
+    ensure_finished(arguments)?;
+
+    let version_cache = cache_root.join("versions").join(version.as_str());
+    reject_symlink(&version_cache)?;
+    let metadata_bytes = read_bounded(&version_cache.join("metadata.json"), MAX_METADATA_BYTES)?;
+    let metadata =
+        parse_selected_version_metadata(&metadata_bytes).map_err(|error| error.to_string())?;
+    if metadata.id != version {
+        return Err(format!(
+            "cached metadata declares version {}, expected {version}",
+            metadata.id
+        ));
+    }
+    verify_file(
+        &version_cache.join("client.jar"),
+        metadata.client.size,
+        metadata.client.sha1,
+    )?;
+
+    let report_path = reports_root.join(PACKETS_REPORT);
+    let report = read_bounded(&report_path, MAX_PACKET_SCHEMA_BYTES as u64)?;
+    let artifact = generate_packet_schema_from_report(
+        version.clone(),
+        cubic_version::ProtocolVersion::new(protocol),
+        hash_bytes(&report)?,
+        &report,
+    )
+    .map_err(|error| error.to_string())?;
+    let protocol_path = structural_root.join(PRISMARINE_PROTOCOL_PATH);
+    let version_index_path = structural_root.join(PRISMARINE_VERSION_INDEX_PATH);
+    reject_symlink(&structural_root)?;
+    reject_symlink(&protocol_path)?;
+    reject_symlink(&version_index_path)?;
+    let structural = read_bounded(&protocol_path, MAX_PACKET_SCHEMA_BYTES as u64)?;
+    let version_index = read_bounded(&version_index_path, MAX_PACKET_SCHEMA_BYTES as u64)?;
+    verify_sha256(
+        &structural,
+        PRISMARINE_PROTOCOL_SHA256,
+        "structural protocol source",
+    )?;
+    verify_sha256(
+        &version_index,
+        PRISMARINE_VERSION_INDEX_SHA256,
+        "protocol version index",
+    )?;
+    validate_prismarine_version_index(&version_index, &version, protocol)?;
+    let artifact = merge_protodef_layouts(
+        artifact,
+        ProtoDefSource {
+            bytes: &structural,
+            source: "PrismarineJS minecraft-data",
+            revision: PRISMARINE_REVISION,
+            source_schema: "ProtoDef protocol.json; major version 26.1",
+            content_sha256: PRISMARINE_PROTOCOL_SHA256,
+            license: "MIT",
+            aliases: V775_ALIASES,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let registry = PacketRegistry::new(artifact).map_err(|error| error.to_string())?;
+    let structural_cross_checks = if version.as_str() == v775::MINECRAFT_VERSION_ID
+        && protocol == v775::PROTOCOL_VERSION
+    {
+        registry
+            .cross_check(v775::packet_identity_cross_checks())
+            .map_err(|error| error.to_string())?;
+        Some(v775::cross_check_generated_layouts(&registry).map_err(|error| error.to_string())?)
+    } else {
+        None
+    };
+    let bytes = serialize_packet_schema(registry.artifact()).map_err(|error| error.to_string())?;
+    let output_directory = output_root.join(version.as_str());
+    fs::create_dir_all(&output_directory)
+        .map_err(|error| format!("failed to create {}: {error}", output_directory.display()))?;
+    reject_symlink(&output_directory)?;
+    let output = output_directory.join(PACKET_SCHEMA_FILE);
+    write_packet_schema_if_changed(&output, &bytes)?;
+    packet_schema_summary(&registry, &bytes, &output, structural_cross_checks)
+}
+
+fn run_validate_packet_schema(
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<String, String> {
+    let artifact = required_path(&mut arguments)?;
+    ensure_finished(arguments)?;
+    let bytes = read_bounded(&artifact, MAX_PACKET_SCHEMA_BYTES as u64)?;
+    let registry = parse_packet_schema(&bytes).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "validated packet schema for {}: {} packet definitions",
+        registry.artifact().minecraft_version,
+        registry.artifact().packets.len()
+    ))
+}
+
+fn run_inspect_packet_schema(
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<String, String> {
+    let artifact = required_path(&mut arguments)?;
+    let state = parse_cli_state(&required_utf8(&mut arguments, "protocol state")?)?;
+    let direction = parse_cli_direction(&required_utf8(&mut arguments, "packet direction")?)?;
+    let selector = required_utf8(&mut arguments, "packet identity or numeric ID")?;
+    ensure_finished(arguments)?;
+    let bytes = read_bounded(&artifact, MAX_PACKET_SCHEMA_BYTES as u64)?;
+    let registry = parse_packet_schema(&bytes).map_err(|error| error.to_string())?;
+    let definition = if let Ok(id) = selector.parse::<u32>() {
+        registry.by_id(state, direction, id)
+    } else {
+        let identity = MinecraftIdentifier::new(selector).map_err(|error| error.to_string())?;
+        registry.by_identity(state, direction, &identity)
+    }
+    .ok_or_else(|| "packet is not present in that state/direction".to_owned())?;
+    match &definition.layout {
+        PacketLayout::Unsupported { reason } => Ok(format!(
+            "Version: {}\nProtocol: {}\nState: {:?}\nDirection: {:?}\nPacket: {}\nID: {} (0x{:02x})\nLayout: identity-only\nUnsupported reason: {reason:?}",
+            registry.artifact().minecraft_version,
+            registry.artifact().protocol_version,
+            definition.state,
+            definition.direction,
+            definition.identity,
+            definition.id,
+            definition.id
+        )),
+        PacketLayout::Fields { fields } => Ok(format!(
+            "Version: {}\nProtocol: {}\nState: {:?}\nDirection: {:?}\nPacket: {}\nID: {} (0x{:02x})\nLayout: generated field codec\nFields: {fields:#?}",
+            registry.artifact().minecraft_version,
+            registry.artifact().protocol_version,
+            definition.state,
+            definition.direction,
+            definition.identity,
+            definition.id,
+            definition.id
+        )),
+    }
+}
+
+fn packet_schema_summary(
+    registry: &PacketRegistry,
+    bytes: &[u8],
+    output: &Path,
+    structural_cross_checks: Option<usize>,
+) -> Result<String, String> {
+    let mut lines = vec![
+        format!("Version: {}", registry.artifact().minecraft_version),
+        format!("Protocol: {}", registry.artifact().protocol_version),
+        format!("Schema: {}", registry.artifact().schema_version.value()),
+    ];
+    for state in [
+        ProtocolState::Handshake,
+        ProtocolState::Status,
+        ProtocolState::Login,
+        ProtocolState::Configuration,
+        ProtocolState::Play,
+    ] {
+        let serverbound = count_packets(registry, state, PacketDirection::Serverbound);
+        let clientbound = count_packets(registry, state, PacketDirection::Clientbound);
+        lines.push(format!(
+            "{state:?}: serverbound {serverbound}, clientbound {clientbound}"
+        ));
+    }
+    let supported = registry
+        .artifact()
+        .packets
+        .iter()
+        .filter(|packet| matches!(packet.layout, PacketLayout::Fields { .. }))
+        .count();
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+    for packet in &registry.artifact().packets {
+        if let PacketLayout::Unsupported { reason } = &packet.layout {
+            *reasons.entry(reason.category().to_owned()).or_default() += 1;
+        }
+    }
+    lines.extend([
+        format!("Total packets: {}", registry.artifact().packets.len()),
+        format!("Fully generated codec layouts: {supported}"),
+        format!(
+            "Identity-only/unsupported definitions: {}",
+            registry.artifact().packets.len() - supported
+        ),
+        format!("Artifact bytes: {}", bytes.len()),
+        format!(
+            "Official packets.json SHA-1: {}",
+            registry.artifact().provenance.official_report_sha1
+        ),
+        format!("Content SHA-1: {}", hash_bytes(bytes)?),
+        "Structural source: PrismarineJS minecraft-data".to_owned(),
+        format!("Structural source revision: {PRISMARINE_REVISION}"),
+        format!("Structural source SHA-256: {PRISMARINE_PROTOCOL_SHA256}"),
+        format!("Unsupported reasons: {reasons:?}"),
+        format!(
+            "Bootstrap v775 cross-check: {}",
+            if structural_cross_checks.is_some() {
+                "passed"
+            } else {
+                "not applicable"
+            }
+        ),
+        format!(
+            "Bootstrap v775 structural cross-check: {}",
+            structural_cross_checks
+                .map(|count| format!("passed ({count} layouts)"))
+                .unwrap_or_else(|| "not applicable".to_owned())
+        ),
+        format!("Output: {}", output.display()),
+        "Validation: passed".to_owned(),
+    ]);
+    Ok(lines.join("\n"))
+}
+
+fn count_packets(
+    registry: &PacketRegistry,
+    state: ProtocolState,
+    direction: PacketDirection,
+) -> usize {
+    registry
+        .artifact()
+        .packets
+        .iter()
+        .filter(|packet| packet.state == state && packet.direction == direction)
+        .count()
+}
+
+fn verify_sha256(bytes: &[u8], expected: &str, label: &str) -> Result<(), String> {
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} SHA-256 mismatch: expected {expected}, found {actual}"
+        ))
+    }
+}
+
+fn validate_prismarine_version_index(
+    bytes: &[u8],
+    version: &MinecraftVersionId,
+    protocol: i32,
+) -> Result<(), String> {
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(bytes)
+        .map_err(|error| format!("protocol version index is malformed: {error}"))?;
+    let matching: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("minecraftVersion")
+                .and_then(serde_json::Value::as_str)
+                == Some(version.as_str())
+        })
+        .collect();
+    if matching.len() != 1 {
+        return Err(format!(
+            "pinned protocol version index contains {} entries for exact version {version}",
+            matching.len()
+        ));
+    }
+    let entry = matching[0];
+    if entry.get("version").and_then(serde_json::Value::as_i64) != Some(i64::from(protocol))
+        || entry
+            .get("majorVersion")
+            .and_then(serde_json::Value::as_str)
+            != Some("26.1")
+    {
+        return Err(format!(
+            "pinned structural source does not map exact version {version} to protocol {protocol} and major schema 26.1"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_cli_state(value: &str) -> Result<ProtocolState, String> {
+    match value {
+        "handshake" => Ok(ProtocolState::Handshake),
+        "status" => Ok(ProtocolState::Status),
+        "login" => Ok(ProtocolState::Login),
+        "configuration" => Ok(ProtocolState::Configuration),
+        "play" => Ok(ProtocolState::Play),
+        _ => Err("state must be handshake, status, login, configuration, or play".to_owned()),
+    }
+}
+fn parse_cli_direction(value: &str) -> Result<PacketDirection, String> {
+    match value {
+        "serverbound" => Ok(PacketDirection::Serverbound),
+        "clientbound" => Ok(PacketDirection::Clientbound),
+        _ => Err("direction must be serverbound or clientbound".to_owned()),
     }
 }
 
@@ -368,6 +793,28 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("failed to promote {}: {error}", path.display()))
 }
 
+fn write_packet_schema_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if path.exists() {
+        reject_symlink(path)?;
+        if read_bounded(path, MAX_PACKET_SCHEMA_BYTES as u64)? == bytes {
+            return Ok(());
+        }
+    }
+    let temporary = path.with_extension("json.part");
+    if temporary.exists() {
+        fs::remove_file(&temporary)
+            .map_err(|error| format!("failed to remove stale {}: {error}", temporary.display()))?;
+    }
+    fs::write(&temporary, bytes)
+        .map_err(|error| format!("failed to write {}: {error}", temporary.display()))?;
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
+    }
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("failed to promote {}: {error}", path.display()))
+}
+
 fn reject_symlink(path: &Path) -> Result<(), String> {
     if path
         .symlink_metadata()
@@ -421,5 +868,110 @@ fn ensure_finished(mut arguments: impl Iterator<Item = OsString>) -> Result<(), 
 }
 
 fn usage() -> String {
-    "Usage:\n  version-generator validate <version-data-root>\n  version-generator build-catalog <version-data-root>\n  version-generator game-data <minecraft-cache-root> <version-id> <reports-root> <output-root>\n  version-generator validate-game-data <game-data.json>\n  version-generator inspect-game-data <game-data.json> <identifier>".to_owned()
+    "Usage:\n  version-generator validate <version-data-root>\n  version-generator build-catalog <version-data-root>\n  version-generator game-data <minecraft-cache-root> <version-id> <reports-root> <output-root>\n  version-generator validate-game-data <game-data.json>\n  version-generator inspect-game-data <game-data.json> <identifier>\n  version-generator packet-schema <minecraft-cache-root> <version-id> <protocol> <reports-root> <pinned-minecraft-data-checkout> <output-root>\n  version-generator validate-packet-schema <packet-schema.json>\n  version-generator inspect-packet-schema <packet-schema.json> <state> <direction> <identity-or-id>".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cubic_protocol::packet_schema::{
+        PacketDefinition, PacketLayout, PacketSchemaArtifact, PacketSchemaFormatVersion,
+        PacketSchemaProvenance,
+    };
+
+    fn artifact_bytes() -> Vec<u8> {
+        serialize_packet_schema(&PacketSchemaArtifact {
+            schema_version: PacketSchemaFormatVersion::CURRENT,
+            minecraft_version: MinecraftVersionId::new("synthetic").unwrap(),
+            protocol_version: cubic_version::ProtocolVersion::new(99),
+            provenance: PacketSchemaProvenance {
+                official_report_sha1: "0123456789abcdef0123456789abcdef01234567".parse().unwrap(),
+                supplemental: None,
+            },
+            packets: vec![PacketDefinition {
+                state: ProtocolState::Status,
+                direction: PacketDirection::Serverbound,
+                identity: MinecraftIdentifier::new("minecraft:status_request").unwrap(),
+                id: 0,
+                layout: PacketLayout::Unsupported {
+                    reason: cubic_protocol::packet_schema::UnsupportedLayoutReason::NoStructuralSourceEntry,
+                },
+            }],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn packet_schema_validate_and_inspect_commands_are_offline_and_deterministic() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("packet-schema.json");
+        let bytes = artifact_bytes();
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let validated = run([
+            OsString::from("validate-packet-schema"),
+            path.clone().into_os_string(),
+        ])
+        .unwrap();
+        assert!(validated.contains("1 packet definitions"));
+        let inspected = run([
+            OsString::from("inspect-packet-schema"),
+            path.into_os_string(),
+            OsString::from("status"),
+            OsString::from("serverbound"),
+            OsString::from("minecraft:status_request"),
+        ])
+        .unwrap();
+        assert!(inspected.contains("ID: 0 (0x00)"));
+        assert!(inspected.contains("identity-only"));
+    }
+
+    #[test]
+    fn packet_schema_cli_rejects_bad_state_direction_and_extra_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("packet-schema.json");
+        fs::write(&path, artifact_bytes()).unwrap();
+        assert!(
+            run([
+                OsString::from("inspect-packet-schema"),
+                path.clone().into_os_string(),
+                OsString::from("future"),
+                OsString::from("serverbound"),
+                OsString::from("0"),
+            ])
+            .is_err()
+        );
+        assert!(
+            run([
+                OsString::from("validate-packet-schema"),
+                path.into_os_string(),
+                OsString::from("extra"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pinned_structural_version_index_requires_exact_version_protocol_and_family() {
+        let version = MinecraftVersionId::new("26.1.2").unwrap();
+        let valid = br#"[{"minecraftVersion":"26.1.2","version":775,"majorVersion":"26.1"}]"#;
+        validate_prismarine_version_index(valid, &version, 775).unwrap();
+        assert!(validate_prismarine_version_index(valid, &version, 774).is_err());
+        assert!(
+            validate_prismarine_version_index(
+                br#"[{"minecraftVersion":"26.1.2","version":775,"majorVersion":"future"}]"#,
+                &version,
+                775,
+            )
+            .is_err()
+        );
+        assert!(validate_prismarine_version_index(b"[]", &version, 775).is_err());
+    }
+
+    #[test]
+    fn pinned_structural_hash_check_fails_closed() {
+        let expected = format!("{:x}", Sha256::digest(b"schema"));
+        verify_sha256(b"schema", &expected, "test source").unwrap();
+        assert!(verify_sha256(b"changed", &expected, "test source").is_err());
+    }
 }

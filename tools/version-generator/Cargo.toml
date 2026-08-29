@@ -7,8 +7,14 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cubic-protocol = { path = "../../crates/cubic-protocol" }
 cubic-version = { path = "../../crates/cubic-version" }
+serde_json.workspace = true
 sha1.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -7,6 +7,7 @@
 pub mod bootstrap;
 pub mod handshake;
 pub mod nbt;
+pub mod packet_schema;
 pub mod status;
 
 mod bitset;

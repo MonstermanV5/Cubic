@@ -647,6 +647,7 @@ dependencies = [
 name = "cubic-protocol"
 version = "0.1.0"
 dependencies = [
+ "cubic-version",
  "proptest",
  "serde",
  "serde_json",
@@ -3982,8 +3983,12 @@ dependencies = [
 name = "version-generator"
 version = "0.1.0"
 dependencies = [
+ "cubic-protocol",
  "cubic-version",
+ "serde_json",
  "sha1",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

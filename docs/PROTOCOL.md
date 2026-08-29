@@ -1,6 +1,6 @@
 # Protocol Primitive Foundation
 
-Phase 8 extends the one isolated temporary Java 26.1.2 / protocol 775 bootstrap profile with the minimum bounded Play control/chat subset. TCP and session policy remain in `cubic-network`; general generated Play schemas remain deferred to Phase 12.
+Phase 12 adds the exact-version generated packet-registry boundary while retaining the isolated Java 26.1.2 / protocol 775 bootstrap profile for verified live codecs. TCP and session policy remain in `cubic-network`; packet schema details remain in `cubic-protocol`.
 
 ## Layer boundary
 
@@ -11,7 +11,7 @@ future TCP transport -> uncompressed frame decoder -> completed frame body
                      -> raw packet ID/payload split -> future packet schema codec
 ```
 
-The framing, primitive-codec, raw NBT, Status, and temporary protocol-775 bootstrap codecs exist. The raw packet helper otherwise separates a VarInt ID from uninterpreted payload bytes without assigning meaning to it. NBT can decode directly from a `CodecReader`, leaving subsequent packet fields unread. General generated packet schemas, compression, encryption, authentication, and Play semantics are not implemented.
+The framing, primitive-codec, raw NBT, Status, temporary protocol-775 bootstrap, and generated packet registry exist. The raw packet helper separates a VarInt ID from payload bytes. `PacketRegistry` resolves exact-version state/direction identities and interprets validated bounded layouts merged from the official registry and pinned structural data. Unsupported layouts retain a categorized reason. Compression, encryption, authentication, and Play semantics remain outside the registry.
 
 ## Phase 7 protocol-775 bootstrap profile
 
@@ -62,6 +62,7 @@ The decoder does not provide transport backpressure or connection recovery polic
 - `FrameDecoder` and `encode_frame`: incremental uncompressed framing.
 - `RawPacket` and `split_raw_packet`: schema-neutral packet ID/payload separation.
 - `nbt`: raw Java Edition NBT values, Modified UTF-8, explicit named/unnamed compound roots, and bounded encoding/decoding. See `NBT.md`.
+- `packet_schema`: schema-versioned exact-version artifacts, immutable state/direction indexes, explicit unknown-versus-unsupported results, and bounded compositional packet encoding/decoding. See `PACKETS.md`.
 
 Minecraft-version-specific packet IDs and behavior must not be scattered through this layer. The single `bootstrap::v775` exception is intentionally isolated and temporary. Phase 8 adds clientbound Login, Keep Alive, Ping, Player Position, Chunk Batch Finished, Cookie Request, Player/Disguised/System Chat, Disconnect, Set Health, Start Configuration, Resource Pack Push, and Transfer classifications, plus required responses and unsigned Chat Message encoding. Unknown complete Play frames remain bounded and are identified for immediate discard. Official 26.1.2 registration and the independent current packet table identify clientbound Play `0x18` as Custom Payload; it is ordinary bounded Play traffic, not the initial Login packet.
 
@@ -75,4 +76,4 @@ The 26.1.2 signing input was verified against the installed deobfuscated client 
 
 The last-seen tracker is bounded to 20 entries for this profile. It advances only for a new signed Player Chat, encodes the fixed 20 bits in three little-endian Java-BitSet bytes, computes the trailing Java-compatible checksum over displayed signatures, and emits a standalone acknowledgement after more than 64 pending signed messages. Unsigned/System/Disguised messages do not advance this signed window. Global Player Chat indices are strict and reset with a new/reconfigured session. These values live in the versioned bootstrap/profile boundary; they are not asserted as rules for other Minecraft versions.
 
-The network transport—not packet codecs—owns AES-128/CFB8 and compressed framing. Compression uses a VarInt Data Length, zlib rather than gzip, zero for an uncompressed body, and strict compressed/decompressed bounds. General generated packet schemas remain Phase 12 work.
+The network transport—not packet codecs—owns AES-128/CFB8 and compressed framing. Compression uses a VarInt Data Length, zlib rather than gzip, zero for an uncompressed body, and strict compressed/decompressed bounds. Phase 12 does not migrate live traffic: the proven bootstrap remains the live reference while generated layouts are adopted deliberately after semantic and bounds review.

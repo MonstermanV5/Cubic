@@ -31,6 +31,19 @@ pub fn encode_unnamed_network_root(
     Ok(writer.into_inner())
 }
 
+/// Encodes the unnamed network form of any non-End NBT tag.
+///
+/// Modern text components use this generic root form. The root type byte is
+/// included and the same cumulative resource limits apply as for compounds.
+pub fn encode_unnamed_network_tag(tag: &NbtTag, limits: NbtLimits) -> Result<Vec<u8>, NbtError> {
+    let mut context = EncodeContext::new(limits);
+    context.validate_tag(tag, 0)?;
+    let mut writer = CodecWriter::new();
+    writer.write_u8(tag.tag_type().id());
+    encode_payload(tag, &mut writer, limits)?;
+    Ok(writer.into_inner())
+}
+
 struct EncodeContext {
     limits: NbtLimits,
     total_tags: usize,

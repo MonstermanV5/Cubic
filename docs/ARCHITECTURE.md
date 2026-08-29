@@ -7,7 +7,7 @@ This document describes current and intended boundaries. Phases 1-7 provide the 
 - `cubic-auth`: UI-independent Microsoft/Xbox/Minecraft authentication with explicit `CubicEntra` and experimental `XalInterop` providers, token lifecycle, typed account identity, bounded HTTPS services, session-server join, proof-of-possession signing, short-lived player-certificate acquisition/signing, and secure credential-store abstraction. It has no renderer or Minecraft packet codecs.
 - `cubic-app`: composition root. It parses graphical, Status, one-shot development-login, and Chat Mode commands; Chat Mode starts the network runtime on a dedicated thread and passes only a bounded session port to the platform/UI side.
 - `cubic-core`: platform-independent shared concepts, including protocol-independent rich text, chat events, session commands, and connection presentation state.
-- `cubic-protocol`: owns synchronous codecs and the isolated temporary protocol-775 bootstrap profile, now including only the small Phase 8 Play control/chat subset. It contains no sockets, async runtime, compression, authentication, or general Play schema.
+- `cubic-protocol`: owns synchronous codecs, the isolated temporary protocol-775 bootstrap profile, and Phase 12's exact-version packet registry/bounded layout interpreter. It contains no sockets, async runtime, compression, authentication, or game semantics.
 - `cubic-network`: owns TCP, framing, deadlines, Status, Login/Configuration, and the persistent Chat Mode Play task. It converts bootstrap packets into stable `cubic-core` events and never touches UI/GPU state.
 - `cubic-version`: Minecraft version metadata, typed version/protocol/schema identifiers, release and snapshot kinds, compatibility profile identifiers, bounded filesystem-backed version-data store, plus the transport-independent official manifest/selected-version descriptor model.
 - `cubic-resources`: Phase 10 official HTTPS acquisition, hash/size verification, immutable cache ownership, asset-index lookup, content-addressed asset objects, and explicit client-JAR acquisition. It does not interpret registries, models, or Mojang code.
@@ -16,7 +16,7 @@ This document describes current and intended boundaries. Phases 1-7 provide the 
 - `cubic-render`: owns wgpu surface/device submission and the direct `egui-wgpu` paint integration used by Chat Mode. It still contains no world renderer.
 - `cubic-ui`: owns the protocol-independent Chat Mode model and egui presentation: bounded history, text input, send action, scrolling, and connection/error state.
 - `cubic-platform`: owns the winit event loop, native window lifecycle, redraw scheduling, suspension, the Windows-only private WebView2 navigation host for experimental XAL authorization capture, and the isolated future iOS host handoff.
-- `version-generator`: offline development/build utility that validates installed version datasets and builds a deterministic catalog from on-disk version data. Depends only on `cubic-version`; performs no network access.
+- `version-generator`: offline development/build utility for version catalogs, generated game data, and exact-version packet-schema artifacts. It reuses `cubic-version` identities and `cubic-protocol` schema validation and performs no network access.
 
 ## Dependency direction
 
@@ -32,7 +32,9 @@ Phase 11 extends `version-generator` rather than adding another tool. The offlin
 
 Generated data is explicitly a vanilla baseline. A future server-authoritative registry layer may overlay or replace relevant mappings during Configuration without mutating the baseline. Phase 11 does not implement that runtime overlay, packet codecs, world state, or resource interpretation. See `GAME_DATA.md`.
 
-`cubic-protocol` remains independent of the application, platform, renderer, async runtime, and network transport. `cubic-network` feeds arbitrary TCP fragments into its synchronous frame decoder and gives completed frame bodies to state-specific codecs. A future generated packet-schema layer may consume completed frame bodies and decode NBT directly from the same primitive reader without copying the remainder of a packet. Root-format selection is an explicit call-site choice, not a Minecraft-version check inside NBT.
+Phase 12 uses a hybrid packet boundary. Mojang's `packets.json` supplies authoritative exact-version state/direction/identity/ID facts; pinned PrismarineJS ProtoDef data supplies only supplemental ordered wire structure. Generation fails on an ID disagreement and uses exact names or a small reviewed 26.1.2 alias table—never fuzzy matching. Unsupported source constructs and ambiguous names remain explicit identity-only definitions. A schema-versioned artifact and immutable runtime indexes expose the merged result without filesystem knowledge in networking. Stable semantic events remain outside the dynamic wire representation. The working `bootstrap::v775` path remains active; 34 IDs and 14 representative layouts are cross-checked against it. See `PACKETS.md`.
+
+`cubic-protocol` remains independent of the application, platform, renderer, async runtime, and network transport. It now depends narrowly on `cubic-version` for validated exact-version/protocol/identifier types. `cubic-network` feeds arbitrary TCP fragments into its synchronous frame decoder and gives completed frame bodies to state-specific codecs. The packet-schema layer consumes completed payloads and decodes NBT directly from the same primitive reader. Root-format selection is an explicit schema choice, not a Minecraft-version check inside NBT.
 
 The current Status path is deliberately separate from the graphical lifecycle:
 
@@ -51,7 +53,7 @@ cubic-app dev-login -> cubic-network state machine and framed TCP transport
                     -> cubic-protocol protocol-775 bootstrap packet profile
 ```
 
-All manually authored 26.1.2 packet IDs and layouts live in the single `cubic_protocol::bootstrap::v775` module. Phase 12 will replace or absorb that temporary profile with generated packet data. Network and engine code must not grow scattered version strings, numeric protocol checks, or giant version match statements.
+All manually authored 26.1.2 packet IDs and layouts live in the single `cubic_protocol::bootstrap::v775` module. Phase 12 cross-checks its packet identities/IDs and provides the generated-registry replacement boundary, but does not replace verified codecs with missing official layouts. Network and engine code must not grow scattered version strings, numeric protocol checks, or giant version match statements.
 
 ## Phase 8 Chat Mode lifecycle
 

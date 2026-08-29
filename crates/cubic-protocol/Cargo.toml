@@ -7,6 +7,7 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cubic-version = { path = "../cubic-version" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

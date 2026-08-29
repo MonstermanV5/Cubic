@@ -10,7 +10,7 @@ pub use decode::{
     decode_unnamed_network_root_complete, decode_unnamed_network_tag,
     decode_unnamed_network_tag_complete,
 };
-pub use encode::{encode_named_root, encode_unnamed_network_root};
+pub use encode::{encode_named_root, encode_unnamed_network_root, encode_unnamed_network_tag};
 pub use error::{NbtCollectionKind, NbtError};
 pub use limits::NbtLimits;
 pub use string::NbtString;

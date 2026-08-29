@@ -12,6 +12,10 @@ use crate::{
         NbtCompound, NbtError, NbtLimits, NbtTag, decode_unnamed_network_root_complete,
         decode_unnamed_network_tag,
     },
+    packet_schema::{
+        FieldCodec, PacketDirection, PacketIdentityCheck, PacketLayout, PacketRegistry,
+        PacketSchemaError, ProtocolState,
+    },
     split_raw_packet,
 };
 
@@ -112,6 +116,383 @@ const KNOWN_PACK_NAMESPACE_LIMITS: StringLimits = StringLimits::new(64, 192);
 const KNOWN_PACK_ID_LIMITS: StringLimits = StringLimits::new(256, 768);
 const KNOWN_PACK_VERSION_LIMITS: StringLimits = StringLimits::new(128, 384);
 const CHAT_LIMITS: StringLimits = StringLimits::new(MAX_CHAT_UTF16_UNITS, 768);
+
+/// Packet identities/IDs already proven by Cubic's protocol-775 bootstrap.
+///
+/// Phase 12 compares these facts with the official Data Generator report. The
+/// list is not a replacement schema: field layouts remain in this temporary
+/// bootstrap module until a lawful structural source is available.
+#[must_use]
+pub const fn packet_identity_cross_checks() -> &'static [PacketIdentityCheck] {
+    use PacketDirection::{Clientbound as C, Serverbound as S};
+    use ProtocolState::{Configuration as Config, Handshake, Login, Play, Status};
+    &[
+        PacketIdentityCheck {
+            state: Handshake,
+            direction: S,
+            identity: "minecraft:intention",
+            id: 0,
+        },
+        PacketIdentityCheck {
+            state: Status,
+            direction: S,
+            identity: "minecraft:status_request",
+            id: 0,
+        },
+        PacketIdentityCheck {
+            state: Status,
+            direction: C,
+            identity: "minecraft:status_response",
+            id: 0,
+        },
+        PacketIdentityCheck {
+            state: Status,
+            direction: S,
+            identity: "minecraft:ping_request",
+            id: 1,
+        },
+        PacketIdentityCheck {
+            state: Status,
+            direction: C,
+            identity: "minecraft:pong_response",
+            id: 1,
+        },
+        PacketIdentityCheck {
+            state: Login,
+            direction: S,
+            identity: "minecraft:hello",
+            id: LOGIN_START_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Login,
+            direction: C,
+            identity: "minecraft:hello",
+            id: LOGIN_ENCRYPTION_REQUEST_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Login,
+            direction: C,
+            identity: "minecraft:login_finished",
+            id: LOGIN_SUCCESS_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Login,
+            direction: C,
+            identity: "minecraft:login_compression",
+            id: LOGIN_SET_COMPRESSION_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Login,
+            direction: S,
+            identity: "minecraft:login_acknowledged",
+            id: LOGIN_ACKNOWLEDGED_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Config,
+            direction: S,
+            identity: "minecraft:client_information",
+            id: CONFIG_CLIENT_INFORMATION_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Config,
+            direction: C,
+            identity: "minecraft:custom_payload",
+            id: CONFIG_CUSTOM_PAYLOAD_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Config,
+            direction: C,
+            identity: "minecraft:disconnect",
+            id: CONFIG_DISCONNECT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Config,
+            direction: C,
+            identity: "minecraft:finish_configuration",
+            id: CONFIG_FINISH_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Config,
+            direction: S,
+            identity: "minecraft:finish_configuration",
+            id: CONFIG_FINISH_ACK_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Config,
+            direction: C,
+            identity: "minecraft:keep_alive",
+            id: CONFIG_KEEP_ALIVE_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Config,
+            direction: C,
+            identity: "minecraft:ping",
+            id: CONFIG_PING_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Config,
+            direction: C,
+            identity: "minecraft:select_known_packs",
+            id: CONFIG_KNOWN_PACKS_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:accept_teleportation",
+            id: PLAY_CONFIRM_TELEPORT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:chat_ack",
+            id: PLAY_CHAT_ACKNOWLEDGEMENT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:chat",
+            id: PLAY_CHAT_MESSAGE_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:chat_session_update",
+            id: PLAY_CHAT_SESSION_UPDATE_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:chunk_batch_received",
+            id: PLAY_CHUNK_BATCH_RECEIVED_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:configuration_acknowledged",
+            id: PLAY_ACKNOWLEDGE_CONFIGURATION_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:custom_payload",
+            id: PLAY_CUSTOM_PAYLOAD_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:disconnect",
+            id: PLAY_DISCONNECT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:disguised_chat",
+            id: PLAY_DISGUISED_CHAT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:keep_alive",
+            id: PLAY_KEEP_ALIVE_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:login",
+            id: INITIAL_PLAY_LOGIN_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:ping",
+            id: PLAY_PING_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:player_chat",
+            id: PLAY_PLAYER_CHAT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:set_health",
+            id: PLAY_SET_HEALTH_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:start_configuration",
+            id: PLAY_START_CONFIGURATION_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:system_chat",
+            id: PLAY_SYSTEM_CHAT_ID as u32,
+        },
+    ]
+}
+
+/// Cross-checks representative generated layouts against codecs that have
+/// already passed real protocol-775 interoperability tests.
+pub fn cross_check_generated_layouts(
+    registry: &PacketRegistry,
+) -> Result<usize, PacketSchemaError> {
+    use PacketDirection::{Clientbound as C, Serverbound as S};
+    use ProtocolState::{Configuration as Config, Handshake, Login, Play, Status};
+
+    type FieldCheck = (&'static str, fn(&FieldCodec) -> bool);
+    type LayoutCheck = (
+        ProtocolState,
+        PacketDirection,
+        &'static str,
+        &'static [FieldCheck],
+    );
+    let checks: &[LayoutCheck] = &[
+        (
+            Handshake,
+            S,
+            "minecraft:intention",
+            &[
+                ("protocol_version", is_varint),
+                ("server_host", is_string),
+                ("server_port", is_u16),
+                ("next_state", is_varint),
+            ],
+        ),
+        (Status, S, "minecraft:status_request", &[]),
+        (
+            Status,
+            C,
+            "minecraft:status_response",
+            &[("response", is_string)],
+        ),
+        (Status, S, "minecraft:ping_request", &[("time", is_i64)]),
+        (Status, C, "minecraft:pong_response", &[("time", is_i64)]),
+        (
+            Login,
+            C,
+            "minecraft:login_compression",
+            &[("threshold", is_varint)],
+        ),
+        (Config, C, "minecraft:finish_configuration", &[]),
+        (Config, S, "minecraft:finish_configuration", &[]),
+        (
+            Config,
+            C,
+            "minecraft:keep_alive",
+            &[("keep_alive_id", is_i64)],
+        ),
+        (
+            Play,
+            C,
+            "minecraft:keep_alive",
+            &[("keep_alive_id", is_i64)],
+        ),
+        (
+            Play,
+            S,
+            "minecraft:chat",
+            &[
+                ("message", is_string),
+                ("timestamp", is_i64),
+                ("salt", is_i64),
+                ("signature", is_optional_signature),
+                ("offset", is_varint),
+                ("acknowledged", is_acknowledged),
+                ("checksum", is_u8),
+            ],
+        ),
+        (
+            Play,
+            S,
+            "minecraft:chat_session_update",
+            &[
+                ("session_uuid", is_uuid),
+                ("expire_time", is_i64),
+                ("public_key", is_byte_array),
+                ("signature", is_byte_array),
+            ],
+        ),
+        (
+            Play,
+            C,
+            "minecraft:system_chat",
+            &[("content", is_nbt_tag), ("is_action_bar", is_bool)],
+        ),
+        (
+            Play,
+            C,
+            "minecraft:custom_payload",
+            &[("channel", is_string), ("data", is_remaining_bytes)],
+        ),
+    ];
+    for (state, direction, identity, expected) in checks {
+        let identity_value = cubic_version::MinecraftIdentifier::new(*identity)
+            .map_err(|error| PacketSchemaError::InvalidSchema(error.to_string()))?;
+        let packet = registry
+            .by_identity(*state, *direction, &identity_value)
+            .ok_or_else(|| {
+                PacketSchemaError::InvalidSchema(format!(
+                    "generated schema is missing structural cross-check packet {identity}"
+                ))
+            })?;
+        let PacketLayout::Fields { fields } = &packet.layout else {
+            return Err(PacketSchemaError::InvalidSchema(format!(
+                "generated schema has no layout for structural cross-check packet {identity}"
+            )));
+        };
+        if fields.len() != expected.len()
+            || fields
+                .iter()
+                .zip(*expected)
+                .any(|(field, (name, predicate))| field.name != *name || !predicate(&field.codec))
+        {
+            return Err(PacketSchemaError::InvalidSchema(format!(
+                "generated layout disagrees with proven bootstrap codec for {identity}"
+            )));
+        }
+    }
+    Ok(checks.len())
+}
+
+fn is_bool(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::Bool)
+}
+fn is_u8(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::U8)
+}
+fn is_u16(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::U16)
+}
+fn is_i64(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::I64)
+}
+fn is_varint(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::VarInt)
+}
+fn is_string(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::String { .. })
+}
+fn is_uuid(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::Uuid)
+}
+fn is_byte_array(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::ByteArray { .. })
+}
+fn is_nbt_tag(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::NbtTag)
+}
+fn is_remaining_bytes(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::RemainingBytes { .. })
+}
+fn is_optional_signature(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::Optional { value } if matches!(value.as_ref(), FieldCodec::FixedBytes { length: 256 }))
+}
+fn is_acknowledged(codec: &FieldCodec) -> bool {
+    matches!(codec, FieldCodec::FixedBytes { length: 3 })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoginSuccess<'a> {
