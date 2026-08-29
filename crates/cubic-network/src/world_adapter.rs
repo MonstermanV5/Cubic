@@ -6,9 +6,11 @@ use cubic_protocol::bootstrap::v775::{
 };
 use cubic_version::MinecraftIdentifier;
 use cubic_world::{
-    AuthoritativeRotation, BlockCoordinates, ClockState, Difficulty, DimensionTypeReference,
-    EnterWorld, GameMode, LastDeathLocation, PlayerPositionUpdate, RelativeTransformFlags, Respawn,
-    RespawnRotation, SpawnContext, SpawnPoint, WorldBorder, WorldEvent, WorldTime,
+    AuthoritativeRotation, BlockCoordinates, BlockEntitySummary, Chunk, ChunkCoordinate,
+    ChunkLightSummary, ChunkSection, ClockState, Difficulty, DimensionTypeReference, EnterWorld,
+    GameMode, HeightmapData, LastDeathLocation, PalettedContainer, PlayerPositionUpdate,
+    RelativeTransformFlags, Respawn, RespawnRotation, RuntimeBiomeId, RuntimeBlockStateId,
+    SpawnContext, SpawnPoint, WorldBorder, WorldEvent, WorldTime,
 };
 use thiserror::Error;
 
@@ -27,6 +29,32 @@ pub(crate) enum WorldAdapterError {
     InvalidDifficulty(i32),
     #[error("protocol-775 {field} value must be finite")]
     NonFiniteFloat { field: &'static str },
+}
+
+pub(crate) enum ChunkAdaptation {
+    Load(Chunk),
+    Unload(ChunkCoordinate),
+    Light {
+        coordinate: ChunkCoordinate,
+        light: ChunkLightSummary,
+    },
+    Other(v775::PlayClientbound),
+}
+
+pub(crate) fn adapt_chunk_packet(packet: v775::PlayClientbound) -> ChunkAdaptation {
+    match packet {
+        v775::PlayClientbound::LevelChunkWithLight(chunk) => {
+            ChunkAdaptation::Load(semantic_chunk(chunk))
+        }
+        v775::PlayClientbound::ForgetLevelChunk { x, z } => {
+            ChunkAdaptation::Unload(ChunkCoordinate::new(x, z))
+        }
+        v775::PlayClientbound::LightUpdate(update) => ChunkAdaptation::Light {
+            coordinate: ChunkCoordinate::new(update.x, update.z),
+            light: semantic_light(update.light),
+        },
+        other => ChunkAdaptation::Other(other),
+    }
 }
 
 pub(crate) fn initial_world_event(
@@ -79,6 +107,72 @@ pub(crate) fn play_world_event(
         _ => None,
     };
     Ok(event)
+}
+
+fn semantic_chunk(chunk: v775::LevelChunkWithLight) -> Chunk {
+    Chunk {
+        coordinate: ChunkCoordinate::new(chunk.x, chunk.z),
+        sections: chunk.sections.into_iter().map(semantic_section).collect(),
+        heightmaps: chunk
+            .heightmaps
+            .into_iter()
+            .map(|heightmap| HeightmapData {
+                kind_raw_id: heightmap.kind_raw_id,
+                data: heightmap.data,
+            })
+            .collect(),
+        block_entities: chunk
+            .block_entities
+            .into_iter()
+            .map(|entity| BlockEntitySummary {
+                local_x: entity.local_x,
+                y: entity.y,
+                local_z: entity.local_z,
+                type_raw_id: entity.type_raw_id,
+                has_data: entity.has_data,
+            })
+            .collect(),
+        light: semantic_light(chunk.light),
+    }
+}
+
+fn semantic_section(section: v775::WireChunkSection) -> ChunkSection {
+    ChunkSection {
+        non_empty_block_count: section.non_empty_block_count,
+        fluid_count: section.fluid_count,
+        blocks: map_palette(section.blocks, RuntimeBlockStateId),
+        biomes: map_palette(section.biomes, RuntimeBiomeId),
+    }
+}
+
+fn map_palette<T, F>(palette: v775::WirePalettedContainer, map: F) -> PalettedContainer<T>
+where
+    F: Fn(u32) -> T + Copy,
+{
+    match palette {
+        v775::WirePalettedContainer::Single { value, entries } => PalettedContainer::Single {
+            value: map(value),
+            entries,
+        },
+        v775::WirePalettedContainer::Indirect { palette, indices } => PalettedContainer::Indirect {
+            palette: palette.into_iter().map(map).collect(),
+            indices,
+        },
+        v775::WirePalettedContainer::Direct { values } => PalettedContainer::Direct {
+            values: values.into_iter().map(map).collect(),
+        },
+    }
+}
+
+fn semantic_light(light: v775::WireLightData) -> ChunkLightSummary {
+    ChunkLightSummary {
+        sky_mask: light.sky_mask,
+        block_mask: light.block_mask,
+        empty_sky_mask: light.empty_sky_mask,
+        empty_block_mask: light.empty_block_mask,
+        sky_layer_count: light.sky_layer_count,
+        block_layer_count: light.block_layer_count,
+    }
 }
 
 fn spawn_context(spawn: SpawnInfo) -> Result<SpawnContext, WorldAdapterError> {
@@ -324,6 +418,38 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn chunk_wire_data_becomes_typed_semantic_state_without_packet_ids() {
+        let packet = v775::PlayClientbound::LevelChunkWithLight(v775::LevelChunkWithLight {
+            x: -8,
+            z: 3,
+            sections: vec![v775::WireChunkSection {
+                non_empty_block_count: 1,
+                fluid_count: 0,
+                blocks: v775::WirePalettedContainer::Single {
+                    value: 17,
+                    entries: 4_096,
+                },
+                biomes: v775::WirePalettedContainer::Single {
+                    value: 4,
+                    entries: 64,
+                },
+            }],
+            heightmaps: Vec::new(),
+            block_entities: Vec::new(),
+            light: v775::WireLightData::default(),
+        });
+        let ChunkAdaptation::Load(chunk) = adapt_chunk_packet(packet) else {
+            panic!("expected semantic chunk")
+        };
+        assert_eq!(chunk.coordinate, ChunkCoordinate::new(-8, 3));
+        assert_eq!(
+            chunk.sections[0].block(0, 0, 0),
+            Some(RuntimeBlockStateId(17))
+        );
+        assert_eq!(chunk.sections[0].biome(0, 0, 0), Some(RuntimeBiomeId(4)));
     }
 
     #[test]

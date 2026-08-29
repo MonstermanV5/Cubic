@@ -5,6 +5,12 @@
 
 use thiserror::Error;
 
+mod chunk;
+pub use chunk::{
+    ChunkDecodeError, LevelChunkWithLight, LightUpdate, WireBlockEntity, WireChunkSection,
+    WireHeightmap, WireLightData, WirePalettedContainer,
+};
+
 use crate::{
     BitSetLimits, CodecError, CodecReader, CodecWriter, MINECRAFT_MAX_FRAME_SIZE, ProtocolUuid,
     StringLimits, encode_frame,
@@ -95,10 +101,14 @@ const PLAY_PONG_ID: i32 = 0x2d;
 
 const PLAY_CHANGE_DIFFICULTY_ID: i32 = 0x0a;
 const PLAY_CHUNK_BATCH_FINISHED_ID: i32 = 0x0b;
+const PLAY_CHUNK_BATCH_START_ID: i32 = 0x0c;
 const PLAY_COOKIE_REQUEST_ID: i32 = 0x15;
 const PLAY_CUSTOM_PAYLOAD_ID: i32 = 0x18;
 const PLAY_GAME_EVENT_ID: i32 = 0x26;
+const PLAY_FORGET_LEVEL_CHUNK_ID: i32 = 0x25;
 const PLAY_INITIALIZE_BORDER_ID: i32 = 0x2b;
+const PLAY_LEVEL_CHUNK_WITH_LIGHT_ID: i32 = 0x2d;
+const PLAY_LIGHT_UPDATE_ID: i32 = 0x30;
 const PLAY_RESOURCE_PACK_PUSH_ID: i32 = 0x51;
 const PLAY_TRANSFER_ID: i32 = 0x81;
 const PLAY_DISCONNECT_ID: i32 = 0x20;
@@ -285,6 +295,24 @@ pub const fn packet_identity_cross_checks() -> &'static [PacketIdentityCheck] {
             direction: C,
             identity: "minecraft:custom_payload",
             id: PLAY_CUSTOM_PAYLOAD_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:forget_level_chunk",
+            id: PLAY_FORGET_LEVEL_CHUNK_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:level_chunk_with_light",
+            id: PLAY_LEVEL_CHUNK_WITH_LIGHT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:light_update",
+            id: PLAY_LIGHT_UPDATE_ID as u32,
         },
         PacketIdentityCheck {
             state: Play,
@@ -712,6 +740,13 @@ pub enum PlayClientbound {
     ChunkBatchFinished {
         chunks: i32,
     },
+    ChunkBatchStart,
+    LevelChunkWithLight(LevelChunkWithLight),
+    ForgetLevelChunk {
+        x: i32,
+        z: i32,
+    },
+    LightUpdate(LightUpdate),
     CookieRequest {
         key: String,
     },
@@ -876,6 +911,8 @@ pub enum BootstrapProtocolError {
     Codec(#[from] CodecError),
     #[error("malformed bounded NBT disconnect reason")]
     Nbt(#[source] NbtError),
+    #[error(transparent)]
+    Chunk(#[from] ChunkDecodeError),
     #[error("unexpected packet ID {id} in {state} state")]
     UnexpectedPacketId { state: &'static str, id: i32 },
     #[error("{context} has {remaining} trailing bytes")]
@@ -1181,6 +1218,25 @@ pub fn decode_play_clientbound(
             }
             require_consumed(&reader, "Play Chunk Batch Finished")?;
             Ok(PlayClientbound::ChunkBatchFinished { chunks })
+        }
+        PLAY_CHUNK_BATCH_START_ID => {
+            require_consumed(&reader, "Play Chunk Batch Start")?;
+            Ok(PlayClientbound::ChunkBatchStart)
+        }
+        PLAY_FORGET_LEVEL_CHUNK_ID => {
+            let (x, z) = chunk::decode_forget_level_chunk(&mut reader)?;
+            require_consumed(&reader, "Forget Level Chunk")?;
+            Ok(PlayClientbound::ForgetLevelChunk { x, z })
+        }
+        PLAY_LEVEL_CHUNK_WITH_LIGHT_ID => {
+            let chunk = chunk::decode_level_chunk_with_light(&mut reader)?;
+            require_consumed(&reader, "Level Chunk With Light")?;
+            Ok(PlayClientbound::LevelChunkWithLight(chunk))
+        }
+        PLAY_LIGHT_UPDATE_ID => {
+            let update = chunk::decode_light_update(&mut reader)?;
+            require_consumed(&reader, "Light Update")?;
+            Ok(PlayClientbound::LightUpdate(update))
         }
         PLAY_COOKIE_REQUEST_ID => {
             let key = reader.read_string(IDENTIFIER_LIMITS)?.to_owned();

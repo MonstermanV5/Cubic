@@ -283,6 +283,30 @@ async fn run_play_session(
                     }
                 };
                 let packet = v775::decode_play_clientbound(&frame)?;
+                let packet = match crate::world_adapter::adapt_chunk_packet(packet) {
+                    crate::world_adapter::ChunkAdaptation::Load(chunk) => {
+                        let coordinate = chunk.coordinate;
+                        world.apply(WorldEvent::LoadChunk(chunk))?;
+                        if let Some(stored) = world.loaded_chunks().get(coordinate) {
+                            let summary = stored.summary();
+                            tracing::debug!(target: "world::chunk", x = summary.coordinate.x, z = summary.coordinate.z, sections = summary.sections, non_empty_sections = summary.non_empty_sections, single_palettes = summary.single_block_palettes, indirect_palettes = summary.indirect_block_palettes, direct_palettes = summary.direct_block_palettes, heightmaps = summary.heightmaps, block_entities = summary.block_entities, sky_layers = summary.sky_layers, block_layers = summary.block_layers, loaded_chunks = world.loaded_chunks().len(), "stored decoded chunk");
+                        }
+                        continue;
+                    }
+                    crate::world_adapter::ChunkAdaptation::Unload(coordinate) => {
+                        world.apply(WorldEvent::UnloadChunk(coordinate))?;
+                        tracing::debug!(target: "world::chunk", x = coordinate.x, z = coordinate.z, loaded_chunks = world.loaded_chunks().len(), "unloaded chunk");
+                        continue;
+                    }
+                    crate::world_adapter::ChunkAdaptation::Light { coordinate, light } => {
+                        let sky_layers = light.sky_layer_count;
+                        let block_layers = light.block_layer_count;
+                        world.apply(WorldEvent::UpdateChunkLight { coordinate, light })?;
+                        tracing::debug!(target: "world::chunk", x = coordinate.x, z = coordinate.z, sky_layers, block_layers, "applied bounded chunk light update");
+                        continue;
+                    }
+                    crate::world_adapter::ChunkAdaptation::Other(packet) => packet,
+                };
                 if let Some(event) = crate::world_adapter::play_world_event(&packet)? {
                     let transition = world.apply(event)?;
                     tracing::debug!(target: "world", summary = %world.summary(), reset = ?transition.reset, dimension_changed = transition.dimension_changed, "applied authoritative world update");
@@ -304,6 +328,10 @@ async fn run_play_session(
                             sent_player_loaded = true;
                         }
                     }
+                    PlayClientbound::ChunkBatchStart => {}
+                    PlayClientbound::LevelChunkWithLight(_)
+                    | PlayClientbound::ForgetLevelChunk { .. }
+                    | PlayClientbound::LightUpdate(_) => {}
                     PlayClientbound::CookieRequest { key } => {
                         write(connection, v775::encode_play_cookie_response(&key)?, "Play Cookie Response write").await?;
                     }

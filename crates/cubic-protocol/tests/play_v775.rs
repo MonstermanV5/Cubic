@@ -254,12 +254,12 @@ fn malformed_known_play_packets_return_errors() {
 }
 
 #[test]
-fn irrelevant_world_payload_is_identified_without_retention_model() {
-    let packet = [0x2d, 1, 2, 3, 4, 5];
+fn unrelated_play_payload_is_identified_without_retention_model() {
+    let packet = [0x2e, 1, 2, 3, 4, 5];
     assert_eq!(
         v775::decode_play_clientbound(&packet).unwrap(),
         v775::PlayClientbound::Ignored {
-            packet_id: 0x2d,
+            packet_id: 0x2e,
             payload_bytes: 5
         }
     );

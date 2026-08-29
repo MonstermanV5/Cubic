@@ -1,11 +1,12 @@
 use cubic_version::MinecraftIdentifier;
 use cubic_world::{
-    AuthoritativeRotation, BlockCoordinates, ClockState, Difficulty, DimensionTypeReference,
-    EnterWorld, GameMode, MAX_KNOWN_DIMENSIONS, MAX_RUNTIME_REGISTRIES,
-    MAX_RUNTIME_REGISTRY_ENTRIES, MAX_WORLD_CLOCKS, PlayerPositionUpdate, RelativeTransformFlags,
-    ResetScope, Respawn, RespawnRotation, RuntimeRegistrySnapshot, RuntimeRegistrySummary,
-    SpawnContext, SpawnPoint, WorldBorder, WorldError, WorldEvent, WorldLifecycle, WorldState,
-    WorldTime,
+    AuthoritativeRotation, BlockCoordinates, Chunk, ChunkCoordinate, ChunkLightSummary,
+    ChunkSection, ClockState, Difficulty, DimensionTypeReference, EnterWorld, GameMode,
+    MAX_KNOWN_DIMENSIONS, MAX_RUNTIME_REGISTRIES, MAX_RUNTIME_REGISTRY_ENTRIES, MAX_WORLD_CLOCKS,
+    PalettedContainer, PlayerPositionUpdate, RelativeTransformFlags, ResetScope, Respawn,
+    RespawnRotation, RuntimeBiomeId, RuntimeBlockStateId, RuntimeRegistrySnapshot,
+    RuntimeRegistrySummary, SpawnContext, SpawnPoint, WorldBorder, WorldError, WorldEvent,
+    WorldLifecycle, WorldState, WorldTime,
 };
 
 fn id(value: &str) -> MinecraftIdentifier {
@@ -69,6 +70,53 @@ fn absolute_position(id: i32) -> PlayerPositionUpdate {
         pitch: -12.0,
         relative: RelativeTransformFlags::default(),
     }
+}
+
+fn sample_chunk() -> Chunk {
+    Chunk {
+        coordinate: ChunkCoordinate::new(-3, 4),
+        sections: vec![ChunkSection {
+            non_empty_block_count: 0,
+            fluid_count: 0,
+            blocks: PalettedContainer::Single {
+                value: RuntimeBlockStateId(0),
+                entries: 4_096,
+            },
+            biomes: PalettedContainer::Single {
+                value: RuntimeBiomeId(1),
+                entries: 64,
+            },
+        }],
+        heightmaps: Vec::new(),
+        block_entities: Vec::new(),
+        light: ChunkLightSummary::default(),
+    }
+}
+
+#[test]
+fn world_contents_and_connection_resets_clear_loaded_chunks() {
+    let mut state = active();
+    state.apply(WorldEvent::LoadChunk(sample_chunk())).unwrap();
+    assert_eq!(state.loaded_chunks().len(), 1);
+    state
+        .apply(WorldEvent::Respawn(Respawn {
+            spawn: spawn("other:sky"),
+            keep_attribute_modifiers: false,
+            keep_entity_data: true,
+            rotation: RespawnRotation::Preserve,
+        }))
+        .unwrap();
+    assert!(state.loaded_chunks().is_empty());
+
+    state.apply(WorldEvent::LoadChunk(sample_chunk())).unwrap();
+    state.apply(WorldEvent::BeginConfiguration).unwrap();
+    assert!(state.loaded_chunks().is_empty());
+    state
+        .apply(WorldEvent::EnterWorld(enter("example:moon")))
+        .unwrap();
+    state.apply(WorldEvent::LoadChunk(sample_chunk())).unwrap();
+    state.apply(WorldEvent::Disconnect).unwrap();
+    assert!(state.loaded_chunks().is_empty());
 }
 
 #[test]

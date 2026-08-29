@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 
 use crate::{
-    AuthoritativeRotation, AuthoritativeTransform, EnterWorld, PlayerPositionUpdate,
+    AuthoritativeRotation, AuthoritativeTransform, EnterWorld, LoadedChunks, PlayerPositionUpdate,
     RespawnRotation, RuntimeRegistrySnapshot, SpawnPoint, WorldBorder, WorldEvent, WorldSession,
     WorldTime,
 };
@@ -42,6 +42,7 @@ pub struct WorldState {
     revision: u64,
     registries: RuntimeRegistrySnapshot,
     session: Option<WorldSession>,
+    chunks: LoadedChunks,
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -79,6 +80,8 @@ pub enum WorldError {
     StaleTeleport { current: i32, received: i32 },
     #[error("relative {field} update requires a prior authoritative position")]
     RelativeWithoutBaseline { field: &'static str },
+    #[error(transparent)]
+    ChunkStore(#[from] crate::ChunkStoreError),
 }
 
 impl WorldState {
@@ -102,6 +105,11 @@ impl WorldState {
         &self.registries
     }
 
+    #[must_use]
+    pub const fn loaded_chunks(&self) -> &LoadedChunks {
+        &self.chunks
+    }
+
     pub fn apply(&mut self, event: WorldEvent) -> Result<WorldTransition, WorldError> {
         let next_revision = self
             .revision
@@ -112,6 +120,7 @@ impl WorldState {
                 self.lifecycle = WorldLifecycle::Configuring;
                 self.registries = RuntimeRegistrySnapshot::default();
                 self.session = None;
+                self.chunks.clear();
                 (ResetScope::Connection, false)
             }
             WorldEvent::RuntimeRegistries(mut registries) => {
@@ -128,6 +137,7 @@ impl WorldState {
                 validate_enter_world(&enter)?;
                 self.session = Some(session_from_enter(enter));
                 self.lifecycle = WorldLifecycle::Active;
+                self.chunks.clear();
                 (ResetScope::WorldContents, true)
             }
             WorldEvent::Respawn(respawn) => {
@@ -147,6 +157,7 @@ impl WorldState {
                     session.weather = Default::default();
                     session.border = None;
                 }
+                self.chunks.clear();
                 (ResetScope::WorldContents, dimension_changed)
             }
             WorldEvent::SynchronizePlayerPosition(update) => {
@@ -202,10 +213,26 @@ impl WorldState {
                 self.active_mut("SetWorldBorder")?.border = Some(border);
                 (ResetScope::None, false)
             }
+            WorldEvent::LoadChunk(chunk) => {
+                self.require(WorldLifecycle::Active, "LoadChunk")?;
+                self.chunks.insert(chunk)?;
+                (ResetScope::None, false)
+            }
+            WorldEvent::UnloadChunk(coordinate) => {
+                self.require(WorldLifecycle::Active, "UnloadChunk")?;
+                self.chunks.remove(coordinate);
+                (ResetScope::None, false)
+            }
+            WorldEvent::UpdateChunkLight { coordinate, light } => {
+                self.require(WorldLifecycle::Active, "UpdateChunkLight")?;
+                self.chunks.update_light(coordinate, light);
+                (ResetScope::None, false)
+            }
             WorldEvent::Disconnect => {
                 self.lifecycle = WorldLifecycle::Disconnected;
                 self.registries = RuntimeRegistrySnapshot::default();
                 self.session = None;
+                self.chunks.clear();
                 (ResetScope::Connection, false)
             }
         };
@@ -232,14 +259,15 @@ impl WorldState {
             },
         );
         format!(
-            "lifecycle=Active dimension={} dimension_type_raw={} entity={} game_mode={:?} position={} known_dimensions={} runtime_registries={}",
+            "lifecycle=Active dimension={} dimension_type_raw={} entity={} game_mode={:?} position={} known_dimensions={} runtime_registries={} loaded_chunks={}",
             session.spawn_context.dimension,
             session.spawn_context.dimension_type.raw_id,
             session.player_entity_id,
             session.spawn_context.game_mode,
             position,
             session.known_dimensions.len(),
-            self.registries.registries.len()
+            self.registries.registries.len(),
+            self.chunks.len()
         )
     }
 

@@ -533,6 +533,10 @@ async fn await_initial_play_login(
             | PlayClientbound::InitializeBorder(_)
             | PlayClientbound::Health { .. }
             | PlayClientbound::CustomPayload { .. }
+            | PlayClientbound::ChunkBatchStart
+            | PlayClientbound::LevelChunkWithLight(_)
+            | PlayClientbound::ForgetLevelChunk { .. }
+            | PlayClientbound::LightUpdate(_)
             | PlayClientbound::Ignored { .. } => {}
         }
     }

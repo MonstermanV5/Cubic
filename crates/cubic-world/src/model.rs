@@ -1,5 +1,7 @@
 use cubic_version::MinecraftIdentifier;
 
+use crate::{Chunk, ChunkCoordinate, ChunkLightSummary};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GameMode {
     Survival,
@@ -219,5 +221,11 @@ pub enum WorldEvent {
     SetThunderLevel(f32),
     SetGameMode(GameMode),
     SetWorldBorder(WorldBorder),
+    LoadChunk(Chunk),
+    UnloadChunk(ChunkCoordinate),
+    UpdateChunkLight {
+        coordinate: ChunkCoordinate,
+        light: ChunkLightSummary,
+    },
     Disconnect,
 }

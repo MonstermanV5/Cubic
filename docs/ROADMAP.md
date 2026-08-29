@@ -15,7 +15,7 @@ Status markers: `[ ]` not started, `[~]` partial, `[x]` complete, `[!]` blocked.
 - [x] Phase 11 - generated game registries/data
 - [x] Phase 12 - generated packet codecs
 - [x] Phase 13 - world state
-- [ ] Phase 14 - chunk decoding
+- [x] Phase 14 - chunk decoding
 - [ ] Phase 15 - first simple 3D world
 - [ ] Phase 16 - Minecraft block resources/models
 - [ ] Phase 17 - basic movement/collision
@@ -56,3 +56,5 @@ Phase 11 is complete. Mojang's official 26.1.2 Data Generator ran with the offic
 Phase 12 passed real manual acceptance. The official 26.1.2 Data Generator report remains authoritative for 256 exact packet identities/IDs; pinned PrismarineJS revision `8a80816cbfb3fe2b609f2cde4e57796c8033af61` supplements ordered structure. The accepted deterministic merged artifact contains 96 bounded layouts and 160 categorized identity-only definitions, passes 34 bootstrap ID and 14 structural checks, is 114,441 bytes, and has SHA-1 `c43e6035f08d250cf3f0e91a558fe105e3b6d040`. No live network codec was migrated and no real report/raw source/artifact is committed.
 
 Phase 13 passed real localhost acceptance against offline-mode vanilla Java 26.1.2. Cubic entered authoritative Overworld state, retained functional Chat Mode, crossed Overworld -> Nether -> Overworld with deterministic `WorldContents` resets, invalidated coordinates while preserving the independent rotation baseline, applied post-respawn relative yaw/pitch synchronization, advanced teleport IDs `1 -> 2 -> 3`, and disconnected cleanly. `cubic-world` owns the bounded version-independent state; chunk decoding remains the Phase 14 boundary.
+
+Phase 14 passed real localhost acceptance against offline-mode vanilla Java 26.1.2. Cubic decoded plausible signed Overworld coordinates and 24-section chunks up to 329 loaded entries, validated palettes, heightmaps, and lighting, then cleared `329 -> 0` across both Overworld -> Nether and Nether -> Overworld transitions. Nether decoded 16-section chunks with appropriate light characteristics and also reached 329 loaded entries; Overworld reloaded successfully after returning. Chat Mode remained functional, disconnect was clean, memory visibly dropped on each world reset, and no warning, malformed, trailing-data, or chunk-limit failure occurred. No rendering or Phase 15 work is present.

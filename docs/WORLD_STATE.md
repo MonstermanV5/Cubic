@@ -1,6 +1,6 @@
 # World State
 
-Phase 13 introduces Cubic's first persistent semantic representation of an active Minecraft world session. It is deliberately small: it records authoritative context needed by later systems but contains no chunks, entities, movement simulation, collision, or rendering.
+Phase 13 introduced Cubic's first persistent semantic representation of an active Minecraft world session. Phase 14 extends it with bounded decoded chunks while entities, movement simulation, collision, and rendering remain absent.
 
 ## Ownership and data flow
 
@@ -37,7 +37,7 @@ Minecraft Java 26.1.2 / protocol 775 is the first reference adapter, not the per
 
 ## Deferred work
 
-Phase 14 owns chunk section, palette, biome, heightmap, lighting, and chunk-cache work. Later phases own entity populations, movement/collision, gameplay, dimensions/environment depth, and world rendering. Phase 13's reset scopes exist so those stores can be invalidated cleanly when added; they are not implemented here.
+Phase 14 now owns chunk sections, palettes, biomes, bounded heightmap/light attachments, and a 512-entry loaded-chunk store. Every `WorldContents` or connection reset clears it synchronously, so terrain cannot leak between dimensions or sessions. Later phases own entity populations, movement/collision, gameplay, dimensions/environment depth, and world rendering. See `CHUNKS.md`.
 
 ## Manual acceptance
 

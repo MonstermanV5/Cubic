@@ -77,6 +77,10 @@ async fn persistent_session_handles_control_chat_and_outgoing_unsigned_message()
         write_packet(&mut stream, 0x3d, 77_i32.to_be_bytes().to_vec()).await;
         assert_i32(&reader.next(&mut stream).await, 0x2d, 77);
 
+        // A minimal reviewed v775 chunk proves Chat Mode can retain semantic
+        // terrain without exposing it to the UI or changing redraw behavior.
+        write_packet(&mut stream, 0x2d, minimal_chunk_payload(-1, 2)).await;
+
         let mut position = CodecWriter::new();
         position.write_var_int(300);
         position.write_bytes(&[0; 60]);
@@ -207,6 +211,29 @@ async fn persistent_session_handles_control_chat_and_outgoing_unsigned_message()
     );
     server.await.unwrap();
     assert!(client.await.unwrap().is_ok());
+}
+
+fn minimal_chunk_payload(x: i32, z: i32) -> Vec<u8> {
+    let mut section = CodecWriter::new();
+    section.write_i16(0);
+    section.write_i16(0);
+    section.write_u8(0);
+    section.write_var_int(0);
+    section.write_u8(0);
+    section.write_var_int(1);
+
+    let mut payload = CodecWriter::new();
+    payload.write_i32(x);
+    payload.write_i32(z);
+    payload.write_var_int(0);
+    payload
+        .write_byte_array(section.as_slice(), 2 * 1024 * 1024)
+        .unwrap();
+    payload.write_var_int(0);
+    for _ in 0..6 {
+        payload.write_var_int(0);
+    }
+    payload.into_inner()
 }
 
 async fn bootstrap_to_play(stream: &mut TcpStream) {
