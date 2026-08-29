@@ -26,6 +26,32 @@ pub struct DimensionTypeReference {
     pub raw_id: u32,
 }
 
+/// Authoritative vertical geometry supplied by the server's dimension-type registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DimensionGeometry {
+    pub min_y: i32,
+    pub height: u32,
+}
+
+impl DimensionGeometry {
+    #[must_use]
+    pub const fn min_section_y(self) -> i32 {
+        self.min_y / 16
+    }
+
+    #[must_use]
+    pub const fn section_count(self) -> usize {
+        (self.height / 16) as usize
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeDimensionType {
+    pub raw_id: u32,
+    pub identifier: MinecraftIdentifier,
+    pub geometry: DimensionGeometry,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockCoordinates {
     pub x: i32,
@@ -193,6 +219,7 @@ pub struct WorldSession {
     pub limited_crafting: bool,
     pub secure_chat_enforced: bool,
     pub spawn_context: SpawnContext,
+    pub dimension_geometry: DimensionGeometry,
     pub position: Option<AuthoritativeTransform>,
     pub rotation: Option<AuthoritativeRotation>,
     pub last_teleport_id: Option<i32>,
@@ -207,6 +234,7 @@ pub struct WorldSession {
 pub enum WorldEvent {
     BeginConfiguration,
     RuntimeRegistries(RuntimeRegistrySnapshot),
+    RuntimeDimensionTypes(Vec<RuntimeDimensionType>),
     EnterWorld(EnterWorld),
     Respawn(Respawn),
     SynchronizePlayerPosition(PlayerPositionUpdate),

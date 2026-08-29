@@ -4,11 +4,11 @@
 
 Cubic is an independent project intended to become a Minecraft: Java Edition-compatible multiplayer client, primarily implemented in Rust.
 
-Cubic does not contain Mojang or Microsoft code or assets. Minecraft gameplay and world rendering have not yet been implemented. The repository currently contains the architectural scaffold, native graphics bootstrap, low-level protocol/NBT foundations, bounded server-list Status query, version-data architecture, completed Chat Mode/authenticated secure-chat and generated-data foundations, persistent local diagnostics, and the Phase 13 semantic world-state model.
+Cubic does not contain Mojang or Microsoft code or assets. Minecraft gameplay is not implemented. The repository currently contains the architectural scaffold, native graphics bootstrap, protocol/NBT and generated-data foundations, authenticated Chat Mode, semantic world/chunk state, and Phase 15's first diagnostic 3D terrain path.
 
 ## Current state
 
-With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status` queries a server list entry, and `dev-login` retains the completed Phase 7 one-shot acceptance path. `chat` opens Cubic's full-window, low-idle-redraw Chat Mode and runs its persistent network task independently of the UI. The original `--username` path remains the offline development mode; `chat <server> --backend xal` selects the authenticated experimental-XAL path. Java 26.1.2 / protocol 775 is the first manually implemented reference profile, not Cubic's permanent compatibility boundary. Phase 13 now maintains small authoritative session/dimension/position metadata during Chat Mode, but chunks, entities, movement, Minecraft resources, and 3D gameplay remain unimplemented. See `docs/WORLD_STATE.md`.
+With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status`, `dev-login`, and `chat` retain their accepted behavior. `world <server> --username <name>` opens a separate offline-development window that renders bounded decoded chunks as colored exposed cube faces from the authoritative player camera. It requires the exact Phase 11 generated game-data artifact under Cubic's platform data directory. This is diagnostic terrain—not Minecraft models, textures, movement, entities, collision, or Play Mode—and Chat Mode remains independent. See `docs/WORLD_RENDERING.md`.
 
 ## Build and validate
 

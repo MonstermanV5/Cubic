@@ -572,6 +572,7 @@ dependencies = [
  "cubic-resources",
  "cubic-ui",
  "cubic-version",
+ "cubic-world",
  "tempfile",
  "tokio",
  "tracing",
@@ -632,6 +633,7 @@ dependencies = [
  "cubic-auth",
  "cubic-render",
  "cubic-ui",
+ "cubic-world",
  "egui",
  "egui-winit",
  "pollster",
@@ -659,8 +661,11 @@ dependencies = [
 name = "cubic-render"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "cubic-world",
  "egui",
  "egui-wgpu",
+ "thiserror 2.0.20",
  "tracing",
  "wgpu",
  "winit",

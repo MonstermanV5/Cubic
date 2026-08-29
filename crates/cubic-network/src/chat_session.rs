@@ -27,6 +27,7 @@ use crate::{
     development_login::{ConnectionState, connect_to_play, run_configuration},
     online_login::establish_authenticated_play,
     secure_chat::{SecureChatError, SecureChatSession, system_time_millis},
+    world_render::WorldRenderRunner,
 };
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 128;
@@ -184,6 +185,8 @@ pub async fn run_development_chat_session(
         ChatSecurity::UnsignedDevelopment,
         runner,
         connected.initial_login,
+        connected.dimension_types,
+        None,
     )
     .await
 }
@@ -218,6 +221,28 @@ pub async fn run_authenticated_chat_session<J: MinecraftSessionJoiner>(
         security,
         runner,
         connected.initial_login,
+        connected.dimension_types,
+        None,
+    )
+    .await
+}
+
+/// Runs the existing development Play session while publishing coalesced world deltas.
+pub async fn run_development_world_session(
+    address: &ServerAddress,
+    username: &DevelopmentUsername,
+    options: &ChatSessionOptions,
+    runner: ChatSessionRunner,
+    render: WorldRenderRunner,
+) -> Result<(), ChatSessionError> {
+    let mut connected = connect_to_play(address, username, &options.login).await?;
+    run_play_session(
+        &mut connected.connection,
+        ChatSecurity::UnsignedDevelopment,
+        runner,
+        connected.initial_login,
+        connected.dimension_types,
+        Some(render),
     )
     .await
 }
@@ -227,15 +252,32 @@ enum ChatSecurity {
     Authenticated(Box<SecureChatSession>),
 }
 
+fn publish_reset(render: &Option<WorldRenderRunner>, world: &WorldState) {
+    let (Some(render), Some(session)) = (render, world.session()) else {
+        return;
+    };
+    render.reset(
+        session.spawn_context.dimension.to_string(),
+        session.dimension_geometry,
+    );
+    if let Some(pose) = session.position {
+        render.pose(pose);
+    }
+}
+
 async fn run_play_session(
     connection: &mut crate::connection::MinecraftConnection,
     mut security: ChatSecurity,
     mut runner: ChatSessionRunner,
     initial_login: v775::InitialPlayLogin,
+    dimension_types: Vec<cubic_world::RuntimeDimensionType>,
+    render: Option<WorldRenderRunner>,
 ) -> Result<(), ChatSessionError> {
     let mut world = WorldState::default();
     world.apply(WorldEvent::BeginConfiguration)?;
+    world.apply(WorldEvent::RuntimeDimensionTypes(dimension_types))?;
     world.apply(crate::world_adapter::initial_world_event(initial_login)?)?;
+    publish_reset(&render, &world);
     tracing::info!(target: "world", summary = %world.summary(), "entered authoritative world state");
     runner.event(ChatEvent::Connected);
 
@@ -288,6 +330,9 @@ async fn run_play_session(
                         let coordinate = chunk.coordinate;
                         world.apply(WorldEvent::LoadChunk(chunk))?;
                         if let Some(stored) = world.loaded_chunks().get(coordinate) {
+                            if let Some(render) = &render {
+                                render.load(Arc::new(stored.clone()));
+                            }
                             let summary = stored.summary();
                             tracing::debug!(target: "world::chunk", x = summary.coordinate.x, z = summary.coordinate.z, sections = summary.sections, non_empty_sections = summary.non_empty_sections, single_palettes = summary.single_block_palettes, indirect_palettes = summary.indirect_block_palettes, direct_palettes = summary.direct_block_palettes, heightmaps = summary.heightmaps, block_entities = summary.block_entities, sky_layers = summary.sky_layers, block_layers = summary.block_layers, loaded_chunks = world.loaded_chunks().len(), "stored decoded chunk");
                         }
@@ -295,6 +340,9 @@ async fn run_play_session(
                     }
                     crate::world_adapter::ChunkAdaptation::Unload(coordinate) => {
                         world.apply(WorldEvent::UnloadChunk(coordinate))?;
+                        if let Some(render) = &render {
+                            render.unload(coordinate);
+                        }
                         tracing::debug!(target: "world::chunk", x = coordinate.x, z = coordinate.z, loaded_chunks = world.loaded_chunks().len(), "unloaded chunk");
                         continue;
                     }
@@ -309,6 +357,13 @@ async fn run_play_session(
                 };
                 if let Some(event) = crate::world_adapter::play_world_event(&packet)? {
                     let transition = world.apply(event)?;
+                    if transition.reset != cubic_world::ResetScope::None {
+                        publish_reset(&render, &world);
+                    } else if let Some(pose) = world.session().and_then(|session| session.position)
+                        && let Some(render) = &render
+                    {
+                        render.pose(pose);
+                    }
                     tracing::debug!(target: "world", summary = %world.summary(), reset = ?transition.reset, dimension_changed = transition.dimension_changed, "applied authoritative world update");
                 }
                 match packet {
@@ -446,7 +501,9 @@ async fn run_play_session(
                         write(connection, v775::encode_client_information(&ClientInformation::default())?, "Reconfiguration Client Information write").await?;
                         let mut state = ConnectionState::Configuration;
                         let configuration = run_configuration(connection, &mut state).await?;
+                        world.apply(WorldEvent::RuntimeDimensionTypes(configuration.dimension_types))?;
                         world.apply(crate::world_adapter::initial_world_event(configuration.initial_login)?)?;
+                        publish_reset(&render, &world);
                         tracing::info!(target: "world", summary = %world.summary(), "reconfiguration replaced authoritative world state");
                         if let ChatSecurity::Authenticated(session) = &mut security {
                             session.reset(random_session_uuid());
@@ -702,6 +759,17 @@ mod tests {
         }
     }
 
+    fn dimension_types() -> Vec<cubic_world::RuntimeDimensionType> {
+        vec![cubic_world::RuntimeDimensionType {
+            raw_id: 0,
+            identifier: cubic_version::MinecraftIdentifier::new("minecraft:overworld").unwrap(),
+            geometry: cubic_world::DimensionGeometry {
+                min_y: -64,
+                height: 384,
+            },
+        }]
+    }
+
     async fn read_test_frame(stream: &mut TcpStream, decoder: &mut FrameDecoder) -> Vec<u8> {
         let mut buffer = [0_u8; 1024];
         loop {
@@ -788,7 +856,15 @@ mod tests {
             cubic_protocol::ProtocolUuid::from_u128(2),
         )));
         let session = tokio::spawn(async move {
-            run_play_session(&mut connection, security, runner, initial_login()).await
+            run_play_session(
+                &mut connection,
+                security,
+                runner,
+                initial_login(),
+                dimension_types(),
+                None,
+            )
+            .await
         });
 
         let mut decoder = FrameDecoder::new(limits);

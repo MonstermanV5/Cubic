@@ -23,7 +23,7 @@ impl ChunkCoordinate {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RuntimeBlockStateId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

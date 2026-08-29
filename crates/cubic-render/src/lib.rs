@@ -1,5 +1,8 @@
 //! Minimal cross-platform wgpu renderer for the graphical bootstrap.
 
+mod mesher;
+mod world;
+
 use std::{
     error::Error,
     fmt,
@@ -9,12 +12,24 @@ use std::{
     },
 };
 
+use cubic_world::{BlockVisualProfile, WorldRenderUpdate};
 use wgpu::{
     Color, CommandEncoderDescriptor, CurrentSurfaceTexture, Device, DeviceDescriptor, Instance,
     InstanceDescriptor, LoadOp, Operations, Queue, RenderPassColorAttachment, RenderPassDescriptor,
     StoreOp, Surface, SurfaceConfiguration, TextureViewDescriptor,
 };
 use winit::{dpi::PhysicalSize, window::Window};
+use world::WorldRenderer;
+
+#[derive(Clone, Debug, Default)]
+pub struct WorldRenderStats {
+    pub dimension: Option<String>,
+    pub geometry: Option<cubic_world::DimensionGeometry>,
+    pub pose: Option<cubic_world::AuthoritativeTransform>,
+    pub loaded_chunks: usize,
+    pub meshed_chunks: usize,
+    pub pending_meshes: usize,
+}
 
 const CLEAR_COLOR: Color = Color {
     r: 0.035,
@@ -62,6 +77,7 @@ pub struct Renderer {
     out_of_memory: Arc<AtomicBool>,
     ui_renderer: egui_wgpu::Renderer,
     ui_textures: TextureDeltaQueue,
+    world_renderer: Option<WorldRenderer>,
 }
 
 impl Renderer {
@@ -143,6 +159,7 @@ impl Renderer {
             out_of_memory,
             ui_renderer,
             ui_textures: TextureDeltaQueue::default(),
+            world_renderer: None,
         })
     }
 
@@ -159,7 +176,113 @@ impl Renderer {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        if let Some(world) = &mut self.world_renderer {
+            world.resize(&self.device, size.width, size.height);
+        }
         tracing::debug!(width = size.width, height = size.height, "surface resized");
+    }
+
+    /// Enables the Phase 15 diagnostic terrain path with version-selected block semantics.
+    pub fn enable_world(&mut self, visual: BlockVisualProfile) {
+        self.world_renderer = Some(WorldRenderer::new(
+            &self.device,
+            self.config.format,
+            self.size.width,
+            self.size.height,
+            visual,
+        ));
+    }
+
+    pub fn apply_world_update(&mut self, update: WorldRenderUpdate) {
+        if let Some(world) = &mut self.world_renderer {
+            world.apply(update);
+        }
+    }
+
+    #[must_use]
+    pub fn world_has_pending_work(&self) -> bool {
+        self.world_renderer
+            .as_ref()
+            .is_some_and(WorldRenderer::has_pending_work)
+    }
+
+    #[must_use]
+    pub fn world_stats(&self) -> WorldRenderStats {
+        self.world_renderer
+            .as_ref()
+            .map_or_else(WorldRenderStats::default, WorldRenderer::stats)
+    }
+
+    pub fn render_world(&mut self) -> Result<FrameStatus, RenderError> {
+        if self.out_of_memory.load(Ordering::Acquire) {
+            return Err(RenderError::OutOfMemory);
+        }
+        if !self.configured {
+            return Ok(FrameStatus::Skipped);
+        }
+        match self.surface.get_current_texture() {
+            CurrentSurfaceTexture::Success(frame) => {
+                self.paint_world(frame);
+                Ok(FrameStatus::Presented)
+            }
+            CurrentSurfaceTexture::Suboptimal(frame) => {
+                self.paint_world(frame);
+                self.reconfigure();
+                Ok(FrameStatus::Reconfigured)
+            }
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => {
+                Ok(FrameStatus::Skipped)
+            }
+            CurrentSurfaceTexture::Outdated => {
+                self.reconfigure();
+                Ok(FrameStatus::Reconfigured)
+            }
+            CurrentSurfaceTexture::Lost => {
+                self.recreate_surface()?;
+                Ok(FrameStatus::Reconfigured)
+            }
+            CurrentSurfaceTexture::Validation => Err(RenderError::SurfaceValidation),
+        }
+    }
+
+    fn paint_world(&mut self, frame: wgpu::SurfaceTexture) {
+        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        let Some(world) = &mut self.world_renderer else {
+            self.clear_and_present(frame);
+            return;
+        };
+        world.prepare(&self.device, &self.queue, self.size.width, self.size.height);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Cubic World Mode encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Cubic World Mode pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(CLEAR_COLOR),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: world.depth_view(),
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Clear(1.0),
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            world.draw(&mut pass);
+        }
+        self.queue.submit([encoder.finish()]);
+        self.queue.present(frame);
     }
 
     /// Returns whether the surface currently has a non-zero drawable area.

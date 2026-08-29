@@ -33,6 +33,7 @@ pub const MAX_USERNAME_UTF16_UNITS: usize = 16;
 pub const MAX_LOGIN_PROPERTIES: usize = 64;
 pub const MAX_LOGIN_PLUGIN_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_CONFIGURATION_CUSTOM_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub const MAX_CONFIGURATION_REGISTRY_ENTRIES: usize = 4_096;
 pub const MAX_PLAY_CUSTOM_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_DISCONNECT_BYTES: usize = 32 * 1024;
 pub const MAX_KNOWN_PACKS: usize = 64;
@@ -613,6 +614,10 @@ pub enum ConfigurationClientbound<'a> {
     Ping {
         id: i32,
     },
+    RegistryData {
+        registry: &'a str,
+        entries: Vec<ConfigurationRegistryEntry<'a>>,
+    },
     KnownPacks(Vec<KnownPack<'a>>),
     ResourcePackPush,
     Transfer,
@@ -621,6 +626,12 @@ pub enum ConfigurationClientbound<'a> {
         packet: SkippedConfigurationPacket,
         payload_bytes: usize,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigurationRegistryEntry<'a> {
+    pub identifier: &'a str,
+    pub data: Option<NbtTag>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1120,10 +1131,7 @@ pub fn decode_configuration_clientbound(
         CONFIG_RESET_CHAT_ID => {
             decode_empty_skipped(&reader, SkippedConfigurationPacket::ResetChat, "Reset Chat")
         }
-        CONFIG_REGISTRY_DATA_ID => Ok(skipped(
-            SkippedConfigurationPacket::RegistryData,
-            packet.payload.len(),
-        )),
+        CONFIG_REGISTRY_DATA_ID => decode_configuration_registry_data(&mut reader),
         CONFIG_RESOURCE_PACK_POP_ID => Ok(skipped(
             SkippedConfigurationPacket::ResourcePackPop,
             packet.payload.len(),
@@ -1797,6 +1805,38 @@ fn decode_known_packs<'a>(
     }
     require_consumed(reader, "Select Known Packs")?;
     Ok(ConfigurationClientbound::KnownPacks(packs))
+}
+
+fn decode_configuration_registry_data<'a>(
+    reader: &mut CodecReader<'a>,
+) -> Result<ConfigurationClientbound<'a>, BootstrapProtocolError> {
+    let registry = reader.read_string(IDENTIFIER_LIMITS)?;
+    let count = read_count(
+        reader,
+        "Configuration Registry Data",
+        MAX_CONFIGURATION_REGISTRY_ENTRIES,
+    )?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| CodecError::AllocationFailed {
+            context: "Configuration Registry Data",
+            requested: count,
+        })?;
+    let limits = NbtLimits::default()
+        .with_max_total_tags(65_536)
+        .with_max_total_allocated_bytes(MAX_CONFIGURATION_BUFFERED_BYTES);
+    for _ in 0..count {
+        let identifier = reader.read_string(IDENTIFIER_LIMITS)?;
+        let data = if reader.read_bool()? {
+            Some(decode_unnamed_network_tag(reader, limits).map_err(BootstrapProtocolError::Nbt)?)
+        } else {
+            None
+        };
+        entries.push(ConfigurationRegistryEntry { identifier, data });
+    }
+    require_consumed(reader, "Configuration Registry Data")?;
+    Ok(ConfigurationClientbound::RegistryData { registry, entries })
 }
 
 fn read_count(

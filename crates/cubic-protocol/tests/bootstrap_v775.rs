@@ -187,13 +187,7 @@ fn configuration_packets_decode_semantically_or_as_bounded_skips() {
         v775::decode_configuration_clientbound(&[0x05, 1, 2, 3, 4]).unwrap(),
         ConfigurationClientbound::Ping { id: 0x0102_0304 }
     );
-    assert!(matches!(
-        v775::decode_configuration_clientbound(&[0x07, 1, 2, 3]),
-        Ok(ConfigurationClientbound::Skipped {
-            payload_bytes: 3,
-            ..
-        })
-    ));
+    assert!(v775::decode_configuration_clientbound(&[0x07, 1, 2, 3]).is_err());
     assert!(matches!(
         v775::decode_configuration_clientbound(&[0x7f]),
         Err(BootstrapProtocolError::UnexpectedPacketId {
@@ -201,6 +195,42 @@ fn configuration_packets_decode_semantically_or_as_bounded_skips() {
             id: 127
         })
     ));
+}
+
+#[test]
+fn dimension_registry_vector_preserves_authoritative_vertical_geometry() {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(0x07);
+    writer
+        .write_string(
+            "minecraft:dimension_type",
+            StringLimits::new(32_767, 32_767),
+        )
+        .unwrap();
+    writer.write_var_int(1);
+    writer
+        .write_string("minecraft:overworld", StringLimits::new(32_767, 32_767))
+        .unwrap();
+    writer.write_bool(true);
+    writer.write_u8(10);
+    for (name, value) in [("min_y", -64_i32), ("height", 384_i32)] {
+        writer.write_u8(3);
+        writer.write_u16(name.len() as u16);
+        writer.write_bytes(name.as_bytes());
+        writer.write_i32(value);
+    }
+    writer.write_u8(0);
+    let decoded = v775::decode_configuration_clientbound(writer.as_slice()).unwrap();
+    let ConfigurationClientbound::RegistryData { registry, entries } = decoded else {
+        panic!("expected registry data")
+    };
+    assert_eq!(registry, "minecraft:dimension_type");
+    assert_eq!(entries.len(), 1);
+    let Some(cubic_protocol::nbt::NbtTag::Compound(data)) = &entries[0].data else {
+        panic!("expected compound dimension data")
+    };
+    assert_eq!(data.get_int("min_y"), Some(-64));
+    assert_eq!(data.get_int("height"), Some(384));
 }
 
 #[test]

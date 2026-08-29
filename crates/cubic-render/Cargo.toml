@@ -7,9 +7,12 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytemuck.workspace = true
+cubic-world = { path = "../cubic-world" }
 egui.workspace = true
 egui-wgpu.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 

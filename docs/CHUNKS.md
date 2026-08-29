@@ -21,7 +21,7 @@ Phase 12's official generated report is authoritative for packet identities and 
 - `light_update` (`0x30`) contains VarInt X/Z and the same bounded light-data structure.
 - Chunk-batch start/finish remain control-plane packets; the existing batch acknowledgement behavior is unchanged.
 
-Each current section contains two big-endian signed shorts (non-empty block count and fluid count), then a 4,096-entry block-state paletted container and a 64-entry biome paletted container. Section count is derived by consuming the exact bounded section buffer, not by assuming classic world height. Sections are stored lowest-to-highest, but their absolute minimum section Y remains unresolved until authoritative dimension-height metadata is modeled.
+Each current section contains two big-endian signed shorts (non-empty block count and fluid count), then a 4,096-entry block-state paletted container and a 64-entry biome paletted container. Section count is derived by consuming the exact bounded section buffer. Phase 15 resolves absolute section Y from the server's Configuration `minecraft:dimension_type` registry (`min_y` and `height`) and rejects a chunk whose decoded section count disagrees with that active geometry.
 
 ## Palettes and packed storage
 
@@ -49,4 +49,4 @@ Chat Mode still renders only chat. Chunk packets produce no UI event or redraw; 
 
 Phase 14 passed real localhost acceptance against offline-mode vanilla Java 26.1.2. Overworld traffic produced plausible signed coordinates, 24-section chunks, single and indirect palettes, validated heightmaps/lighting, and a loaded count of 329. Overworld -> Nether cleared the store from 329 to zero before 16-section Nether chunks with appropriate lighting loaded back to 329. Nether -> Overworld repeated the `329 -> 0` reset and Overworld reloaded to 329. Chat Mode remained functional through both transitions and the final disconnect was clean. No `ERROR`, `WARN`, malformed-packet, trailing-data, or loaded-chunk-limit failure appeared. Process memory rose while terrain was retained and visibly fell when each dimension transition cleared the old chunk set.
 
-Phase 15 will consume this semantic representation. Phase 14 deliberately contains no meshing, GPU buffers, camera, texture/model resolution, movement, collision, or renderer dependency.
+Phase 15 consumes this representation through coalesced coordinate deltas and shared immutable chunk values. Phase 14's canonical store remains network-owned; it has no renderer dependency. Texture/model resolution, movement, and collision remain absent.

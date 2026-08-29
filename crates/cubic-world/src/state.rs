@@ -41,6 +41,7 @@ pub struct WorldState {
     lifecycle: WorldLifecycle,
     revision: u64,
     registries: RuntimeRegistrySnapshot,
+    dimension_types: Vec<crate::RuntimeDimensionType>,
     session: Option<WorldSession>,
     chunks: LoadedChunks,
 }
@@ -74,6 +75,12 @@ pub enum WorldError {
     RevisionOverflow,
     #[error("{field} must be finite and within its permitted range")]
     InvalidNumber { field: &'static str },
+    #[error("dimension type raw ID {raw_id} has no authoritative geometry")]
+    MissingDimensionGeometry { raw_id: u32 },
+    #[error("dimension geometry min_y={min_y} height={height} is invalid")]
+    InvalidDimensionGeometry { min_y: i32, height: u32 },
+    #[error("dimension-type registry contains a duplicate raw ID")]
+    DuplicateDimensionType,
     #[error("teleport ID {value} is negative")]
     NegativeTeleportId { value: i32 },
     #[error("teleport ID {received} is not newer than applied ID {current}")]
@@ -119,6 +126,7 @@ impl WorldState {
             WorldEvent::BeginConfiguration => {
                 self.lifecycle = WorldLifecycle::Configuring;
                 self.registries = RuntimeRegistrySnapshot::default();
+                self.dimension_types.clear();
                 self.session = None;
                 self.chunks.clear();
                 (ResetScope::Connection, false)
@@ -132,10 +140,26 @@ impl WorldState {
                 self.registries = registries;
                 (ResetScope::None, false)
             }
+            WorldEvent::RuntimeDimensionTypes(mut dimensions) => {
+                self.require(WorldLifecycle::Configuring, "RuntimeDimensionTypes")?;
+                dimensions.sort_by_key(|dimension| dimension.raw_id);
+                for dimension in &dimensions {
+                    validate_dimension_geometry(dimension.geometry)?;
+                }
+                if dimensions
+                    .windows(2)
+                    .any(|pair| pair[0].raw_id == pair[1].raw_id)
+                {
+                    return Err(WorldError::DuplicateDimensionType);
+                }
+                self.dimension_types = dimensions;
+                (ResetScope::None, false)
+            }
             WorldEvent::EnterWorld(enter) => {
                 self.require(WorldLifecycle::Configuring, "EnterWorld")?;
                 validate_enter_world(&enter)?;
-                self.session = Some(session_from_enter(enter));
+                let geometry = self.geometry(enter.spawn.dimension_type.raw_id)?;
+                self.session = Some(session_from_enter(enter, geometry));
                 self.lifecycle = WorldLifecycle::Active;
                 self.chunks.clear();
                 (ResetScope::WorldContents, true)
@@ -144,9 +168,11 @@ impl WorldState {
                 if let RespawnRotation::Reset(rotation) = respawn.rotation {
                     validate_rotation(rotation)?;
                 }
+                let geometry = self.geometry(respawn.spawn.dimension_type.raw_id)?;
                 let session = self.active_mut("Respawn")?;
                 let dimension_changed = session.spawn_context.dimension != respawn.spawn.dimension;
                 session.spawn_context = respawn.spawn;
+                session.dimension_geometry = geometry;
                 session.position = None;
                 if let RespawnRotation::Reset(rotation) = respawn.rotation {
                     session.rotation = Some(rotation);
@@ -231,6 +257,7 @@ impl WorldState {
             WorldEvent::Disconnect => {
                 self.lifecycle = WorldLifecycle::Disconnected;
                 self.registries = RuntimeRegistrySnapshot::default();
+                self.dimension_types.clear();
                 self.session = None;
                 self.chunks.clear();
                 (ResetScope::Connection, false)
@@ -293,9 +320,20 @@ impl WorldState {
             lifecycle: self.lifecycle,
         })
     }
+
+    fn geometry(&self, raw_id: u32) -> Result<crate::DimensionGeometry, WorldError> {
+        self.dimension_types
+            .iter()
+            .find(|dimension| dimension.raw_id == raw_id)
+            .map(|dimension| dimension.geometry)
+            .ok_or(WorldError::MissingDimensionGeometry { raw_id })
+    }
 }
 
-fn session_from_enter(enter: EnterWorld) -> WorldSession {
+fn session_from_enter(
+    enter: EnterWorld,
+    dimension_geometry: crate::DimensionGeometry,
+) -> WorldSession {
     let mut known_dimensions = enter.known_dimensions;
     known_dimensions.sort();
     WorldSession {
@@ -310,6 +348,7 @@ fn session_from_enter(enter: EnterWorld) -> WorldSession {
         limited_crafting: enter.limited_crafting,
         secure_chat_enforced: enter.secure_chat_enforced,
         spawn_context: enter.spawn,
+        dimension_geometry,
         position: None,
         rotation: None,
         last_teleport_id: None,
@@ -319,6 +358,22 @@ fn session_from_enter(enter: EnterWorld) -> WorldSession {
         weather: Default::default(),
         border: None,
     }
+}
+
+fn validate_dimension_geometry(geometry: crate::DimensionGeometry) -> Result<(), WorldError> {
+    if geometry.height < 16
+        || geometry.height > 4_064
+        || !geometry.height.is_multiple_of(16)
+        || geometry.min_y.rem_euclid(16) != 0
+        || geometry.min_y < -2_032
+        || i64::from(geometry.min_y) + i64::from(geometry.height) > 2_032
+    {
+        return Err(WorldError::InvalidDimensionGeometry {
+            min_y: geometry.min_y,
+            height: geometry.height,
+        });
+    }
+    Ok(())
 }
 
 fn validate_enter_world(enter: &EnterWorld) -> Result<(), WorldError> {

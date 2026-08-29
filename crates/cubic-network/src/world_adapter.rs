@@ -7,10 +7,11 @@ use cubic_protocol::bootstrap::v775::{
 use cubic_version::MinecraftIdentifier;
 use cubic_world::{
     AuthoritativeRotation, BlockCoordinates, BlockEntitySummary, Chunk, ChunkCoordinate,
-    ChunkLightSummary, ChunkSection, ClockState, Difficulty, DimensionTypeReference, EnterWorld,
-    GameMode, HeightmapData, LastDeathLocation, PalettedContainer, PlayerPositionUpdate,
-    RelativeTransformFlags, Respawn, RespawnRotation, RuntimeBiomeId, RuntimeBlockStateId,
-    SpawnContext, SpawnPoint, WorldBorder, WorldEvent, WorldTime,
+    ChunkLightSummary, ChunkSection, ClockState, Difficulty, DimensionGeometry,
+    DimensionTypeReference, EnterWorld, GameMode, HeightmapData, LastDeathLocation,
+    PalettedContainer, PlayerPositionUpdate, RelativeTransformFlags, Respawn, RespawnRotation,
+    RuntimeBiomeId, RuntimeBlockStateId, RuntimeDimensionType, SpawnContext, SpawnPoint,
+    WorldBorder, WorldEvent, WorldTime,
 };
 use thiserror::Error;
 
@@ -29,6 +30,62 @@ pub(crate) enum WorldAdapterError {
     InvalidDifficulty(i32),
     #[error("protocol-775 {field} value must be finite")]
     NonFiniteFloat { field: &'static str },
+    #[error("dimension-type registry entry {entry} is missing its data")]
+    MissingDimensionData { entry: String },
+    #[error("dimension-type registry entry {entry} does not contain compound NBT")]
+    InvalidDimensionData { entry: String },
+    #[error("dimension-type registry entry {entry} is missing integer field {field}")]
+    MissingDimensionField { entry: String, field: &'static str },
+}
+
+pub(crate) fn dimension_types(
+    entries: Vec<v775::ConfigurationRegistryEntry<'_>>,
+) -> Result<Vec<RuntimeDimensionType>, WorldAdapterError> {
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(raw_id, entry)| {
+            let identifier = identifier(entry.identifier.to_owned())?;
+            let data = entry
+                .data
+                .ok_or_else(|| WorldAdapterError::MissingDimensionData {
+                    entry: identifier.to_string(),
+                })?;
+            let cubic_protocol::nbt::NbtTag::Compound(compound) = data else {
+                return Err(WorldAdapterError::InvalidDimensionData {
+                    entry: identifier.to_string(),
+                });
+            };
+            let min_y = compound.get_int("min_y").ok_or_else(|| {
+                WorldAdapterError::MissingDimensionField {
+                    entry: identifier.to_string(),
+                    field: "min_y",
+                }
+            })?;
+            let height = compound.get_int("height").ok_or_else(|| {
+                WorldAdapterError::MissingDimensionField {
+                    entry: identifier.to_string(),
+                    field: "height",
+                }
+            })?;
+            Ok(RuntimeDimensionType {
+                raw_id: u32::try_from(raw_id).map_err(|_| WorldAdapterError::InvalidInteger {
+                    field: "dimension type raw ID",
+                    value: i64::MAX,
+                })?,
+                identifier,
+                geometry: DimensionGeometry {
+                    min_y,
+                    height: u32::try_from(height).map_err(|_| {
+                        WorldAdapterError::InvalidInteger {
+                            field: "dimension height",
+                            value: i64::from(height),
+                        }
+                    })?,
+                },
+            })
+        })
+        .collect()
 }
 
 pub(crate) enum ChunkAdaptation {

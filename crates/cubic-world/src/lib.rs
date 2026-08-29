@@ -6,6 +6,7 @@
 
 mod chunk;
 mod model;
+mod render;
 mod state;
 
 pub use chunk::{
@@ -17,11 +18,12 @@ pub use chunk::{
 
 pub use model::{
     AuthoritativeRotation, AuthoritativeTransform, BlockCoordinates, ClockState, Difficulty,
-    DimensionTypeReference, EnterWorld, GameMode, LastDeathLocation, PlayerPositionUpdate,
-    RelativeTransformFlags, Respawn, RespawnRotation, RuntimeRegistrySnapshot,
-    RuntimeRegistrySummary, SpawnContext, SpawnPoint, WeatherState, WorldBorder, WorldEvent,
-    WorldSession, WorldTime,
+    DimensionGeometry, DimensionTypeReference, EnterWorld, GameMode, LastDeathLocation,
+    PlayerPositionUpdate, RelativeTransformFlags, Respawn, RespawnRotation, RuntimeDimensionType,
+    RuntimeRegistrySnapshot, RuntimeRegistrySummary, SpawnContext, SpawnPoint, WeatherState,
+    WorldBorder, WorldEvent, WorldSession, WorldTime,
 };
+pub use render::{BlockVisualProfile, ChunkRenderDelta, WorldRenderUpdate};
 pub use state::{
     MAX_KNOWN_DIMENSIONS, MAX_RUNTIME_REGISTRIES, MAX_RUNTIME_REGISTRY_ENTRIES, MAX_WORLD_CLOCKS,
     ResetScope, WorldError, WorldLifecycle, WorldState, WorldTransition,

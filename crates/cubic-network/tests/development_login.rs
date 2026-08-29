@@ -189,7 +189,7 @@ async fn spawn_mock(mode: MockMode) -> (ServerAddress, JoinHandle<Observation>) 
             _ => return observation,
         };
         let mut configuration = packet(0x01, custom_payload());
-        configuration.extend_from_slice(&packet(0x07, vec![0xaa, 0xbb]));
+        configuration.extend_from_slice(&packet(0x07, empty_registry_payload()));
         configuration.extend_from_slice(&packet(0x0e, known_packs_payload()));
         configuration.extend_from_slice(&packet(
             0x04,
@@ -647,6 +647,15 @@ fn assert_plugin_response(frame: &[u8]) {
     assert_eq!(reader.read_var_int().unwrap(), 9);
     assert!(!reader.read_bool().unwrap());
     assert_eq!(reader.remaining(), 0);
+}
+
+fn empty_registry_payload() -> Vec<u8> {
+    let mut writer = CodecWriter::new();
+    writer
+        .write_string("test:registry", StringLimits::new(32_767, 32_767))
+        .unwrap();
+    writer.write_var_int(0);
+    writer.into_inner()
 }
 
 fn assert_client_information(frame: &[u8]) {

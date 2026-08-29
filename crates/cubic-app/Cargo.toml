@@ -14,6 +14,7 @@ cubic-platform = { path = "../cubic-platform" }
 cubic-resources = { path = "../cubic-resources" }
 cubic-ui = { path = "../cubic-ui" }
 cubic-version = { path = "../cubic-version" }
+cubic-world = { path = "../cubic-world" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

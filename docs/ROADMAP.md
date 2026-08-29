@@ -16,7 +16,7 @@ Status markers: `[ ]` not started, `[~]` partial, `[x]` complete, `[!]` blocked.
 - [x] Phase 12 - generated packet codecs
 - [x] Phase 13 - world state
 - [x] Phase 14 - chunk decoding
-- [ ] Phase 15 - first simple 3D world
+- [x] Phase 15 - first simple 3D world
 - [ ] Phase 16 - Minecraft block resources/models
 - [ ] Phase 17 - basic movement/collision
 - [ ] Phase 18 - seamless Play/Chat mode switching
@@ -57,4 +57,6 @@ Phase 12 passed real manual acceptance. The official 26.1.2 Data Generator repor
 
 Phase 13 passed real localhost acceptance against offline-mode vanilla Java 26.1.2. Cubic entered authoritative Overworld state, retained functional Chat Mode, crossed Overworld -> Nether -> Overworld with deterministic `WorldContents` resets, invalidated coordinates while preserving the independent rotation baseline, applied post-respawn relative yaw/pitch synchronization, advanced teleport IDs `1 -> 2 -> 3`, and disconnected cleanly. `cubic-world` owns the bounded version-independent state; chunk decoding remains the Phase 14 boundary.
 
-Phase 14 passed real localhost acceptance against offline-mode vanilla Java 26.1.2. Cubic decoded plausible signed Overworld coordinates and 24-section chunks up to 329 loaded entries, validated palettes, heightmaps, and lighting, then cleared `329 -> 0` across both Overworld -> Nether and Nether -> Overworld transitions. Nether decoded 16-section chunks with appropriate light characteristics and also reached 329 loaded entries; Overworld reloaded successfully after returning. Chat Mode remained functional, disconnect was clean, memory visibly dropped on each world reset, and no warning, malformed, trailing-data, or chunk-limit failure occurred. No rendering or Phase 15 work is present.
+Phase 14 passed real localhost acceptance against offline-mode vanilla Java 26.1.2. Cubic decoded plausible signed Overworld coordinates and 24-section chunks up to 329 loaded entries, validated palettes, heightmaps, and lighting, then cleared `329 -> 0` across both Overworld -> Nether and Nether -> Overworld transitions. Nether decoded 16-section chunks with appropriate light characteristics and also reached 329 loaded entries; Overworld reloaded successfully after returning. Chat Mode remained functional, disconnect was clean, memory visibly dropped on each world reset, and no warning, malformed, trailing-data, or chunk-limit failure occurred.
+
+Phase 15 passed real localhost visual acceptance against offline-mode vanilla Java 26.1.2. Cubic rendered 329 real Overworld chunks with correct authoritative `min_y=-64`, height 384, depth, spatial orientation, and stable resize/minimize/restore behavior. The corrected right-handed camera matched vanilla without horizontal reflection. Overworld -> Nether -> Overworld transitions cleared prior GPU/CPU render state without stale geometry; Nether rendered with authoritative `min_y=0`, height 256, and 16 sections before Overworld reloaded. Near-player-first deterministic mesh scheduling replaced coordinate scanline completion, and the final visual loading-order retest passed. World Mode and Chat Mode remained isolated, Chat Mode retained bidirectional chat with zero loaded chunks, and shutdown was clean with no observed warnings, errors, or panics. Phase 15 does not add Minecraft models/textures, movement, entities, collision, or Phase 16 work.

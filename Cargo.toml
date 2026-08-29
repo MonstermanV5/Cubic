@@ -22,6 +22,7 @@ publish = false
 rust-version = "1.98"
 
 [workspace.dependencies]
+bytemuck = { version = "1.24.0", features = ["derive"] }
 aes = { version = "0.9.2", features = ["zeroize"] }
 base64 = "0.22.1"
 cfb8 = { version = "0.9.1", features = ["zeroize"] }

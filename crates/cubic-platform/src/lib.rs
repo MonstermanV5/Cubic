@@ -10,6 +10,7 @@ use std::{
 
 use cubic_render::{FrameStatus, Renderer, RendererInitError};
 use cubic_ui::{ChatMode, ChatSessionPort};
+use cubic_world::{BlockVisualProfile, WorldRenderUpdate};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -123,6 +124,180 @@ pub fn run_chat(port: Box<dyn ChatSessionPort>) -> Result<(), PlatformError> {
         Err(PlatformError::Startup(error))
     } else {
         Ok(())
+    }
+}
+
+/// Platform-neutral boundary implemented by application orchestration, not by the UI or renderer.
+pub trait WorldSessionPort {
+    fn take_world_update(&mut self) -> Option<WorldRenderUpdate>;
+    fn disconnect(&self);
+}
+
+/// Starts the Phase 15 diagnostic 3D world window.
+pub fn run_world(
+    port: Box<dyn WorldSessionPort>,
+    visual: BlockVisualProfile,
+) -> Result<(), PlatformError> {
+    let event_loop = EventLoop::new().map_err(PlatformError::CreateEventLoop)?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let mut application = WorldApplication::new(port, visual);
+    event_loop
+        .run_app(&mut application)
+        .map_err(PlatformError::RunEventLoop)?;
+    if let Some(error) = application.startup_error {
+        Err(PlatformError::Startup(error))
+    } else {
+        Ok(())
+    }
+}
+
+struct WorldApplication {
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    port: Box<dyn WorldSessionPort>,
+    visual: BlockVisualProfile,
+    startup_error: Option<StartupError>,
+    occluded: bool,
+}
+
+impl WorldApplication {
+    fn new(port: Box<dyn WorldSessionPort>, visual: BlockVisualProfile) -> Self {
+        Self {
+            window: None,
+            renderer: None,
+            port,
+            visual,
+            startup_error: None,
+            occluded: false,
+        }
+    }
+    fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), StartupError> {
+        let attributes = Window::default_attributes()
+            .with_title("Cubic — World Mode")
+            .with_resizable(true)
+            .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT));
+        let window = Arc::new(
+            event_loop
+                .create_window(attributes)
+                .map_err(StartupError::CreateWindow)?,
+        );
+        let mut renderer = pollster::block_on(Renderer::new(Arc::clone(&window)))
+            .map_err(StartupError::InitializeRenderer)?;
+        renderer.enable_world(self.visual.clone());
+        self.window = Some(Arc::clone(&window));
+        self.renderer = Some(renderer);
+        window.request_redraw();
+        Ok(())
+    }
+    fn request_redraw(&self) {
+        if !self.occluded
+            && self.renderer.as_ref().is_some_and(Renderer::is_renderable)
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+    }
+}
+
+impl ApplicationHandler for WorldApplication {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.renderer.is_none()
+            && self.startup_error.is_none()
+            && let Err(error) = self.initialize(event_loop)
+        {
+            tracing::error!(%error, "World Mode startup failed");
+            self.startup_error = Some(error);
+            event_loop.exit();
+        }
+    }
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.renderer = None;
+    }
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        if self
+            .window
+            .as_ref()
+            .is_none_or(|window| window.id() != window_id)
+        {
+            return;
+        }
+        match event {
+            WindowEvent::CloseRequested => {
+                self.port.disconnect();
+                event_loop.exit();
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.resize(size);
+                }
+                self.request_redraw();
+            }
+            WindowEvent::Occluded(value) => {
+                self.occluded = value;
+                if !value {
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                let Some(renderer) = &mut self.renderer else {
+                    return;
+                };
+                if let Err(error) = renderer.render_world() {
+                    tracing::error!(%error, "fatal World Mode rendering error");
+                    event_loop.exit();
+                }
+                if let Some(window) = &self.window {
+                    let stats = renderer.world_stats();
+                    let dimension = stats.dimension.as_deref().unwrap_or("awaiting world");
+                    let geometry = stats.geometry.map_or_else(
+                        || "y=? sections=?".to_owned(),
+                        |value| {
+                            format!(
+                                "y={} height={} sections={}",
+                                value.min_y,
+                                value.height,
+                                value.section_count()
+                            )
+                        },
+                    );
+                    let pose = stats.pose.map_or_else(
+                        || "pos=?".to_owned(),
+                        |value| format!("pos={:.1},{:.1},{:.1}", value.x, value.y, value.z),
+                    );
+                    window.set_title(&format!("Cubic — World Mode | {dimension} | {geometry} | {pose} | chunks={} meshes={} pending={}", stats.loaded_chunks, stats.meshed_chunks, stats.pending_meshes));
+                }
+            }
+            _ => {}
+        }
+    }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let mut changed = false;
+        while let Some(update) = self.port.take_world_update() {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.apply_world_update(update);
+                changed = true;
+            }
+        }
+        let pending = self
+            .renderer
+            .as_ref()
+            .is_some_and(Renderer::world_has_pending_work);
+        if changed || pending {
+            self.request_redraw();
+        }
+        let delay = if pending { 16 } else { 50 };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(delay),
+        ));
+    }
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.port.disconnect();
+        tracing::info!("Cubic World Mode stopped cleanly");
     }
 }
 

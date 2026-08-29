@@ -7,11 +7,13 @@ use cubic_auth::{
 };
 use cubic_network::{
     AuthenticatedLoginOptions, ChatSessionHandle, ChatSessionOptions, DevelopmentLoginOptions,
-    DevelopmentUsername, ServerAddress, StatusQueryOptions, authenticated_login, development_login,
-    query_server_status, run_authenticated_chat_session, run_development_chat_session,
+    DevelopmentUsername, ServerAddress, StatusQueryOptions, WorldRenderHandle, authenticated_login,
+    development_login, query_server_status, run_authenticated_chat_session,
+    run_development_chat_session, run_development_world_session,
 };
 use cubic_ui::ChatSessionPort;
-use cubic_version::MinecraftVersionId;
+use cubic_version::{GameData, MinecraftVersionId};
+use cubic_world::BlockVisualProfile;
 
 mod logging;
 
@@ -29,7 +31,7 @@ fn main() -> ExitCode {
         Ok(command) => command,
         Err(message) => {
             eprintln!(
-                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]\n  cubic-app dev-login <host[:port]> [--username <name>]\n  cubic-app chat <host[:port]> [--username <name> | --backend cubic-entra|xal]\n  cubic-app auth login [--backend cubic-entra|xal]\n  cubic-app auth status [--backend cubic-entra|xal]\n  cubic-app auth logout [--backend cubic-entra|xal]\n  cubic-app online-login <host[:port]> [--backend cubic-entra|xal]\n  cubic-app bootstrap-version <version-id> [--client-jar]"
+                "{message}\n\nUsage:\n  cubic-app\n  cubic-app status <host[:port]> [--protocol <number>]\n  cubic-app dev-login <host[:port]> [--username <name>]\n  cubic-app chat <host[:port]> [--username <name> | --backend cubic-entra|xal]\n  cubic-app world <host[:port]> [--username <name>]\n  cubic-app auth login [--backend cubic-entra|xal]\n  cubic-app auth status [--backend cubic-entra|xal]\n  cubic-app auth logout [--backend cubic-entra|xal]\n  cubic-app online-login <host[:port]> [--backend cubic-entra|xal]\n  cubic-app bootstrap-version <version-id> [--client-jar]"
             );
             return ExitCode::FAILURE;
         }
@@ -44,6 +46,7 @@ fn main() -> ExitCode {
             username,
             backend,
         } => run_chat(address, username, backend),
+        Command::World { address, username } => run_world(address, username),
         Command::Auth(action) => run_auth(action),
         Command::OnlineLogin { address, backend } => run_online_login(&address, backend),
         Command::BootstrapVersion {
@@ -561,6 +564,103 @@ async fn run_authenticated_chat_backend(
     }
 }
 
+fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode {
+    let Some(data_root) = cubic_platform::persistent_data_directory() else {
+        tracing::error!("platform data directory is unavailable");
+        return ExitCode::FAILURE;
+    };
+    let version = match MinecraftVersionId::new("26.1.2") {
+        Ok(version) => version,
+        Err(error) => {
+            tracing::error!(%error, "built-in world profile is invalid");
+            return ExitCode::FAILURE;
+        }
+    };
+    let data = match GameData::load(&data_root.join("generated").join("game-data"), &version) {
+        Ok(data) => data,
+        Err(error) => {
+            tracing::error!(%error, "World Mode requires the Phase 11 generated game-data artifact");
+            return ExitCode::FAILURE;
+        }
+    };
+    let visual = match BlockVisualProfile::from_game_data(&data) {
+        Ok(visual) => visual,
+        Err(error) => {
+            tracing::error!(%error, "could not classify renderable block states");
+            return ExitCode::FAILURE;
+        }
+    };
+    let options = ChatSessionOptions::default();
+    let (chat_handle, chat_runner) = ChatSessionHandle::bounded(&options);
+    let (world_handle, world_runner) = WorldRenderHandle::new();
+    let network_address = address.clone();
+    let network_username = username.clone();
+    let network = std::thread::Builder::new()
+        .name("cubic-world-network".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match runtime {
+                Ok(runtime) => {
+                    if let Err(error) = runtime.block_on(run_development_world_session(
+                        &network_address,
+                        &network_username,
+                        &options,
+                        chat_runner,
+                        world_runner,
+                    )) {
+                        tracing::error!(%error, "World Mode network task stopped");
+                    }
+                }
+                Err(error) => tracing::error!(%error, "could not create World Mode runtime"),
+            }
+        });
+    let network = match network {
+        Ok(network) => network,
+        Err(error) => {
+            tracing::error!(%error, "could not start World Mode network thread");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(address = %address, username = %username, "opening development World Mode");
+    let result = cubic_platform::run_world(
+        Box::new(NetworkWorldPort {
+            chat: chat_handle,
+            world: world_handle,
+        }),
+        visual,
+    );
+    if network.join().is_err() {
+        tracing::error!("World Mode network thread panicked");
+        return ExitCode::FAILURE;
+    }
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "Cubic World Mode stopped because initialization failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+struct NetworkWorldPort {
+    chat: ChatSessionHandle,
+    world: WorldRenderHandle,
+}
+
+impl cubic_platform::WorldSessionPort for NetworkWorldPort {
+    fn take_world_update(&mut self) -> Option<cubic_world::WorldRenderUpdate> {
+        while self.chat.try_next_event().is_some() {}
+        let _critical = self.chat.take_critical_event();
+        self.world.take_update()
+    }
+
+    fn disconnect(&self) {
+        let _result = self.chat.disconnect();
+    }
+}
+
 async fn complete_authenticated_chat<J: MinecraftSessionJoiner>(
     address: &ServerAddress,
     backend: AuthBackend,
@@ -742,6 +842,10 @@ enum Command {
         username: DevelopmentUsername,
         backend: Option<AuthBackend>,
     },
+    World {
+        address: ServerAddress,
+        username: DevelopmentUsername,
+    },
     Auth(AuthAction),
     OnlineLogin {
         address: ServerAddress,
@@ -818,6 +922,10 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     }
     if command == "chat" {
         return parse_chat(arguments);
+    }
+    if command == "world" {
+        return parse_server_and_username("world", arguments)
+            .map(|(address, username)| Command::World { address, username });
     }
     if command != "status" {
         return Err(format!("unknown command {command:?}"));
@@ -1049,6 +1157,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn world_command_is_separate_and_uses_the_bounded_development_identity() {
+        let command = parse_command([
+            "world".to_owned(),
+            "localhost:25565".to_owned(),
+            "--username".to_owned(),
+            "CubicTest2".to_owned(),
+        ])
+        .unwrap();
+        assert!(matches!(command, Command::World { address, username }
+            if address.port() == 25_565 && username.as_str() == "CubicTest2"));
+        assert!(parse_command(["world".to_owned()]).is_err());
     }
 
     #[test]

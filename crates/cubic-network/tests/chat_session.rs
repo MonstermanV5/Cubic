@@ -264,6 +264,27 @@ async fn bootstrap_to_play(stream: &mut TcpStream) {
         split_raw_packet(&reader.next(stream).await).unwrap().id,
         0x00
     );
+    let mut registry = CodecWriter::new();
+    registry
+        .write_string(
+            "minecraft:dimension_type",
+            StringLimits::new(32_767, 32_767),
+        )
+        .unwrap();
+    registry.write_var_int(1);
+    registry
+        .write_string("minecraft:overworld", StringLimits::new(32_767, 32_767))
+        .unwrap();
+    registry.write_bool(true);
+    registry.write_u8(10);
+    for (name, value) in [("min_y", -64_i32), ("height", 384_i32)] {
+        registry.write_u8(3);
+        registry.write_u16(name.len() as u16);
+        registry.write_bytes(name.as_bytes());
+        registry.write_i32(value);
+    }
+    registry.write_u8(0);
+    write_packet(stream, 0x07, registry.into_inner()).await;
     write_packet(stream, 0x03, Vec::new()).await;
     assert_eq!(
         split_raw_packet(&reader.next(stream).await).unwrap().id,

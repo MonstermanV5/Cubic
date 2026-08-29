@@ -103,6 +103,8 @@ pub enum DevelopmentLoginError {
     WireTransform { reason: String },
     #[error(transparent)]
     Protocol(#[from] BootstrapProtocolError),
+    #[error("invalid Configuration registry data: {0}")]
+    ConfigurationData(String),
     #[error("server disconnected during {state}: {reason}")]
     ServerDisconnect { state: &'static str, reason: String },
     #[error(

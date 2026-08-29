@@ -1,12 +1,12 @@
 use cubic_version::MinecraftIdentifier;
 use cubic_world::{
     AuthoritativeRotation, BlockCoordinates, Chunk, ChunkCoordinate, ChunkLightSummary,
-    ChunkSection, ClockState, Difficulty, DimensionTypeReference, EnterWorld, GameMode,
-    MAX_KNOWN_DIMENSIONS, MAX_RUNTIME_REGISTRIES, MAX_RUNTIME_REGISTRY_ENTRIES, MAX_WORLD_CLOCKS,
-    PalettedContainer, PlayerPositionUpdate, RelativeTransformFlags, ResetScope, Respawn,
-    RespawnRotation, RuntimeBiomeId, RuntimeBlockStateId, RuntimeRegistrySnapshot,
-    RuntimeRegistrySummary, SpawnContext, SpawnPoint, WorldBorder, WorldError, WorldEvent,
-    WorldLifecycle, WorldState, WorldTime,
+    ChunkSection, ClockState, Difficulty, DimensionGeometry, DimensionTypeReference, EnterWorld,
+    GameMode, MAX_KNOWN_DIMENSIONS, MAX_RUNTIME_REGISTRIES, MAX_RUNTIME_REGISTRY_ENTRIES,
+    MAX_WORLD_CLOCKS, PalettedContainer, PlayerPositionUpdate, RelativeTransformFlags, ResetScope,
+    Respawn, RespawnRotation, RuntimeBiomeId, RuntimeBlockStateId, RuntimeDimensionType,
+    RuntimeRegistrySnapshot, RuntimeRegistrySummary, SpawnContext, SpawnPoint, WorldBorder,
+    WorldError, WorldEvent, WorldLifecycle, WorldState, WorldTime,
 };
 
 fn id(value: &str) -> MinecraftIdentifier {
@@ -54,10 +54,26 @@ fn enter(dimension: &str) -> EnterWorld {
 fn active() -> WorldState {
     let mut state = WorldState::default();
     state.apply(WorldEvent::BeginConfiguration).unwrap();
+    install_dimensions(&mut state);
     state
         .apply(WorldEvent::EnterWorld(enter("example:moon")))
         .unwrap();
     state
+}
+
+fn install_dimensions(state: &mut WorldState) {
+    state
+        .apply(WorldEvent::RuntimeDimensionTypes(vec![
+            RuntimeDimensionType {
+                raw_id: 7,
+                identifier: id("example:dimension_type"),
+                geometry: DimensionGeometry {
+                    min_y: -64,
+                    height: 384,
+                },
+            },
+        ]))
+        .unwrap();
 }
 
 fn absolute_position(id: i32) -> PlayerPositionUpdate {
@@ -110,6 +126,7 @@ fn world_contents_and_connection_resets_clear_loaded_chunks() {
 
     state.apply(WorldEvent::LoadChunk(sample_chunk())).unwrap();
     state.apply(WorldEvent::BeginConfiguration).unwrap();
+    install_dimensions(&mut state);
     assert!(state.loaded_chunks().is_empty());
     state
         .apply(WorldEvent::EnterWorld(enter("example:moon")))
@@ -129,6 +146,7 @@ fn disconnected_configuration_and_enter_world_are_explicit() {
     ));
     let transition = state.apply(WorldEvent::BeginConfiguration).unwrap();
     assert_eq!(transition.reset, ResetScope::Connection);
+    install_dimensions(&mut state);
     state
         .apply(WorldEvent::EnterWorld(enter("example:moon")))
         .unwrap();
@@ -420,6 +438,7 @@ fn disconnect_and_new_configuration_never_reuse_old_session_state() {
     assert_eq!(state.lifecycle(), WorldLifecycle::Disconnected);
     assert!(state.session().is_none());
     state.apply(WorldEvent::BeginConfiguration).unwrap();
+    install_dimensions(&mut state);
     state
         .apply(WorldEvent::EnterWorld(enter("other:sky")))
         .unwrap();
@@ -466,6 +485,39 @@ fn runtime_registry_boundary_is_bounded_sorted_and_server_owned() {
         })),
         Err(WorldError::DuplicateRegistry)
     );
+}
+
+#[test]
+fn dimension_geometry_is_authoritative_validated_and_selected_by_raw_id() {
+    let mut state = WorldState::default();
+    state.apply(WorldEvent::BeginConfiguration).unwrap();
+    install_dimensions(&mut state);
+    state
+        .apply(WorldEvent::EnterWorld(enter("example:moon")))
+        .unwrap();
+    assert_eq!(
+        state.session().unwrap().dimension_geometry,
+        DimensionGeometry {
+            min_y: -64,
+            height: 384
+        }
+    );
+
+    let mut malformed = WorldState::default();
+    malformed.apply(WorldEvent::BeginConfiguration).unwrap();
+    assert!(matches!(
+        malformed.apply(WorldEvent::RuntimeDimensionTypes(vec![
+            RuntimeDimensionType {
+                raw_id: 7,
+                identifier: id("example:bad"),
+                geometry: DimensionGeometry {
+                    min_y: -63,
+                    height: 383
+                },
+            }
+        ])),
+        Err(WorldError::InvalidDimensionGeometry { .. })
+    ));
 }
 
 #[test]

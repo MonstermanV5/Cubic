@@ -140,6 +140,7 @@ pub async fn development_login(
 pub(crate) struct ConnectedPlay {
     pub(crate) connection: MinecraftConnection,
     pub(crate) initial_login: v775::InitialPlayLogin,
+    pub(crate) dimension_types: Vec<cubic_world::RuntimeDimensionType>,
     pub(crate) result: DevelopmentLoginResult,
 }
 
@@ -209,6 +210,7 @@ async fn connect_to_play_inner(
     Ok(ConnectedPlay {
         connection,
         initial_login: configuration.initial_login,
+        dimension_types: configuration.dimension_types,
         result: DevelopmentLoginResult {
             address: address.clone(),
             minecraft_version: profile.minecraft_version().clone(),
@@ -303,6 +305,7 @@ async fn run_login(
 pub(crate) struct ConfigurationOutcome {
     pub(crate) skipped_packets: usize,
     pub(crate) initial_login: v775::InitialPlayLogin,
+    pub(crate) dimension_types: Vec<cubic_world::RuntimeDimensionType>,
 }
 
 pub(crate) async fn run_configuration(
@@ -310,14 +313,19 @@ pub(crate) async fn run_configuration(
     state: &mut ConnectionState,
 ) -> Result<ConfigurationOutcome, DevelopmentLoginError> {
     let mut skipped_packets = 0_usize;
+    let mut dimension_types = Vec::new();
     for _ in 0..=MAX_RECONFIGURATIONS_DURING_ACCEPTANCE {
-        skipped_packets =
-            skipped_packets.saturating_add(run_configuration_phase(connection, state).await?);
+        let phase = run_configuration_phase(connection, state).await?;
+        skipped_packets = skipped_packets.saturating_add(phase.skipped_packets);
+        if !phase.dimension_types.is_empty() {
+            dimension_types = phase.dimension_types;
+        }
         match await_initial_play_login(connection, state).await? {
             PlayAcceptance::Login(initial_login) => {
                 return Ok(ConfigurationOutcome {
                     skipped_packets,
                     initial_login,
+                    dimension_types,
                 });
             }
             PlayAcceptance::Reconfigure => {}
@@ -329,11 +337,17 @@ pub(crate) async fn run_configuration(
     })
 }
 
+struct ConfigurationPhaseOutcome {
+    skipped_packets: usize,
+    dimension_types: Vec<cubic_world::RuntimeDimensionType>,
+}
+
 async fn run_configuration_phase(
     connection: &mut MinecraftConnection,
     state: &mut ConnectionState,
-) -> Result<usize, DevelopmentLoginError> {
+) -> Result<ConfigurationPhaseOutcome, DevelopmentLoginError> {
     let mut skipped_packets = 0_usize;
+    let mut dimension_types = Vec::new();
     for _ in 0..MAX_CONFIGURATION_PACKETS {
         let frame = connection
             .read_frame("Configuration packet read")
@@ -350,6 +364,15 @@ async fn run_configuration_phase(
             ConfigurationClientbound::CustomPayload { .. }
             | ConfigurationClientbound::Skipped { .. } => {
                 skipped_packets = skipped_packets.saturating_add(1);
+            }
+            ConfigurationClientbound::RegistryData { registry, entries } => {
+                skipped_packets = skipped_packets.saturating_add(1);
+                if registry == "minecraft:dimension_type" {
+                    dimension_types =
+                        crate::world_adapter::dimension_types(entries).map_err(|error| {
+                            DevelopmentLoginError::ConfigurationData(error.to_string())
+                        })?;
+                }
             }
             ConfigurationClientbound::Disconnect { reason } => {
                 let text = reason.get_string("text").map_or_else(
@@ -368,7 +391,10 @@ async fn run_configuration_phase(
                     .await
                     .map_err(map_connection_error)?;
                 transition(state, ConnectionState::Configuration, ConnectionState::Play)?;
-                return Ok(skipped_packets);
+                return Ok(ConfigurationPhaseOutcome {
+                    skipped_packets,
+                    dimension_types,
+                });
             }
             ConfigurationClientbound::KeepAlive { id } => {
                 let response = v775::encode_configuration_keep_alive(id)?;

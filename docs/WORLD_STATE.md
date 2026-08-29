@@ -1,6 +1,6 @@
 # World State
 
-Phase 13 introduced Cubic's first persistent semantic representation of an active Minecraft world session. Phase 14 extends it with bounded decoded chunks while entities, movement simulation, collision, and rendering remain absent.
+Phase 13 introduced Cubic's first persistent semantic representation of an active Minecraft world session. Phase 14 extends it with bounded decoded chunks, and Phase 15 adds authoritative dimension geometry plus a narrow read-only rendering handoff. Entities, movement simulation, and collision remain absent.
 
 ## Ownership and data flow
 
@@ -23,7 +23,7 @@ The explicit lifecycle is `Disconnected -> Configuring -> Active`. `BeginConfigu
 
 An active session records the player entity ID, hardcore and presentation flags, known dimensions, server view/simulation metadata, current dimension and dimension-type registry reference, hashed seed, game mode and previous mode, debug/flat flags, last-death location, portal cooldown, sea level, secure-chat enforcement, authoritative position/yaw/pitch and teleport ID, spawn point, clock updates, difficulty, weather, and initialized border data.
 
-Dimensions are validated `MinecraftIdentifier` values, not a vanilla-only enum, so custom namespaces remain valid. Current 26.1.2 dimension types arrive as server registry raw IDs; Cubic represents that unresolved reference explicitly instead of treating generated vanilla IDs as authoritative.
+Dimensions are validated `MinecraftIdentifier` values, not a vanilla-only enum, so custom namespaces remain valid. During Configuration, the protocol-775 adapter decodes bounded registry entries and extracts `min_y`/`height` from authoritative `minecraft:dimension_type` NBT. `WorldState` validates multiples of 16 and resolves the active raw reference without dimension-name heuristics.
 
 ## Registry boundary and limits
 
