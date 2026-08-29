@@ -90,6 +90,7 @@ pub async fn authenticated_login<J: MinecraftSessionJoiner>(
 
 pub(crate) struct AuthenticatedPlayConnection {
     pub(crate) connection: MinecraftConnection,
+    pub(crate) initial_login: v775::InitialPlayLogin,
     pub(crate) result: AuthenticatedLoginResult,
     pub(crate) secure_chat_rules: crate::secure_chat::SecureChatRules,
 }
@@ -237,12 +238,13 @@ async fn establish_authenticated_play_inner<J: MinecraftSessionJoiner>(
                     )
                     .await
                     .map_err(|error| AuthenticatedLoginError::Transport(error.to_string()))?;
-                run_configuration(&mut connection, &mut state)
+                let configuration = run_configuration(&mut connection, &mut state)
                     .await
                     .map_err(|error| AuthenticatedLoginError::Transport(error.to_string()))?;
                 tracing::info!(target: "network", "Configuration -> Play");
                 return Ok(AuthenticatedPlayConnection {
                     connection,
+                    initial_login: configuration.initial_login,
                     secure_chat_rules: profile.secure_chat_rules(),
                     result: AuthenticatedLoginResult {
                         address: address.clone(),

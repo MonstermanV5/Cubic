@@ -615,6 +615,7 @@ dependencies = [
  "cubic-core",
  "cubic-protocol",
  "cubic-version",
+ "cubic-world",
  "flate2",
  "rand_core 0.6.4",
  "rsa",
@@ -703,6 +704,10 @@ dependencies = [
 [[package]]
 name = "cubic-world"
 version = "0.1.0"
+dependencies = [
+ "cubic-version",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "cursor-icon"

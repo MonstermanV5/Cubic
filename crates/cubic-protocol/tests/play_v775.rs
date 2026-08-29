@@ -1,4 +1,6 @@
-use cubic_protocol::{CodecReader, FrameDecoder, FrameLimits, bootstrap::v775};
+use cubic_protocol::{
+    CodecReader, CodecWriter, FrameDecoder, FrameLimits, StringLimits, bootstrap::v775,
+};
 
 fn body(frame: &[u8]) -> Vec<u8> {
     let mut decoder = FrameDecoder::new(FrameLimits::new(2_097_151, 4 * 1024 * 1024).unwrap());
@@ -261,4 +263,146 @@ fn irrelevant_world_payload_is_identified_without_retention_model() {
             payload_bytes: 5
         }
     );
+}
+
+#[test]
+fn world_state_packets_have_independent_protocol_775_vectors() {
+    let mut position = CodecWriter::new();
+    position.write_var_int(0x48);
+    position.write_var_int(9);
+    for value in [1.0, 2.0, 3.0, 0.1, 0.2, 0.3] {
+        position.write_f64(value);
+    }
+    position.write_f32(90.0);
+    position.write_f32(-10.0);
+    position.write_u32(0x11);
+    let v775::PlayClientbound::PlayerPosition(decoded) =
+        v775::decode_play_clientbound(position.as_slice()).unwrap()
+    else {
+        panic!("expected Player Position")
+    };
+    assert_eq!(decoded.teleport_id, 9);
+    assert_eq!((decoded.x, decoded.y, decoded.z), (1.0, 2.0, 3.0));
+    assert_eq!(decoded.relative_flags, 0x11);
+
+    let mut respawn = CodecWriter::new();
+    respawn.write_var_int(0x52);
+    write_spawn_info(&mut respawn, "custom:dimension");
+    respawn.write_u8(3);
+    let v775::PlayClientbound::Respawn(decoded) =
+        v775::decode_play_clientbound(respawn.as_slice()).unwrap()
+    else {
+        panic!("expected Respawn")
+    };
+    assert_eq!(decoded.spawn.dimension, "custom:dimension");
+    assert_eq!(decoded.data_to_keep, 3);
+
+    let mut spawn = CodecWriter::new();
+    spawn.write_var_int(0x61);
+    spawn
+        .write_string("custom:dimension", StringLimits::new(256, 768))
+        .unwrap();
+    spawn.write_block_position(12, 80, -4).unwrap();
+    spawn.write_f32(45.0);
+    spawn.write_f32(5.0);
+    let v775::PlayClientbound::SetDefaultSpawnPosition(decoded) =
+        v775::decode_play_clientbound(spawn.as_slice()).unwrap()
+    else {
+        panic!("expected Set Default Spawn Position")
+    };
+    assert_eq!(decoded.position.position.x(), 12);
+    assert_eq!(decoded.yaw, 45.0);
+
+    let mut time = CodecWriter::new();
+    time.write_var_int(0x71);
+    time.write_i64(12_345);
+    time.write_var_int(1);
+    time.write_var_int(2);
+    time.write_var_long(6_000);
+    time.write_f32(0.5);
+    time.write_f32(1.0);
+    let v775::PlayClientbound::SetTime(decoded) =
+        v775::decode_play_clientbound(time.as_slice()).unwrap()
+    else {
+        panic!("expected Set Time")
+    };
+    assert_eq!(decoded.game_time, 12_345);
+    assert_eq!(decoded.clocks[0].clock_type_raw_id, 2);
+
+    assert!(matches!(
+        v775::decode_play_clientbound(&[0x0a, 0x03, 0x01]).unwrap(),
+        v775::PlayClientbound::ChangeDifficulty {
+            difficulty: 3,
+            locked: true
+        }
+    ));
+    assert!(matches!(
+        v775::decode_play_clientbound(&[0x26, 0x07, 0x3f, 0x00, 0x00, 0x00]).unwrap(),
+        v775::PlayClientbound::GameEvent {
+            event: 7,
+            value: 0.5
+        }
+    ));
+
+    let mut border = CodecWriter::new();
+    border.write_var_int(0x2b);
+    border.write_f64(1.0);
+    border.write_f64(2.0);
+    border.write_f64(1_000.0);
+    border.write_f64(500.0);
+    border.write_var_long(10_000);
+    border.write_var_int(29_999_984);
+    border.write_var_int(5);
+    border.write_var_int(15);
+    let v775::PlayClientbound::InitializeBorder(decoded) =
+        v775::decode_play_clientbound(border.as_slice()).unwrap()
+    else {
+        panic!("expected Initialize Border")
+    };
+    assert_eq!(decoded.lerp_millis, 10_000);
+    assert_eq!(decoded.warning_seconds, 15);
+}
+
+#[test]
+fn world_state_packet_counts_flags_and_trailing_data_are_rejected() {
+    let mut login = CodecWriter::new();
+    login.write_var_int(0x31);
+    login.write_i32(1);
+    login.write_bool(false);
+    login.write_var_int(1_025);
+    assert!(v775::decode_play_clientbound(login.as_slice()).is_err());
+
+    let mut position = CodecWriter::new();
+    position.write_var_int(0x48);
+    position.write_var_int(1);
+    for _ in 0..6 {
+        position.write_f64(0.0);
+    }
+    position.write_f32(0.0);
+    position.write_f32(0.0);
+    position.write_u32(0x0200);
+    assert!(v775::decode_play_clientbound(position.as_slice()).is_err());
+
+    let mut time = CodecWriter::new();
+    time.write_var_int(0x71);
+    time.write_i64(0);
+    time.write_var_int(65);
+    assert!(v775::decode_play_clientbound(time.as_slice()).is_err());
+
+    assert!(v775::decode_play_clientbound(&[0x0a, 0, 0, 0]).is_err());
+}
+
+fn write_spawn_info(writer: &mut CodecWriter, dimension: &str) {
+    writer.write_var_int(4);
+    writer
+        .write_string(dimension, StringLimits::new(256, 768))
+        .unwrap();
+    writer.write_i64(42);
+    writer.write_i8(1);
+    writer.write_u8(u8::MAX);
+    writer.write_bool(false);
+    writer.write_bool(true);
+    writer.write_bool(false);
+    writer.write_var_int(0);
+    writer.write_var_int(63);
 }

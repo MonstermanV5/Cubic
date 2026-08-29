@@ -37,6 +37,8 @@ pub const CHAT_ACKNOWLEDGEMENT_BYTES: usize = 3;
 pub const PLAYER_CHAT_SIGNATURE_BYTES: usize = 256;
 pub const MAX_PLAYER_PUBLIC_KEY_BYTES: usize = 512;
 pub const MAX_PLAYER_KEY_SIGNATURE_BYTES: usize = 4096;
+pub const MAX_KNOWN_DIMENSIONS: usize = 1_024;
+pub const MAX_WORLD_CLOCKS: usize = 64;
 
 const LOGIN_START_ID: i32 = 0x00;
 const LOGIN_DISCONNECT_ID: i32 = 0x00;
@@ -91,9 +93,12 @@ const PLAY_KEEP_ALIVE_RESPONSE_ID: i32 = 0x1c;
 const PLAY_PLAYER_LOADED_ID: i32 = 0x2c;
 const PLAY_PONG_ID: i32 = 0x2d;
 
+const PLAY_CHANGE_DIFFICULTY_ID: i32 = 0x0a;
 const PLAY_CHUNK_BATCH_FINISHED_ID: i32 = 0x0b;
 const PLAY_COOKIE_REQUEST_ID: i32 = 0x15;
 const PLAY_CUSTOM_PAYLOAD_ID: i32 = 0x18;
+const PLAY_GAME_EVENT_ID: i32 = 0x26;
+const PLAY_INITIALIZE_BORDER_ID: i32 = 0x2b;
 const PLAY_RESOURCE_PACK_PUSH_ID: i32 = 0x51;
 const PLAY_TRANSFER_ID: i32 = 0x81;
 const PLAY_DISCONNECT_ID: i32 = 0x20;
@@ -102,7 +107,10 @@ const PLAY_KEEP_ALIVE_ID: i32 = 0x2c;
 const PLAY_PING_ID: i32 = 0x3d;
 const PLAY_PLAYER_CHAT_ID: i32 = 0x41;
 const PLAY_PLAYER_POSITION_ID: i32 = 0x48;
+const PLAY_RESPAWN_ID: i32 = 0x52;
+const PLAY_SET_DEFAULT_SPAWN_POSITION_ID: i32 = 0x61;
 const PLAY_SET_HEALTH_ID: i32 = 0x68;
+const PLAY_SET_TIME_ID: i32 = 0x71;
 const PLAY_START_CONFIGURATION_ID: i32 = 0x76;
 const PLAY_SYSTEM_CHAT_ID: i32 = 0x79;
 
@@ -116,6 +124,7 @@ const KNOWN_PACK_NAMESPACE_LIMITS: StringLimits = StringLimits::new(64, 192);
 const KNOWN_PACK_ID_LIMITS: StringLimits = StringLimits::new(256, 768);
 const KNOWN_PACK_VERSION_LIMITS: StringLimits = StringLimits::new(128, 384);
 const CHAT_LIMITS: StringLimits = StringLimits::new(MAX_CHAT_UTF16_UNITS, 768);
+const RESOURCE_LOCATION_LIMITS: StringLimits = StringLimits::new(256, 768);
 
 /// Packet identities/IDs already proven by Cubic's protocol-775 bootstrap.
 ///
@@ -680,16 +689,26 @@ impl ChatLastSeenUpdate {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayClientbound {
-    Login,
+    Login(InitialPlayLogin),
     KeepAlive {
         id: i64,
     },
     Ping {
         id: i32,
     },
-    PlayerPosition {
-        teleport_id: i32,
+    PlayerPosition(PlayerPosition),
+    Respawn(Respawn),
+    SetDefaultSpawnPosition(DefaultSpawnPosition),
+    SetTime(WorldTime),
+    ChangeDifficulty {
+        difficulty: i32,
+        locked: bool,
     },
+    GameEvent {
+        event: u8,
+        value: f32,
+    },
+    InitializeBorder(InitializeBorder),
     ChunkBatchFinished {
         chunks: i32,
     },
@@ -732,6 +751,94 @@ pub enum PlayClientbound {
         packet_id: i32,
         payload_bytes: usize,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalPosition {
+    pub dimension: String,
+    pub position: crate::BlockPosition,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpawnInfo {
+    pub dimension_type_raw_id: i32,
+    pub dimension: String,
+    pub hashed_seed: i64,
+    pub game_mode: i8,
+    pub previous_game_mode: u8,
+    pub debug_world: bool,
+    pub flat_world: bool,
+    pub last_death_location: Option<GlobalPosition>,
+    pub portal_cooldown_ticks: i32,
+    pub sea_level: i32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InitialPlayLogin {
+    pub player_entity_id: i32,
+    pub hardcore: bool,
+    pub known_dimensions: Vec<String>,
+    pub max_players: i32,
+    pub view_distance: i32,
+    pub simulation_distance: i32,
+    pub reduced_debug_info: bool,
+    pub show_death_screen: bool,
+    pub limited_crafting: bool,
+    pub spawn: SpawnInfo,
+    pub secure_chat_enforced: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayerPosition {
+    pub teleport_id: i32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub delta_x: f64,
+    pub delta_y: f64,
+    pub delta_z: f64,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub relative_flags: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Respawn {
+    pub spawn: SpawnInfo,
+    pub data_to_keep: u8,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DefaultSpawnPosition {
+    pub position: GlobalPosition,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldClock {
+    pub clock_type_raw_id: i32,
+    pub total_ticks: i64,
+    pub partial_tick: f32,
+    pub rate: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorldTime {
+    pub game_time: i64,
+    pub clocks: Vec<WorldClock>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InitializeBorder {
+    pub center_x: f64,
+    pub center_z: f64,
+    pub old_diameter: f64,
+    pub new_diameter: f64,
+    pub lerp_millis: i64,
+    pub absolute_max_size: i32,
+    pub warning_blocks: i32,
+    pub warning_seconds: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -790,8 +897,6 @@ pub enum BootstrapProtocolError {
         length: usize,
         max: usize,
     },
-    #[error("initial Play Login packet has no payload")]
-    EmptyInitialPlayLogin,
 }
 
 pub fn encode_login_start(
@@ -1032,11 +1137,12 @@ pub fn decode_play_clientbound(
     let packet = split_raw_packet(frame_body)?;
     let mut reader = CodecReader::new(packet.payload);
     match packet.id {
-        INITIAL_PLAY_LOGIN_ID => {
-            if packet.payload.is_empty() {
-                return Err(BootstrapProtocolError::EmptyInitialPlayLogin);
-            }
-            Ok(PlayClientbound::Login)
+        INITIAL_PLAY_LOGIN_ID => decode_initial_play_login(&mut reader).map(PlayClientbound::Login),
+        PLAY_CHANGE_DIFFICULTY_ID => {
+            let difficulty = reader.read_var_int()?;
+            let locked = reader.read_bool()?;
+            require_consumed(&reader, "Change Difficulty")?;
+            Ok(PlayClientbound::ChangeDifficulty { difficulty, locked })
         }
         PLAY_KEEP_ALIVE_ID => {
             let id = reader.read_i64()?;
@@ -1049,16 +1155,21 @@ pub fn decode_play_clientbound(
             Ok(PlayClientbound::Ping { id })
         }
         PLAY_PLAYER_POSITION_ID => {
-            let teleport_id = reader.read_var_int()?;
-            if reader.remaining() < 60 {
-                return Err(CodecError::UnexpectedEnd {
-                    context: "Play Player Position",
-                    needed: 60,
-                    remaining: reader.remaining(),
-                }
-                .into());
-            }
-            Ok(PlayClientbound::PlayerPosition { teleport_id })
+            decode_player_position(&mut reader).map(PlayClientbound::PlayerPosition)
+        }
+        PLAY_RESPAWN_ID => decode_respawn(&mut reader).map(PlayClientbound::Respawn),
+        PLAY_SET_DEFAULT_SPAWN_POSITION_ID => {
+            decode_default_spawn_position(&mut reader).map(PlayClientbound::SetDefaultSpawnPosition)
+        }
+        PLAY_SET_TIME_ID => decode_world_time(&mut reader).map(PlayClientbound::SetTime),
+        PLAY_GAME_EVENT_ID => {
+            let event = reader.read_u8()?;
+            let value = reader.read_f32()?;
+            require_consumed(&reader, "Game Event")?;
+            Ok(PlayClientbound::GameEvent { event, value })
+        }
+        PLAY_INITIALIZE_BORDER_ID => {
+            decode_initialize_border(&mut reader).map(PlayClientbound::InitializeBorder)
         }
         PLAY_CHUNK_BATCH_FINISHED_ID => {
             let chunks = reader.read_var_int()?;
@@ -1128,6 +1239,155 @@ pub fn decode_play_clientbound(
             payload_bytes: packet.payload.len(),
         }),
     }
+}
+
+fn decode_initial_play_login(
+    reader: &mut CodecReader<'_>,
+) -> Result<InitialPlayLogin, BootstrapProtocolError> {
+    let player_entity_id = reader.read_i32()?;
+    let hardcore = reader.read_bool()?;
+    let dimension_count = read_count(reader, "known dimension", MAX_KNOWN_DIMENSIONS)?;
+    let mut known_dimensions = Vec::new();
+    known_dimensions
+        .try_reserve(dimension_count)
+        .map_err(|_| CodecError::AllocationFailed {
+            context: "known dimensions",
+            requested: dimension_count,
+        })?;
+    for _ in 0..dimension_count {
+        known_dimensions.push(reader.read_string(RESOURCE_LOCATION_LIMITS)?.to_owned());
+    }
+    let result = InitialPlayLogin {
+        player_entity_id,
+        hardcore,
+        known_dimensions,
+        max_players: reader.read_var_int()?,
+        view_distance: reader.read_var_int()?,
+        simulation_distance: reader.read_var_int()?,
+        reduced_debug_info: reader.read_bool()?,
+        show_death_screen: reader.read_bool()?,
+        limited_crafting: reader.read_bool()?,
+        spawn: decode_spawn_info(reader)?,
+        secure_chat_enforced: reader.read_bool()?,
+    };
+    require_consumed(reader, "initial Play Login")?;
+    Ok(result)
+}
+
+fn decode_spawn_info(reader: &mut CodecReader<'_>) -> Result<SpawnInfo, BootstrapProtocolError> {
+    Ok(SpawnInfo {
+        dimension_type_raw_id: reader.read_var_int()?,
+        dimension: reader.read_string(RESOURCE_LOCATION_LIMITS)?.to_owned(),
+        hashed_seed: reader.read_i64()?,
+        game_mode: reader.read_i8()?,
+        previous_game_mode: reader.read_u8()?,
+        debug_world: reader.read_bool()?,
+        flat_world: reader.read_bool()?,
+        last_death_location: if reader.read_bool()? {
+            Some(decode_global_position(reader)?)
+        } else {
+            None
+        },
+        portal_cooldown_ticks: reader.read_var_int()?,
+        sea_level: reader.read_var_int()?,
+    })
+}
+
+fn decode_global_position(
+    reader: &mut CodecReader<'_>,
+) -> Result<GlobalPosition, BootstrapProtocolError> {
+    Ok(GlobalPosition {
+        dimension: reader.read_string(RESOURCE_LOCATION_LIMITS)?.to_owned(),
+        position: reader.read_block_position()?,
+    })
+}
+
+fn decode_player_position(
+    reader: &mut CodecReader<'_>,
+) -> Result<PlayerPosition, BootstrapProtocolError> {
+    let result = PlayerPosition {
+        teleport_id: reader.read_var_int()?,
+        x: reader.read_f64()?,
+        y: reader.read_f64()?,
+        z: reader.read_f64()?,
+        delta_x: reader.read_f64()?,
+        delta_y: reader.read_f64()?,
+        delta_z: reader.read_f64()?,
+        yaw: reader.read_f32()?,
+        pitch: reader.read_f32()?,
+        relative_flags: reader.read_u32()?,
+    };
+    if result.relative_flags & !0x01ff != 0 {
+        return Err(CodecError::ValueOutOfRange {
+            context: "Player Position relative flags",
+            value: i128::from(result.relative_flags),
+            min: 0,
+            max: 0x01ff,
+        }
+        .into());
+    }
+    require_consumed(reader, "Play Player Position")?;
+    Ok(result)
+}
+
+fn decode_respawn(reader: &mut CodecReader<'_>) -> Result<Respawn, BootstrapProtocolError> {
+    let result = Respawn {
+        spawn: decode_spawn_info(reader)?,
+        data_to_keep: reader.read_u8()?,
+    };
+    require_consumed(reader, "Play Respawn")?;
+    Ok(result)
+}
+
+fn decode_default_spawn_position(
+    reader: &mut CodecReader<'_>,
+) -> Result<DefaultSpawnPosition, BootstrapProtocolError> {
+    let result = DefaultSpawnPosition {
+        position: decode_global_position(reader)?,
+        yaw: reader.read_f32()?,
+        pitch: reader.read_f32()?,
+    };
+    require_consumed(reader, "Set Default Spawn Position")?;
+    Ok(result)
+}
+
+fn decode_world_time(reader: &mut CodecReader<'_>) -> Result<WorldTime, BootstrapProtocolError> {
+    let game_time = reader.read_i64()?;
+    let count = read_count(reader, "world clock", MAX_WORLD_CLOCKS)?;
+    let mut clocks = Vec::new();
+    clocks
+        .try_reserve(count)
+        .map_err(|_| CodecError::AllocationFailed {
+            context: "world clocks",
+            requested: count,
+        })?;
+    for _ in 0..count {
+        clocks.push(WorldClock {
+            clock_type_raw_id: reader.read_var_int()?,
+            total_ticks: reader.read_var_long()?,
+            partial_tick: reader.read_f32()?,
+            rate: reader.read_f32()?,
+        });
+    }
+    require_consumed(reader, "Set Time")?;
+    Ok(WorldTime { game_time, clocks })
+}
+
+fn decode_initialize_border(
+    reader: &mut CodecReader<'_>,
+) -> Result<InitializeBorder, BootstrapProtocolError> {
+    let result = InitializeBorder {
+        center_x: reader.read_f64()?,
+        center_z: reader.read_f64()?,
+        old_diameter: reader.read_f64()?,
+        new_diameter: reader.read_f64()?,
+        lerp_millis: reader.read_var_long()?,
+        absolute_max_size: reader.read_var_int()?,
+        warning_blocks: reader.read_var_int()?,
+        warning_seconds: reader.read_var_int()?,
+    };
+    require_consumed(reader, "Initialize World Border")?;
+    Ok(result)
 }
 
 pub fn encode_play_keep_alive(id: i64) -> Result<Vec<u8>, BootstrapProtocolError> {

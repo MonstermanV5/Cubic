@@ -10,6 +10,7 @@ mod online_login;
 mod secure_chat;
 mod status;
 mod transforms;
+mod world_adapter;
 
 pub use address::{DEFAULT_MINECRAFT_PORT, ServerAddress, ServerAddressError};
 pub use chat_session::{

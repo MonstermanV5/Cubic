@@ -17,6 +17,33 @@ use tokio::{
 
 const TEST_UUID: u128 = 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff;
 
+fn initial_play_login_payload() -> Vec<u8> {
+    let mut writer = CodecWriter::new();
+    let limits = StringLimits::new(256, 768);
+    writer.write_i32(7);
+    writer.write_bool(false);
+    writer.write_var_int(1);
+    writer.write_string("minecraft:overworld", limits).unwrap();
+    writer.write_var_int(20);
+    writer.write_var_int(10);
+    writer.write_var_int(10);
+    writer.write_bool(false);
+    writer.write_bool(true);
+    writer.write_bool(false);
+    writer.write_var_int(0);
+    writer.write_string("minecraft:overworld", limits).unwrap();
+    writer.write_i64(0);
+    writer.write_i8(0);
+    writer.write_u8(u8::MAX);
+    writer.write_bool(false);
+    writer.write_bool(false);
+    writer.write_bool(false);
+    writer.write_var_int(0);
+    writer.write_var_int(63);
+    writer.write_bool(false);
+    writer.into_inner()
+}
+
 #[derive(Clone, Copy)]
 enum MockMode {
     Success {
@@ -215,7 +242,7 @@ async fn spawn_mock(mode: MockMode) -> (ServerAddress, JoinHandle<Observation>) 
             }
             _ => {}
         }
-        write_packet(&mut stream, 0x31, vec![0x01]).await;
+        write_packet(&mut stream, 0x31, initial_play_login_payload()).await;
         observation
     });
     (address, task)

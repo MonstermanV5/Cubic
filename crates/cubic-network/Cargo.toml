@@ -13,6 +13,7 @@ cubic-auth = { path = "../cubic-auth" }
 cubic-core = { path = "../cubic-core" }
 cubic-protocol = { path = "../cubic-protocol" }
 cubic-version = { path = "../cubic-version" }
+cubic-world = { path = "../cubic-world" }
 flate2.workspace = true
 rand_core_06.workspace = true
 rsa.workspace = true

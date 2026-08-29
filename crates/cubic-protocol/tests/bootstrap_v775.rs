@@ -1,5 +1,5 @@
 use cubic_protocol::{
-    CodecError, FrameDecoder, FrameLimits, ProtocolUuid,
+    CodecError, CodecWriter, FrameDecoder, FrameLimits, ProtocolUuid, StringLimits,
     bootstrap::v775::{
         self, BootstrapProtocolError, ClientInformation, ConfigurationClientbound,
         LoginClientbound, PlayClientbound,
@@ -11,6 +11,38 @@ fn body(encoded_frame: &[u8]) -> Vec<u8> {
     let mut decoder = FrameDecoder::new(FrameLimits::new(2_097_151, 4 * 1024 * 1024).unwrap());
     decoder.push(encoded_frame).unwrap();
     decoder.next_frame().unwrap().unwrap()
+}
+
+fn initial_play_login_body() -> Vec<u8> {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(0x31);
+    write_initial_play_login_payload(&mut writer);
+    writer.into_inner()
+}
+
+fn write_initial_play_login_payload(writer: &mut CodecWriter) {
+    let limits = StringLimits::new(256, 768);
+    writer.write_i32(7);
+    writer.write_bool(false);
+    writer.write_var_int(1);
+    writer.write_string("example:moon", limits).unwrap();
+    writer.write_var_int(20);
+    writer.write_var_int(10);
+    writer.write_var_int(8);
+    writer.write_bool(false);
+    writer.write_bool(true);
+    writer.write_bool(false);
+    writer.write_var_int(3);
+    writer.write_string("example:moon", limits).unwrap();
+    writer.write_i64(42);
+    writer.write_i8(1);
+    writer.write_u8(u8::MAX);
+    writer.write_bool(false);
+    writer.write_bool(true);
+    writer.write_bool(false);
+    writer.write_var_int(0);
+    writer.write_var_int(63);
+    writer.write_bool(true);
 }
 
 #[test]
@@ -194,12 +226,17 @@ fn known_pack_count_and_configuration_disconnect_are_bounded() {
 #[test]
 fn play_decoder_identifies_login_without_rejecting_other_legal_packets() {
     assert!(matches!(
-        v775::decode_play_clientbound(&[0x31, 0x01]),
-        Ok(PlayClientbound::Login)
+        v775::decode_play_clientbound(&initial_play_login_body()),
+        Ok(PlayClientbound::Login(login))
+            if login.player_entity_id == 7
+                && login.spawn.dimension == "example:moon"
+                && login.spawn.dimension_type_raw_id == 3
     ));
     assert!(matches!(
         v775::decode_play_clientbound(&[0x31]),
-        Err(BootstrapProtocolError::EmptyInitialPlayLogin)
+        Err(BootstrapProtocolError::Codec(
+            CodecError::UnexpectedEnd { .. }
+        ))
     ));
     let mut custom_payload = vec![0x18, 0x0f];
     custom_payload.extend_from_slice(b"minecraft:brand");

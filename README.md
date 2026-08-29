@@ -4,11 +4,11 @@
 
 Cubic is an independent project intended to become a Minecraft: Java Edition-compatible multiplayer client, primarily implemented in Rust.
 
-Cubic does not contain Mojang or Microsoft code or assets. Minecraft gameplay and world rendering have not yet been implemented. The repository currently contains the architectural scaffold, native graphics bootstrap, low-level protocol/NBT foundations, bounded server-list Status query, version-data architecture, completed Chat Mode/authenticated secure-chat foundations, persistent local diagnostics, and an in-progress official version/resource bootstrap.
+Cubic does not contain Mojang or Microsoft code or assets. Minecraft gameplay and world rendering have not yet been implemented. The repository currently contains the architectural scaffold, native graphics bootstrap, low-level protocol/NBT foundations, bounded server-list Status query, version-data architecture, completed Chat Mode/authenticated secure-chat and generated-data foundations, persistent local diagnostics, and the Phase 13 semantic world-state model.
 
 ## Current state
 
-With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status` queries a server list entry, and `dev-login` retains the completed Phase 7 one-shot acceptance path. `chat` opens Cubic's full-window, low-idle-redraw Chat Mode and runs its persistent network task independently of the UI. The original `--username` path remains the offline development mode; `chat <server> --backend xal` selects the authenticated experimental-XAL path. Java 26.1.2 / protocol 775 is the first manually implemented reference profile, not Cubic's permanent compatibility boundary. Game/world state, Minecraft resources, and 3D gameplay remain unimplemented.
+With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status` queries a server list entry, and `dev-login` retains the completed Phase 7 one-shot acceptance path. `chat` opens Cubic's full-window, low-idle-redraw Chat Mode and runs its persistent network task independently of the UI. The original `--username` path remains the offline development mode; `chat <server> --backend xal` selects the authenticated experimental-XAL path. Java 26.1.2 / protocol 775 is the first manually implemented reference profile, not Cubic's permanent compatibility boundary. Phase 13 now maintains small authoritative session/dimension/position metadata during Chat Mode, but chunks, entities, movement, Minecraft resources, and 3D gameplay remain unimplemented. See `docs/WORLD_STATE.md`.
 
 ## Build and validate
 

@@ -15,6 +15,7 @@ use cubic_protocol::{
     bootstrap::v775::{self, ClientInformation, PlayClientbound, TextComponent},
     nbt::{NbtCompound, NbtTag},
 };
+use cubic_world::{WorldEvent, WorldState};
 use rand_core_06::{OsRng, RngCore};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -153,6 +154,10 @@ pub enum ChatSessionError {
     InvalidMessage { reason: &'static str },
     #[error("persistent Chat Mode does not support server {feature}")]
     UnsupportedServerFeature { feature: &'static str },
+    #[error("world packet adaptation failed: {0}")]
+    WorldAdapter(String),
+    #[error("world state update failed: {0}")]
+    WorldState(#[from] cubic_world::WorldError),
     #[error(
         "commands are not supported in Phase 8 because signable command arguments are not available"
     )]
@@ -178,6 +183,7 @@ pub async fn run_development_chat_session(
         &mut connected.connection,
         ChatSecurity::UnsignedDevelopment,
         runner,
+        connected.initial_login,
     )
     .await
 }
@@ -207,7 +213,13 @@ pub async fn run_authenticated_chat_session<J: MinecraftSessionJoiner>(
         sender,
         random_session_uuid(),
     )));
-    run_play_session(&mut connected.connection, security, runner).await
+    run_play_session(
+        &mut connected.connection,
+        security,
+        runner,
+        connected.initial_login,
+    )
+    .await
 }
 
 enum ChatSecurity {
@@ -219,7 +231,12 @@ async fn run_play_session(
     connection: &mut crate::connection::MinecraftConnection,
     mut security: ChatSecurity,
     mut runner: ChatSessionRunner,
+    initial_login: v775::InitialPlayLogin,
 ) -> Result<(), ChatSessionError> {
+    let mut world = WorldState::default();
+    world.apply(WorldEvent::BeginConfiguration)?;
+    world.apply(crate::world_adapter::initial_world_event(initial_login)?)?;
+    tracing::info!(target: "world", summary = %world.summary(), "entered authoritative world state");
     runner.event(ChatEvent::Connected);
 
     let information = v775::encode_play_client_information(&ClientInformation::default())?;
@@ -249,7 +266,11 @@ async fn run_play_session(
                             runner.event(ChatEvent::Warning(error.to_string()));
                         }
                     }
-                    Some(ChatSessionCommand::Disconnect) | None => return Ok(()),
+                    Some(ChatSessionCommand::Disconnect) | None => {
+                        world.apply(WorldEvent::Disconnect)?;
+                        tracing::info!(target: "world", summary = %world.summary(), "left authoritative world state");
+                        return Ok(());
+                    }
                 }
             }
             frame = connection.read_frame_unbounded("persistent Play packet read") => {
@@ -261,15 +282,20 @@ async fn run_play_session(
                         return Err(ChatSessionError::Transport(reason));
                     }
                 };
-                match v775::decode_play_clientbound(&frame)? {
+                let packet = v775::decode_play_clientbound(&frame)?;
+                if let Some(event) = crate::world_adapter::play_world_event(&packet)? {
+                    let transition = world.apply(event)?;
+                    tracing::debug!(target: "world", summary = %world.summary(), reset = ?transition.reset, dimension_changed = transition.dimension_changed, "applied authoritative world update");
+                }
+                match packet {
                     PlayClientbound::KeepAlive { id } => {
                         write(connection, v775::encode_play_keep_alive(id)?, "Play Keep Alive response write").await?;
                     }
                     PlayClientbound::Ping { id } => {
                         write(connection, v775::encode_play_pong(id)?, "Play Pong write").await?;
                     }
-                    PlayClientbound::PlayerPosition { teleport_id } => {
-                        write(connection, v775::encode_play_teleport_confirmation(teleport_id)?, "Play Teleport Confirmation write").await?;
+                    PlayClientbound::PlayerPosition(position) => {
+                        write(connection, v775::encode_play_teleport_confirmation(position.teleport_id)?, "Play Teleport Confirmation write").await?;
                     }
                     PlayClientbound::ChunkBatchFinished { .. } => {
                         write(connection, v775::encode_play_chunk_batch_received(1.0)?, "Play Chunk Batch Received write").await?;
@@ -358,13 +384,21 @@ async fn run_play_session(
                         }
                     }
                     PlayClientbound::Disconnect { reason } => {
+                        world.apply(WorldEvent::Disconnect)?;
+                        tracing::info!(target: "world", summary = %world.summary(), "server disconnected world state");
                         runner.critical(ChatEvent::Disconnected { reason: reason.plain_text });
                         return Ok(());
                     }
                     PlayClientbound::Health { health } if health <= 6.0 => {
                         runner.event(ChatEvent::Warning(format!("Low health: {health:.1}")));
                     }
-                    PlayClientbound::Login
+                    PlayClientbound::Login(_)
+                    | PlayClientbound::Respawn(_)
+                    | PlayClientbound::SetDefaultSpawnPosition(_)
+                    | PlayClientbound::SetTime(_)
+                    | PlayClientbound::ChangeDifficulty { .. }
+                    | PlayClientbound::GameEvent { .. }
+                    | PlayClientbound::InitializeBorder(_)
                     | PlayClientbound::Health { .. }
                     | PlayClientbound::CustomPayload { .. }
                     | PlayClientbound::Ignored { .. } => {}
@@ -379,10 +413,13 @@ async fn run_play_session(
                         });
                     }
                     PlayClientbound::StartConfiguration => {
+                        world.apply(WorldEvent::BeginConfiguration)?;
                         write(connection, v775::encode_play_acknowledge_configuration()?, "Play Configuration Acknowledged write").await?;
                         write(connection, v775::encode_client_information(&ClientInformation::default())?, "Reconfiguration Client Information write").await?;
                         let mut state = ConnectionState::Configuration;
-                        let _skipped = run_configuration(connection, &mut state).await?;
+                        let configuration = run_configuration(connection, &mut state).await?;
+                        world.apply(crate::world_adapter::initial_world_event(configuration.initial_login)?)?;
+                        tracing::info!(target: "world", summary = %world.summary(), "reconfiguration replaced authoritative world state");
                         if let ChatSecurity::Authenticated(session) = &mut security {
                             session.reset(random_session_uuid());
                             write_session_update(connection, session).await?;
@@ -429,6 +466,12 @@ async fn send_chat(
 impl From<SecureChatError> for ChatSessionError {
     fn from(error: SecureChatError) -> Self {
         Self::SecureChat(error.to_string())
+    }
+}
+
+impl From<crate::world_adapter::WorldAdapterError> for ChatSessionError {
+    fn from(error: crate::world_adapter::WorldAdapterError) -> Self {
+        Self::WorldAdapter(error.to_string())
     }
 }
 
@@ -604,6 +647,33 @@ mod tests {
         }
     }
 
+    fn initial_login() -> v775::InitialPlayLogin {
+        v775::InitialPlayLogin {
+            player_entity_id: 7,
+            hardcore: false,
+            known_dimensions: vec!["minecraft:overworld".to_owned()],
+            max_players: 20,
+            view_distance: 10,
+            simulation_distance: 10,
+            reduced_debug_info: false,
+            show_death_screen: true,
+            limited_crafting: false,
+            spawn: v775::SpawnInfo {
+                dimension_type_raw_id: 0,
+                dimension: "minecraft:overworld".to_owned(),
+                hashed_seed: 0,
+                game_mode: 0,
+                previous_game_mode: u8::MAX,
+                debug_world: false,
+                flat_world: false,
+                last_death_location: None,
+                portal_cooldown_ticks: 0,
+                sea_level: 63,
+            },
+            secure_chat_enforced: true,
+        }
+    }
+
     async fn read_test_frame(stream: &mut TcpStream, decoder: &mut FrameDecoder) -> Vec<u8> {
         let mut buffer = [0_u8; 1024];
         loop {
@@ -689,8 +759,9 @@ mod tests {
             cubic_protocol::ProtocolUuid::from_u128(1),
             cubic_protocol::ProtocolUuid::from_u128(2),
         )));
-        let session =
-            tokio::spawn(async move { run_play_session(&mut connection, security, runner).await });
+        let session = tokio::spawn(async move {
+            run_play_session(&mut connection, security, runner, initial_login()).await
+        });
 
         let mut decoder = FrameDecoder::new(limits);
         assert_eq!(

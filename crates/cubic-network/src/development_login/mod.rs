@@ -139,6 +139,7 @@ pub async fn development_login(
 
 pub(crate) struct ConnectedPlay {
     pub(crate) connection: MinecraftConnection,
+    pub(crate) initial_login: v775::InitialPlayLogin,
     pub(crate) result: DevelopmentLoginResult,
 }
 
@@ -203,10 +204,11 @@ async fn connect_to_play_inner(
         .map_err(map_connection_error)?;
 
     let profile_uuid = run_login(&mut connection, username, &mut state).await?;
-    let skipped_configuration_packets = run_configuration(&mut connection, &mut state).await?;
+    let configuration = run_configuration(&mut connection, &mut state).await?;
 
     Ok(ConnectedPlay {
         connection,
+        initial_login: configuration.initial_login,
         result: DevelopmentLoginResult {
             address: address.clone(),
             minecraft_version: profile.minecraft_version().clone(),
@@ -214,7 +216,7 @@ async fn connect_to_play_inner(
             username: username.clone(),
             profile_uuid,
             state,
-            skipped_configuration_packets,
+            skipped_configuration_packets: configuration.skipped_packets,
         },
     })
 }
@@ -298,16 +300,26 @@ async fn run_login(
     })
 }
 
+pub(crate) struct ConfigurationOutcome {
+    pub(crate) skipped_packets: usize,
+    pub(crate) initial_login: v775::InitialPlayLogin,
+}
+
 pub(crate) async fn run_configuration(
     connection: &mut MinecraftConnection,
     state: &mut ConnectionState,
-) -> Result<usize, DevelopmentLoginError> {
+) -> Result<ConfigurationOutcome, DevelopmentLoginError> {
     let mut skipped_packets = 0_usize;
     for _ in 0..=MAX_RECONFIGURATIONS_DURING_ACCEPTANCE {
         skipped_packets =
             skipped_packets.saturating_add(run_configuration_phase(connection, state).await?);
         match await_initial_play_login(connection, state).await? {
-            PlayAcceptance::Login => return Ok(skipped_packets),
+            PlayAcceptance::Login(initial_login) => {
+                return Ok(ConfigurationOutcome {
+                    skipped_packets,
+                    initial_login,
+                });
+            }
             PlayAcceptance::Reconfigure => {}
         }
     }
@@ -406,7 +418,7 @@ async fn run_configuration_phase(
 }
 
 enum PlayAcceptance {
-    Login,
+    Login(v775::InitialPlayLogin),
     Reconfigure,
 }
 
@@ -421,7 +433,7 @@ async fn await_initial_play_login(
             .await
             .map_err(map_connection_error)?;
         match v775::decode_play_clientbound(&frame)? {
-            PlayClientbound::Login => return Ok(PlayAcceptance::Login),
+            PlayClientbound::Login(login) => return Ok(PlayAcceptance::Login(login)),
             PlayClientbound::KeepAlive { id } => {
                 connection
                     .write_all(
@@ -437,10 +449,10 @@ async fn await_initial_play_login(
                     .await
                     .map_err(map_connection_error)?;
             }
-            PlayClientbound::PlayerPosition { teleport_id } => {
+            PlayClientbound::PlayerPosition(position) => {
                 connection
                     .write_all(
-                        &v775::encode_play_teleport_confirmation(teleport_id)?,
+                        &v775::encode_play_teleport_confirmation(position.teleport_id)?,
                         "Play Teleport Confirmation write",
                     )
                     .await
@@ -513,6 +525,12 @@ async fn await_initial_play_login(
             PlayClientbound::PlayerChat { .. }
             | PlayClientbound::DisguisedChat { .. }
             | PlayClientbound::SystemChat { .. }
+            | PlayClientbound::Respawn(_)
+            | PlayClientbound::SetDefaultSpawnPosition(_)
+            | PlayClientbound::SetTime(_)
+            | PlayClientbound::ChangeDifficulty { .. }
+            | PlayClientbound::GameEvent { .. }
+            | PlayClientbound::InitializeBorder(_)
             | PlayClientbound::Health { .. }
             | PlayClientbound::CustomPayload { .. }
             | PlayClientbound::Ignored { .. } => {}

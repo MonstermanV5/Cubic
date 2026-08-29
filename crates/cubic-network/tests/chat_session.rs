@@ -17,6 +17,33 @@ use tokio::{
 
 const TEST_UUID: u128 = 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff;
 
+fn initial_play_login_payload() -> Vec<u8> {
+    let mut writer = CodecWriter::new();
+    let limits = StringLimits::new(256, 768);
+    writer.write_i32(7);
+    writer.write_bool(false);
+    writer.write_var_int(1);
+    writer.write_string("minecraft:overworld", limits).unwrap();
+    writer.write_var_int(20);
+    writer.write_var_int(10);
+    writer.write_var_int(10);
+    writer.write_bool(false);
+    writer.write_bool(true);
+    writer.write_bool(false);
+    writer.write_var_int(0);
+    writer.write_string("minecraft:overworld", limits).unwrap();
+    writer.write_i64(0);
+    writer.write_i8(0);
+    writer.write_u8(u8::MAX);
+    writer.write_bool(false);
+    writer.write_bool(false);
+    writer.write_bool(false);
+    writer.write_var_int(0);
+    writer.write_var_int(63);
+    writer.write_bool(false);
+    writer.into_inner()
+}
+
 fn options() -> ChatSessionOptions {
     ChatSessionOptions {
         login: DevelopmentLoginOptions {
@@ -215,7 +242,7 @@ async fn bootstrap_to_play(stream: &mut TcpStream) {
         split_raw_packet(&reader.next(stream).await).unwrap().id,
         0x03
     );
-    write_packet(stream, 0x31, vec![1]).await;
+    write_packet(stream, 0x31, initial_play_login_payload()).await;
 }
 
 async fn wait_for(
