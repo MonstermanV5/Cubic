@@ -81,17 +81,21 @@ async fn persistent_session_handles_control_chat_and_outgoing_unsigned_message()
         // terrain without exposing it to the UI or changing redraw behavior.
         write_packet(&mut stream, 0x2d, minimal_chunk_payload(-1, 2)).await;
 
-        let mut position = CodecWriter::new();
-        position.write_var_int(300);
-        position.write_bytes(&[0; 60]);
-        write_packet(&mut stream, 0x48, position.into_inner()).await;
-        let confirmation = reader.next(&mut stream).await;
-        let packet = split_raw_packet(&confirmation).unwrap();
-        assert_eq!(packet.id, 0);
-        assert_eq!(
-            CodecReader::new(packet.payload).read_var_int().unwrap(),
-            300
-        );
+        for teleport_id in [300, 301] {
+            let mut position = CodecWriter::new();
+            position.write_var_int(teleport_id);
+            position.write_bytes(&[0; 60]);
+            write_packet(&mut stream, 0x48, position.into_inner()).await;
+        }
+        for teleport_id in [300, 301] {
+            let confirmation = reader.next(&mut stream).await;
+            let packet = split_raw_packet(&confirmation).unwrap();
+            assert_eq!(packet.id, 0);
+            assert_eq!(
+                CodecReader::new(packet.payload).read_var_int().unwrap(),
+                teleport_id
+            );
+        }
 
         write_packet(&mut stream, 0x0b, vec![2]).await;
         assert_eq!(

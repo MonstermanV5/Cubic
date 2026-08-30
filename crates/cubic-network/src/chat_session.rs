@@ -15,7 +15,7 @@ use cubic_protocol::{
     bootstrap::v775::{self, ClientInformation, PlayClientbound, TextComponent},
     nbt::{NbtCompound, NbtTag},
 };
-use cubic_world::{WorldEvent, WorldState};
+use cubic_world::{BlockCollisionProfile, Vec3d, WorldEvent, WorldState};
 use rand_core_06::{OsRng, RngCore};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -27,6 +27,7 @@ use crate::{
     development_login::{ConnectionState, connect_to_play, run_configuration},
     online_login::establish_authenticated_play,
     secure_chat::{SecureChatError, SecureChatSession, system_time_millis},
+    world_movement::{WorldControlRunner, WorldMovementController},
     world_render::WorldRenderRunner,
 };
 
@@ -159,6 +160,8 @@ pub enum ChatSessionError {
     WorldAdapter(String),
     #[error("world state update failed: {0}")]
     WorldState(#[from] cubic_world::WorldError),
+    #[error("local player movement failed: {0}")]
+    Movement(String),
     #[error(
         "commands are not supported in Phase 8 because signable command arguments are not available"
     )]
@@ -186,6 +189,7 @@ pub async fn run_development_chat_session(
         runner,
         connected.initial_login,
         connected.dimension_types,
+        None,
         None,
     )
     .await
@@ -223,6 +227,7 @@ pub async fn run_authenticated_chat_session<J: MinecraftSessionJoiner>(
         connected.initial_login,
         connected.dimension_types,
         None,
+        None,
     )
     .await
 }
@@ -234,6 +239,8 @@ pub async fn run_development_world_session(
     options: &ChatSessionOptions,
     runner: ChatSessionRunner,
     render: WorldRenderRunner,
+    controls: WorldControlRunner,
+    collisions: BlockCollisionProfile,
 ) -> Result<(), ChatSessionError> {
     let mut connected = connect_to_play(address, username, &options.login).await?;
     run_play_session(
@@ -243,6 +250,7 @@ pub async fn run_development_world_session(
         connected.initial_login,
         connected.dimension_types,
         Some(render),
+        Some((controls, collisions)),
     )
     .await
 }
@@ -252,7 +260,34 @@ enum ChatSecurity {
     Authenticated(Box<SecureChatSession>),
 }
 
-fn publish_reset(render: &Option<WorldRenderRunner>, world: &WorldState) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderPoseAuthority {
+    AuthoritativeWorld,
+    LocalPrediction,
+}
+
+fn publish_authoritative_pose(
+    render: Option<&WorldRenderRunner>,
+    world: &WorldState,
+    pose_authority: RenderPoseAuthority,
+) {
+    if pose_authority == RenderPoseAuthority::LocalPrediction {
+        return;
+    }
+    let (Some(render), Some(pose)) = (render, world.session().and_then(|session| session.position))
+    else {
+        return;
+    };
+    render.pose(cubic_world::LocalPlayerPose::new(
+        pose.x, pose.y, pose.z, pose.yaw, pose.pitch,
+    ));
+}
+
+fn publish_reset(
+    render: &Option<WorldRenderRunner>,
+    world: &WorldState,
+    pose_authority: RenderPoseAuthority,
+) {
     let (Some(render), Some(session)) = (render, world.session()) else {
         return;
     };
@@ -260,9 +295,7 @@ fn publish_reset(render: &Option<WorldRenderRunner>, world: &WorldState) {
         session.spawn_context.dimension.to_string(),
         session.dimension_geometry,
     );
-    if let Some(pose) = session.position {
-        render.pose(pose);
-    }
+    publish_authoritative_pose(Some(render), world, pose_authority);
 }
 
 async fn run_play_session(
@@ -272,12 +305,19 @@ async fn run_play_session(
     initial_login: v775::InitialPlayLogin,
     dimension_types: Vec<cubic_world::RuntimeDimensionType>,
     render: Option<WorldRenderRunner>,
+    movement: Option<(WorldControlRunner, BlockCollisionProfile)>,
 ) -> Result<(), ChatSessionError> {
+    let player_entity_id = initial_login.player_entity_id;
+    let pose_authority = if movement.is_some() {
+        RenderPoseAuthority::LocalPrediction
+    } else {
+        RenderPoseAuthority::AuthoritativeWorld
+    };
     let mut world = WorldState::default();
     world.apply(WorldEvent::BeginConfiguration)?;
     world.apply(WorldEvent::RuntimeDimensionTypes(dimension_types))?;
     world.apply(crate::world_adapter::initial_world_event(initial_login)?)?;
-    publish_reset(&render, &world);
+    publish_reset(&render, &world, pose_authority);
     tracing::info!(target: "world", summary = %world.summary(), "entered authoritative world state");
     runner.event(ChatEvent::Connected);
 
@@ -293,9 +333,17 @@ async fn run_play_session(
 
     let mut salt_counter = 0_i64;
     let mut sent_player_loaded = false;
+    let mut movement = movement.map(|(controls, collisions)| {
+        WorldMovementController::new(controls, collisions, player_entity_id)
+    });
+    let mut movement_ticks = tokio::time::interval(std::time::Duration::from_millis(50));
+    movement_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+            scheduled = movement_ticks.tick(), if movement.is_some() => {
+                service_movement_tick(connection, &mut movement, &world, &render, scheduled).await?;
+            }
             command = runner.commands.recv() => {
                 match command {
                     Some(ChatSessionCommand::SendMessage(message)) => {
@@ -324,17 +372,54 @@ async fn run_play_session(
                         return Err(ChatSessionError::Transport(reason));
                     }
                 };
-                let packet = v775::decode_play_clientbound(&frame)?;
+                let decode_started = std::time::Instant::now();
+                let frame_bytes = frame.len();
+                let packet = if v775::classify_play_decode_work(&frame)? == v775::PlayDecodeWork::ChunkHeavy {
+                    let mut decode = tokio::task::spawn_blocking(move || v775::decode_play_clientbound(&frame));
+                    loop {
+                        tokio::select! {
+                            result = &mut decode => {
+                                break result
+                                    .map_err(|_| ChatSessionError::Movement("bounded chunk decode worker stopped unexpectedly".to_owned()))??;
+                            }
+                            scheduled = movement_ticks.tick(), if movement.is_some() => {
+                                service_movement_tick(connection, &mut movement, &world, &render, scheduled).await?;
+                            }
+                        }
+                    }
+                } else {
+                    v775::decode_play_clientbound(&frame)?
+                };
+                let decode_elapsed = decode_started.elapsed();
+                if decode_elapsed > std::time::Duration::from_millis(50) {
+                    tracing::debug!(target: "movement::latency", ?decode_elapsed, frame_bytes, "completed slow Play packet decode without starving movement ticks");
+                }
                 let packet = match crate::world_adapter::adapt_chunk_packet(packet) {
                     crate::world_adapter::ChunkAdaptation::Load(chunk) => {
                         let coordinate = chunk.coordinate;
+                        let semantic_started = std::time::Instant::now();
                         world.apply(WorldEvent::LoadChunk(chunk))?;
-                        if let Some(stored) = world.loaded_chunks().get(coordinate) {
-                            if let Some(render) = &render {
-                                render.load(Arc::new(stored.clone()));
-                            }
+                        let semantic_elapsed = semantic_started.elapsed();
+                        let lookup_started = std::time::Instant::now();
+                        if let Some(stored) = world.loaded_chunks().get_shared(coordinate) {
+                            let lookup_elapsed = lookup_started.elapsed();
+                            let publication = render
+                                .as_ref()
+                                .map_or_default(|render| render.load(Arc::clone(&stored)));
+                            let diagnostics_started = std::time::Instant::now();
                             let summary = stored.summary();
-                            tracing::debug!(target: "world::chunk", x = summary.coordinate.x, z = summary.coordinate.z, sections = summary.sections, non_empty_sections = summary.non_empty_sections, single_palettes = summary.single_block_palettes, indirect_palettes = summary.indirect_block_palettes, direct_palettes = summary.direct_block_palettes, heightmaps = summary.heightmaps, block_entities = summary.block_entities, sky_layers = summary.sky_layers, block_layers = summary.block_layers, loaded_chunks = world.loaded_chunks().len(), "stored decoded chunk");
+                            tracing::trace!(target: "world::chunk", x = summary.coordinate.x, z = summary.coordinate.z, sections = summary.sections, non_empty_sections = summary.non_empty_sections, single_palettes = summary.single_block_palettes, indirect_palettes = summary.indirect_block_palettes, direct_palettes = summary.direct_block_palettes, heightmaps = summary.heightmaps, block_entities = summary.block_entities, sky_layers = summary.sky_layers, block_layers = summary.block_layers, loaded_chunks = world.loaded_chunks().len(), "stored decoded chunk");
+                            let diagnostics_elapsed = diagnostics_started.elapsed();
+                            let publication_elapsed = publication.lock_wait + publication.bookkeeping;
+                            if lookup_elapsed > std::time::Duration::from_millis(50)
+                                || publication_elapsed > std::time::Duration::from_millis(50)
+                                || diagnostics_elapsed > std::time::Duration::from_millis(50)
+                            {
+                                tracing::debug!(target: "movement::latency", ?lookup_elapsed, lock_wait = ?publication.lock_wait, bookkeeping = ?publication.bookkeeping, ?diagnostics_elapsed, x = coordinate.x, z = coordinate.z, "slow chunk-to-render handoff breakdown");
+                            }
+                        }
+                        if semantic_elapsed > std::time::Duration::from_millis(50) {
+                            tracing::debug!(target: "movement::latency", ?semantic_elapsed, x = coordinate.x, z = coordinate.z, "semantic chunk application was slow");
                         }
                         continue;
                     }
@@ -353,16 +438,75 @@ async fn run_play_session(
                         tracing::debug!(target: "world::chunk", x = coordinate.x, z = coordinate.z, sky_layers, block_layers, "applied bounded chunk light update");
                         continue;
                     }
+                    crate::world_adapter::ChunkAdaptation::Blocks(updates) => {
+                        let update_count = updates.len();
+                        let semantic_started = std::time::Instant::now();
+                        let result = world.apply_block_updates(&updates)?;
+                        let semantic_elapsed = semantic_started.elapsed();
+                        let publication_started = std::time::Instant::now();
+                        let mut publication_lock_wait = std::time::Duration::ZERO;
+                        let mut publication_bookkeeping = std::time::Duration::ZERO;
+                        if let Some(render) = &render {
+                            for coordinate in &result.changed_chunks {
+                                if let Some(chunk) = world.loaded_chunks().get_shared(*coordinate) {
+                                    let timing = render.load(chunk);
+                                    publication_lock_wait += timing.lock_wait;
+                                    publication_bookkeeping += timing.bookkeeping;
+                                }
+                            }
+                        }
+                        let publication_elapsed = publication_started.elapsed();
+                        tracing::debug!(
+                            target: "world::block_update",
+                            update_count,
+                            changed_chunks = result.changed_chunks.len(),
+                            ignored = result.ignored_unloaded_or_out_of_bounds,
+                            revision = result.revision,
+                            "applied bounded authoritative live block updates"
+                        );
+                        if semantic_elapsed > std::time::Duration::from_millis(50) {
+                            tracing::debug!(target: "movement::latency", ?semantic_elapsed, update_count, "semantic block update application was slow");
+                        }
+                        if publication_elapsed > std::time::Duration::from_millis(50) {
+                            tracing::debug!(target: "movement::latency", ?publication_elapsed, ?publication_lock_wait, ?publication_bookkeeping, update_count, "block render-delta publication was slow");
+                        }
+                        continue;
+                    }
                     crate::world_adapter::ChunkAdaptation::Other(packet) => packet,
                 };
-                if let Some(event) = crate::world_adapter::play_world_event(&packet)? {
+                let world_event = match (&packet, &movement) {
+                    (PlayClientbound::PlayerPosition(position), Some(controller)) => Some(
+                        WorldEvent::SynchronizePlayerPosition(
+                            controller
+                                .absolute_position_update(*position, &world)
+                                .map_err(|error| ChatSessionError::Movement(error.to_string()))?,
+                        ),
+                    ),
+                    (PlayClientbound::PlayerRotation(rotation), Some(controller)) => Some(
+                        WorldEvent::SynchronizePlayerRotation(
+                            controller
+                                .absolute_rotation_update(
+                                    rotation.yaw,
+                                    rotation.relative_yaw,
+                                    rotation.pitch,
+                                    rotation.relative_pitch,
+                                    &world,
+                                )
+                                .map_err(|error| ChatSessionError::Movement(error.to_string()))?,
+                        ),
+                    ),
+                    _ => crate::world_adapter::play_world_event(&packet)?,
+                };
+                if let Some(event) = world_event {
                     let transition = world.apply(event)?;
                     if transition.reset != cubic_world::ResetScope::None {
-                        publish_reset(&render, &world);
-                    } else if let Some(pose) = world.session().and_then(|session| session.position)
-                        && let Some(render) = &render
-                    {
-                        render.pose(pose);
+                        publish_reset(&render, &world, pose_authority);
+                        if let Some(controller) = &mut movement {
+                            let entity_id = world.session().map_or(player_entity_id, |session| session.player_entity_id);
+                            controller.reset(entity_id);
+                        }
+                    } else {
+                        publish_authoritative_pose(render.as_ref(), &world, pose_authority);
                     }
                     tracing::debug!(target: "world", summary = %world.summary(), reset = ?transition.reset, dimension_changed = transition.dimension_changed, "applied authoritative world update");
                 }
@@ -375,6 +519,48 @@ async fn run_play_session(
                     }
                     PlayClientbound::PlayerPosition(position) => {
                         write(connection, v775::encode_play_teleport_confirmation(position.teleport_id)?, "Play Teleport Confirmation write").await?;
+                        if let Some(controller) = &mut movement
+                            && let Some(authoritative) = world.session().and_then(|session| session.position)
+                        {
+                            let pose = controller
+                                .reconcile(position, authoritative, &world)
+                                .map_err(|error| ChatSessionError::Movement(error.to_string()))?;
+                            if let Some(render) = &render {
+                                render.pose_discontinuity(
+                                    pose,
+                                    std::time::Instant::now(),
+                                    controller.presentation_look(),
+                                );
+                            }
+                        }
+                    }
+                    PlayClientbound::PlayerRotation(rotation) => {
+                        if let Some(controller) = &mut movement
+                            && let Some((pose, look)) = controller.rotate(
+                                rotation.yaw,
+                                rotation.relative_yaw,
+                                rotation.pitch,
+                                rotation.relative_pitch,
+                            )
+                            && let Some(render) = &render
+                        {
+                            render.pose_discontinuity(pose, std::time::Instant::now(), look);
+                        }
+                    }
+                    PlayClientbound::SetEntityMotion(motion) => {
+                        if let Some(controller) = &mut movement {
+                            controller.apply_velocity(
+                                motion.entity_id,
+                                Vec3d::new(motion.delta_x, motion.delta_y, motion.delta_z),
+                            );
+                        }
+                    }
+                    PlayClientbound::PlayerAbilities(abilities) => {
+                        if let Some(controller) = &mut movement {
+                            controller
+                                .apply_abilities(abilities)
+                                .map_err(|error| ChatSessionError::Movement(error.to_string()))?;
+                        }
                     }
                     PlayClientbound::ChunkBatchFinished { .. } => {
                         write(connection, v775::encode_play_chunk_batch_received(1.0)?, "Play Chunk Batch Received write").await?;
@@ -386,7 +572,9 @@ async fn run_play_session(
                     PlayClientbound::ChunkBatchStart => {}
                     PlayClientbound::LevelChunkWithLight(_)
                     | PlayClientbound::ForgetLevelChunk { .. }
-                    | PlayClientbound::LightUpdate(_) => {}
+                    | PlayClientbound::LightUpdate(_)
+                    | PlayClientbound::BlockUpdate(_)
+                    | PlayClientbound::SectionBlocksUpdate(_) => {}
                     PlayClientbound::CookieRequest { key } => {
                         write(connection, v775::encode_play_cookie_response(&key)?, "Play Cookie Response write").await?;
                     }
@@ -503,7 +691,11 @@ async fn run_play_session(
                         let configuration = run_configuration(connection, &mut state).await?;
                         world.apply(WorldEvent::RuntimeDimensionTypes(configuration.dimension_types))?;
                         world.apply(crate::world_adapter::initial_world_event(configuration.initial_login)?)?;
-                        publish_reset(&render, &world);
+                        publish_reset(&render, &world, pose_authority);
+                        if let Some(controller) = &mut movement {
+                            let entity_id = world.session().map_or(player_entity_id, |session| session.player_entity_id);
+                            controller.reset(entity_id);
+                        }
                         tracing::info!(target: "world", summary = %world.summary(), "reconfiguration replaced authoritative world state");
                         if let ChatSecurity::Authenticated(session) = &mut security {
                             session.reset(random_session_uuid());
@@ -515,6 +707,86 @@ async fn run_play_session(
             }
         }
     }
+}
+
+async fn service_movement_tick(
+    connection: &mut crate::connection::MinecraftConnection,
+    movement: &mut Option<WorldMovementController>,
+    world: &WorldState,
+    render: &Option<WorldRenderRunner>,
+    scheduled: tokio::time::Instant,
+) -> Result<(), ChatSessionError> {
+    let started = tokio::time::Instant::now();
+    let lateness = started.saturating_duration_since(scheduled);
+    if lateness > std::time::Duration::from_millis(50) {
+        tracing::debug!(
+            target: "movement::latency",
+            ?lateness,
+            skipped_tick_intervals = lateness.as_millis() / 50,
+            "20 Hz movement tick woke late"
+        );
+    }
+    let tick = if let Some(controller) = movement {
+        controller
+            .tick(world)
+            .map_err(|error| ChatSessionError::Movement(error.to_string()))?
+    } else {
+        None
+    };
+    if let Some(tick) = tick {
+        let simulated_at = tokio::time::Instant::now();
+        if tick.jumped {
+            tracing::debug!(
+                target: "movement::latency",
+                ?scheduled,
+                ?started,
+                ?tick.input_sampled_at,
+                space_state_age_at_sample = ?tick.jump_changed_at.map(|at| tick.input_sampled_at.saturating_duration_since(at)),
+                sample_to_jump_complete = ?simulated_at.into_std().saturating_duration_since(tick.input_sampled_at),
+                grounded_at_start = tick.grounded_at_start,
+                horizontal_acceleration = tick.horizontal_acceleration,
+                horizontal_drag = tick.horizontal_drag,
+                sprint_jump_impulse = tick.sprint_jump_impulse,
+                "grounded held-Space jump applied in fixed movement tick"
+            );
+        }
+        if let Some(render) = render {
+            render.pose_tick(tick.pose, scheduled.into_std(), tick.look, tick.jumped);
+        }
+        for frame in tick.frames {
+            write(connection, frame, "Play movement write").await?;
+        }
+        tracing::trace!(
+            target: "movement",
+            x = tick.pose.x,
+            y = tick.pose.y,
+            z = tick.pose.z,
+            velocity_x = tick.velocity.x,
+            velocity_y = tick.velocity.y,
+            velocity_z = tick.velocity.z,
+            on_ground = tick.on_ground,
+            horizontal_collision = tick.horizontal_collision,
+            sprinting = tick.sprinting,
+            sneaking = tick.sneaking,
+            flying = tick.flying,
+            grounded_at_start = tick.grounded_at_start,
+            horizontal_acceleration = tick.horizontal_acceleration,
+            horizontal_drag = tick.horizontal_drag,
+            sprint_jump_impulse = tick.sprint_jump_impulse,
+            "completed fixed player movement tick"
+        );
+    }
+    write(
+        connection,
+        v775::encode_play_client_tick_end()?,
+        "Play client tick end write",
+    )
+    .await?;
+    let elapsed = started.elapsed();
+    if elapsed > std::time::Duration::from_millis(50) {
+        tracing::debug!(target: "movement::latency", ?elapsed, "movement tick execution exceeded its 50 ms budget");
+    }
+    Ok(())
 }
 
 async fn send_chat(
@@ -706,7 +978,11 @@ mod tests {
         net::{TcpListener, TcpStream},
     };
 
-    use crate::secure_chat::{ChatCertificate, SecureChatRules};
+    use crate::{
+        secure_chat::{ChatCertificate, SecureChatRules},
+        world_movement::WorldControlHandle,
+        world_render::WorldRenderHandle,
+    };
 
     struct SyntheticCertificate;
 
@@ -796,6 +1072,79 @@ mod tests {
     }
 
     #[test]
+    fn predicted_camera_is_not_rewound_by_generic_authoritative_updates() {
+        let mut world = WorldState::default();
+        world.apply(WorldEvent::BeginConfiguration).unwrap();
+        world
+            .apply(WorldEvent::RuntimeDimensionTypes(dimension_types()))
+            .unwrap();
+        world
+            .apply(crate::world_adapter::initial_world_event(initial_login()).unwrap())
+            .unwrap();
+        world
+            .apply(WorldEvent::SynchronizePlayerPosition(
+                cubic_world::PlayerPositionUpdate {
+                    teleport_id: 1,
+                    x: 1.0,
+                    y: 70.0,
+                    z: 2.0,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    relative: cubic_world::RelativeTransformFlags::default(),
+                },
+            ))
+            .unwrap();
+
+        let (mut handle, runner) = WorldRenderHandle::new();
+        let predicted = cubic_world::LocalPlayerPose::new(8.0, 70.0, 9.0, 45.0, 5.0);
+        runner.pose(predicted);
+        assert_eq!(
+            handle.take_update().unwrap().pose.map(|sample| sample.pose),
+            Some(predicted)
+        );
+
+        for _ in 0..3 {
+            publish_authoritative_pose(Some(&runner), &world, RenderPoseAuthority::LocalPrediction);
+            assert!(handle.take_update().is_none());
+        }
+
+        let (_controls, control_runner) = WorldControlHandle::new();
+        let mut controller =
+            WorldMovementController::new(control_runner, BlockCollisionProfile::synthetic([]), 7);
+        let corrected = controller
+            .reconcile(
+                v775::PlayerPosition {
+                    teleport_id: 2,
+                    x: 7.5,
+                    y: 70.0,
+                    z: 8.5,
+                    delta_x: 0.0,
+                    delta_y: 0.0,
+                    delta_z: 0.0,
+                    yaw: 40.0,
+                    pitch: 4.0,
+                    relative_flags: 0,
+                },
+                cubic_world::AuthoritativeTransform {
+                    teleport_id: 2,
+                    x: 7.5,
+                    y: 70.0,
+                    z: 8.5,
+                    yaw: 40.0,
+                    pitch: 4.0,
+                },
+                &world,
+            )
+            .unwrap();
+        runner.pose(corrected);
+        assert_eq!(
+            handle.take_update().unwrap().pose.map(|sample| sample.pose),
+            Some(corrected)
+        );
+        assert!(handle.take_update().is_none());
+    }
+
+    #[test]
     fn critical_disconnect_survives_a_full_event_queue() {
         let options = ChatSessionOptions {
             event_capacity: 1,
@@ -811,6 +1160,98 @@ mod tests {
             Some(ChatEvent::Disconnected {
                 reason: "bye".to_owned()
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn world_mode_ends_each_protocol_tick_even_before_prediction_is_seeded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let address = ServerAddress::from_str(&format!("127.0.0.1:{port}")).unwrap();
+        let limits = FrameLimits::new(v775::MAX_BOOTSTRAP_FRAME_SIZE, 4 * 1024 * 1024).unwrap();
+        let mut connection = crate::connection::MinecraftConnection::connect(
+            &address,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            limits,
+        )
+        .await
+        .unwrap();
+        let mut server = accept.await.unwrap();
+        let options = ChatSessionOptions::default();
+        let (handle, runner) = ChatSessionHandle::bounded(&options);
+        let (_controls, control_runner) = WorldControlHandle::new();
+        let session = tokio::spawn(async move {
+            run_play_session(
+                &mut connection,
+                ChatSecurity::UnsignedDevelopment,
+                runner,
+                initial_login(),
+                dimension_types(),
+                None,
+                Some((control_runner, BlockCollisionProfile::synthetic([]))),
+            )
+            .await
+        });
+
+        let mut decoder = FrameDecoder::new(limits);
+        assert_eq!(
+            split_raw_packet(&read_test_frame(&mut server, &mut decoder).await)
+                .unwrap()
+                .id,
+            0x0e
+        );
+        assert_eq!(
+            split_raw_packet(&read_test_frame(&mut server, &mut decoder).await)
+                .unwrap()
+                .id,
+            0x0d
+        );
+
+        handle.disconnect().unwrap();
+        session.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocking_chunk_work_isolated_from_the_fixed_tick_timer() {
+        let mut blocked_interval = tokio::time::interval(Duration::from_millis(10));
+        blocked_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        blocked_interval.tick().await;
+        std::thread::sleep(Duration::from_millis(120));
+        let blocked_scheduled = blocked_interval.tick().await;
+        let blocked_lateness =
+            tokio::time::Instant::now().saturating_duration_since(blocked_scheduled);
+        assert!(blocked_lateness >= Duration::from_millis(90));
+
+        let mut isolated_interval = tokio::time::interval(Duration::from_millis(10));
+        isolated_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        isolated_interval.tick().await;
+        let mut work =
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(120)));
+        let mut serviced = 0_u32;
+        let mut maximum_lateness = Duration::ZERO;
+        loop {
+            tokio::select! {
+                result = &mut work => {
+                    result.unwrap();
+                    break;
+                }
+                scheduled = isolated_interval.tick() => {
+                    serviced += 1;
+                    maximum_lateness = maximum_lateness.max(
+                        tokio::time::Instant::now().saturating_duration_since(scheduled)
+                    );
+                }
+            }
+        }
+        assert!(serviced >= 5, "serviced only {serviced} fixed ticks");
+        assert!(
+            maximum_lateness < Duration::from_millis(80),
+            "isolated maximum lateness was {maximum_lateness:?}"
+        );
+        eprintln!(
+            "synthetic fixed-tick lateness: blocking={blocked_lateness:?} isolated_max={maximum_lateness:?} serviced={serviced}"
         );
     }
 
@@ -862,6 +1303,7 @@ mod tests {
                 runner,
                 initial_login(),
                 dimension_types(),
+                None,
                 None,
             )
             .await

@@ -11,6 +11,7 @@ mod secure_chat;
 mod status;
 mod transforms;
 mod world_adapter;
+mod world_movement;
 mod world_render;
 
 pub use address::{DEFAULT_MINECRAFT_PORT, ServerAddress, ServerAddressError};
@@ -29,4 +30,5 @@ pub use online_login::{
     authenticated_login,
 };
 pub use status::{ServerStatus, StatusQueryOptions, query_server_status};
+pub use world_movement::{WorldControlHandle, WorldControlRunner};
 pub use world_render::{WorldRenderHandle, WorldRenderRunner};

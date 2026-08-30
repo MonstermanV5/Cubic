@@ -8,6 +8,215 @@ fn body(frame: &[u8]) -> Vec<u8> {
     decoder.next_frame().unwrap().unwrap()
 }
 
+#[test]
+fn movement_and_input_packets_match_independent_protocol_775_vectors() {
+    let mut expected_position = vec![0x1e];
+    expected_position.extend_from_slice(&1.0_f64.to_be_bytes());
+    expected_position.extend_from_slice(&2.0_f64.to_be_bytes());
+    expected_position.extend_from_slice(&3.0_f64.to_be_bytes());
+    expected_position.push(0x03);
+    assert_eq!(
+        body(&v775::encode_play_move_position(1.0, 2.0, 3.0, true, true).unwrap()),
+        expected_position
+    );
+
+    let mut expected_combined = vec![0x1f];
+    expected_combined.extend_from_slice(&1.0_f64.to_be_bytes());
+    expected_combined.extend_from_slice(&2.0_f64.to_be_bytes());
+    expected_combined.extend_from_slice(&3.0_f64.to_be_bytes());
+    expected_combined.extend_from_slice(&90.0_f32.to_be_bytes());
+    expected_combined.extend_from_slice(&(-45.0_f32).to_be_bytes());
+    expected_combined.push(0x01);
+    assert_eq!(
+        body(
+            &v775::encode_play_move_position_rotation(1.0, 2.0, 3.0, 90.0, -45.0, true, false,)
+                .unwrap()
+        ),
+        expected_combined
+    );
+
+    assert_eq!(
+        body(&v775::encode_play_move_rotation(90.0, -45.0, true, false).unwrap()),
+        [
+            vec![0x20],
+            90.0_f32.to_be_bytes().to_vec(),
+            (-45.0_f32).to_be_bytes().to_vec(),
+            vec![1]
+        ]
+        .concat()
+    );
+    assert_eq!(
+        body(&v775::encode_play_move_status(false, true).unwrap()),
+        vec![0x21, 0x02]
+    );
+    assert_eq!(
+        body(
+            &v775::encode_play_player_input(v775::PlayerInput {
+                forward: true,
+                left: true,
+                jump: true,
+                sprint: true,
+                ..v775::PlayerInput::default()
+            })
+            .unwrap()
+        ),
+        vec![0x2b, 0x55]
+    );
+    assert_eq!(
+        body(
+            &v775::encode_play_player_command(300, v775::PlayerCommandAction::StartSprinting,)
+                .unwrap()
+        ),
+        vec![0x2a, 0xac, 0x02, 0x01, 0x00]
+    );
+    assert_eq!(
+        body(&v775::encode_play_player_abilities(true).unwrap()),
+        vec![0x28, 0x02]
+    );
+    assert_eq!(
+        body(&v775::encode_play_player_abilities(false).unwrap()),
+        vec![0x28, 0x00]
+    );
+    assert_eq!(body(&v775::encode_play_client_tick_end().unwrap()), [0x0d]);
+}
+
+#[test]
+fn clientbound_player_abilities_matches_protocol_775_wire_layout() {
+    let mut packet = vec![0x40, 0x0f];
+    packet.extend_from_slice(&0.05_f32.to_be_bytes());
+    packet.extend_from_slice(&0.1_f32.to_be_bytes());
+    assert_eq!(
+        v775::decode_play_clientbound(&packet).unwrap(),
+        v775::PlayClientbound::PlayerAbilities(v775::PlayerAbilities {
+            invulnerable: true,
+            flying: true,
+            may_fly: true,
+            instant_build: true,
+            flying_speed: 0.05,
+            walking_speed: 0.1,
+        })
+    );
+    assert!(v775::decode_play_clientbound(&[0x40, 0x10, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+}
+
+#[test]
+fn live_block_update_packets_match_verified_protocol_775_layouts() {
+    let x = -1_i32;
+    let y = 64_i32;
+    let z = 17_i32;
+    let packed_position = (((i64::from(x) as u64) & 0x03ff_ffff) << 38)
+        | (((i64::from(z) as u64) & 0x03ff_ffff) << 12)
+        | ((i64::from(y) as u64) & 0x0fff);
+    let mut single = vec![0x08];
+    single.extend_from_slice(&packed_position.to_be_bytes());
+    single.extend_from_slice(&[0xac, 0x02]); // runtime state 300
+    let v775::PlayClientbound::BlockUpdate(decoded) =
+        v775::decode_play_clientbound(&single).unwrap()
+    else {
+        panic!("expected Block Update")
+    };
+    assert_eq!((decoded.x, decoded.y, decoded.z), (x, y, z));
+    assert_eq!(decoded.state_id, 300);
+
+    // Official SectionPos packing is X:22, Z:22, Y:20. Each VarLong entry is
+    // state<<12 | localX<<8 | localZ<<4 | localY.
+    let section_x = -2_i32;
+    let section_y = -1_i32;
+    let section_z = 3_i32;
+    let packed_section = (((i64::from(section_x) as u64) & 0x3f_ffff) << 42)
+        | (((i64::from(section_z) as u64) & 0x3f_ffff) << 20)
+        | ((i64::from(section_y) as u64) & 0x0f_ffff);
+    let mut section = CodecWriter::new();
+    section.write_var_int(0x54);
+    section.write_u64(packed_section);
+    section.write_var_int(2);
+    section.write_var_long((1_i64 << 12) | (15 << 8));
+    section.write_var_long((300_i64 << 12) | (7 << 8) | (8 << 4) | 9);
+    let v775::PlayClientbound::SectionBlocksUpdate(decoded) =
+        v775::decode_play_clientbound(section.as_slice()).unwrap()
+    else {
+        panic!("expected Section Blocks Update")
+    };
+    assert_eq!(
+        (decoded.section_x, decoded.section_y, decoded.section_z),
+        (section_x, section_y, section_z)
+    );
+    assert_eq!(decoded.updates[0].state_id, 1);
+    assert_eq!(
+        (
+            decoded.updates[0].local_x,
+            decoded.updates[0].local_y,
+            decoded.updates[0].local_z
+        ),
+        (15, 0, 0)
+    );
+    assert_eq!(decoded.updates[1].state_id, 300);
+    assert_eq!(
+        (
+            decoded.updates[1].local_x,
+            decoded.updates[1].local_y,
+            decoded.updates[1].local_z
+        ),
+        (7, 9, 8)
+    );
+    assert_eq!(
+        v775::classify_play_decode_work(&single).unwrap(),
+        v775::PlayDecodeWork::Normal
+    );
+}
+
+#[test]
+fn malformed_live_block_updates_are_rejected_with_bounds() {
+    let mut negative = CodecWriter::new();
+    negative.write_var_int(0x08);
+    negative.write_block_position(0, 0, 0).unwrap();
+    negative.write_var_int(-1);
+    assert!(v775::decode_play_clientbound(negative.as_slice()).is_err());
+
+    let mut oversized = CodecWriter::new();
+    oversized.write_var_int(0x54);
+    oversized.write_i64(0);
+    oversized.write_var_int((v775::MAX_SECTION_BLOCK_UPDATES + 1) as i32);
+    assert!(v775::decode_play_clientbound(oversized.as_slice()).is_err());
+
+    let mut truncated = CodecWriter::new();
+    truncated.write_var_int(0x54);
+    truncated.write_i64(0);
+    truncated.write_var_int(1);
+    assert!(v775::decode_play_clientbound(truncated.as_slice()).is_err());
+}
+
+#[test]
+fn current_low_precision_entity_motion_vector_decodes_without_legacy_shorts() {
+    // entity 7; LpVec3 scale 1; normalized components +1, 0, -1.
+    let packet = [0x65, 0x07, 0xf1, 0xff, 0x00, 0x00, 0xff, 0xff];
+    let decoded = v775::decode_play_clientbound(&packet).unwrap();
+    let v775::PlayClientbound::SetEntityMotion(motion) = decoded else {
+        panic!("expected entity motion")
+    };
+    assert_eq!(motion.entity_id, 7);
+    assert!((motion.delta_x - 1.0).abs() < 1.0e-9);
+    assert!(motion.delta_y.abs() < 1.0e-9);
+    assert!((motion.delta_z + 1.0).abs() < 1.0e-9);
+
+    let zero = v775::decode_play_clientbound(&[0x65, 0x07, 0x00]).unwrap();
+    let v775::PlayClientbound::SetEntityMotion(zero) = zero else {
+        panic!("expected zero entity motion")
+    };
+    assert_eq!((zero.delta_x, zero.delta_y, zero.delta_z), (0.0, 0.0, 0.0));
+    assert!(v775::decode_play_clientbound(&[0x65, 0x07, 0x01]).is_err());
+}
+
+#[test]
+fn movement_encoders_reject_non_finite_local_state() {
+    assert!(v775::encode_play_move_position(f64::NAN, 0.0, 0.0, false, false).is_err());
+    assert!(
+        v775::encode_play_move_position_rotation(0.0, 0.0, 0.0, f32::INFINITY, 0.0, false, false,)
+            .is_err()
+    );
+    assert!(v775::encode_play_move_rotation(0.0, f32::NAN, false, false).is_err());
+}
+
 fn nbt_string(value: &str) -> Vec<u8> {
     let mut bytes = vec![8];
     bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());

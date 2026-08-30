@@ -1,4 +1,4 @@
-use std::{process::ExitCode, str::FromStr, time::Duration};
+use std::{process::ExitCode, str::FromStr, sync::Arc, time::Duration};
 
 use cubic_auth::{
     AuthBackend, AuthClient, AuthClientOptions, AuthenticatedMinecraftAccount, CredentialStore,
@@ -7,8 +7,8 @@ use cubic_auth::{
 };
 use cubic_network::{
     AuthenticatedLoginOptions, ChatSessionHandle, ChatSessionOptions, DevelopmentLoginOptions,
-    DevelopmentUsername, ServerAddress, StatusQueryOptions, WorldRenderHandle, authenticated_login,
-    development_login, query_server_status, run_authenticated_chat_session,
+    DevelopmentUsername, ServerAddress, StatusQueryOptions, WorldControlHandle, WorldRenderHandle,
+    authenticated_login, development_login, query_server_status, run_authenticated_chat_session,
     run_development_chat_session, run_development_world_session,
 };
 use cubic_render::BlockResources;
@@ -20,10 +20,16 @@ mod logging;
 const XAL_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 fn main() -> ExitCode {
-    if let Err(error) = logging::initialize() {
-        eprintln!("failed to initialize diagnostics: {error}");
-        logging::initialize_stderr_only();
-    }
+    // Retain the guard for the process lifetime so the bounded background log
+    // writer drains and flushes cleanly during shutdown.
+    let _logging_guard = match logging::initialize() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("failed to initialize diagnostics: {error}");
+            logging::initialize_stderr_only();
+            None
+        }
+    };
 
     tracing::info!("{}", cubic_core::startup_message());
 
@@ -634,10 +640,12 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
             return ExitCode::FAILURE;
         }
     };
+    let collisions = cubic_world::BlockCollisionProfile::from_game_data(&data);
     tracing::info!(version = %version, blockstates = resources.blockstate_count, models = resources.model_count, textures = resources.texture_count, atlas_width = resources.atlas.width, atlas_height = resources.atlas.height, atlas_bytes = resources.atlas.rgba.len(), fallbacks = resources.fallback_count, "vanilla block resources prepared");
     let options = ChatSessionOptions::default();
     let (chat_handle, chat_runner) = ChatSessionHandle::bounded(&options);
     let (world_handle, world_runner) = WorldRenderHandle::new();
+    let (control_handle, control_runner) = WorldControlHandle::new();
     let network_address = address.clone();
     let network_username = username.clone();
     let network = std::thread::Builder::new()
@@ -654,6 +662,8 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
                         &options,
                         chat_runner,
                         world_runner,
+                        control_runner,
+                        collisions,
                     )) {
                         tracing::error!(%error, "World Mode network task stopped");
                     }
@@ -673,6 +683,7 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
         Box::new(NetworkWorldPort {
             chat: chat_handle,
             world: world_handle,
+            controls: control_handle,
         }),
         resources,
     );
@@ -692,6 +703,7 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
 struct NetworkWorldPort {
     chat: ChatSessionHandle,
     world: WorldRenderHandle,
+    controls: WorldControlHandle,
 }
 
 impl cubic_platform::WorldSessionPort for NetworkWorldPort {
@@ -701,8 +713,25 @@ impl cubic_platform::WorldSessionPort for NetworkWorldPort {
         self.world.take_update()
     }
 
+    fn set_render_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>) {
+        self.world.set_waker(waker);
+    }
+
     fn disconnect(&self) {
+        self.controls.clear();
         let _result = self.chat.disconnect();
+    }
+
+    fn set_movement_input(&self, sequence: u64, input: cubic_world::MovementInput) {
+        self.controls.set_input(sequence, input);
+    }
+
+    fn reset_movement_input(&self, sequence: u64) {
+        self.controls.reset_input(sequence);
+    }
+
+    fn add_look_delta(&self, sequence: u64, yaw: f32, pitch: f32) {
+        self.controls.add_look_delta(sequence, yaw, pitch);
     }
 }
 

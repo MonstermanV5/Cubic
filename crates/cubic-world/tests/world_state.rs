@@ -1,11 +1,13 @@
 use cubic_version::MinecraftIdentifier;
 use cubic_world::{
-    AuthoritativeRotation, BlockCoordinates, Chunk, ChunkCoordinate, ChunkLightSummary,
-    ChunkSection, ClockState, Difficulty, DimensionGeometry, DimensionTypeReference, EnterWorld,
-    GameMode, MAX_KNOWN_DIMENSIONS, MAX_RUNTIME_REGISTRIES, MAX_RUNTIME_REGISTRY_ENTRIES,
-    MAX_WORLD_CLOCKS, PalettedContainer, PlayerPositionUpdate, RelativeTransformFlags, ResetScope,
-    Respawn, RespawnRotation, RuntimeBiomeId, RuntimeBlockStateId, RuntimeDimensionType,
-    RuntimeRegistrySnapshot, RuntimeRegistrySummary, SpawnContext, SpawnPoint, WorldBorder,
+    AuthoritativeRotation, BlockCollisionProfile, BlockCoordinates, BlockStateUpdate, Chunk,
+    ChunkCoordinate, ChunkLightSummary, ChunkSection, ClockState, CollisionShape, Difficulty,
+    DimensionGeometry, DimensionTypeReference, EnterWorld, GameMode, LocalPlayerPose,
+    MAX_BLOCK_UPDATES_PER_EVENT, MAX_KNOWN_DIMENSIONS, MAX_RUNTIME_REGISTRIES,
+    MAX_RUNTIME_REGISTRY_ENTRIES, MAX_WORLD_CLOCKS, PalettedContainer, PlayerMovementState,
+    PlayerPositionUpdate, PlayerRotationUpdate, RelativeTransformFlags, ResetScope, Respawn,
+    RespawnRotation, RuntimeBiomeId, RuntimeBlockStateId, RuntimeDimensionType,
+    RuntimeRegistrySnapshot, RuntimeRegistrySummary, SpawnContext, SpawnPoint, Vec3d, WorldBorder,
     WorldError, WorldEvent, WorldLifecycle, WorldState, WorldTime,
 };
 
@@ -88,6 +90,35 @@ fn absolute_position(id: i32) -> PlayerPositionUpdate {
     }
 }
 
+#[test]
+fn rotation_only_updates_preserve_position_and_advance_the_rotation_baseline() {
+    let mut state = active();
+    state
+        .apply(WorldEvent::SynchronizePlayerPosition(absolute_position(1)))
+        .unwrap();
+    state
+        .apply(WorldEvent::SynchronizePlayerRotation(
+            PlayerRotationUpdate {
+                yaw: 15.0,
+                pitch: 5.0,
+                relative_yaw: true,
+                relative_pitch: false,
+            },
+        ))
+        .unwrap();
+    let session = state.session().unwrap();
+    let position = session.position.unwrap();
+    assert_eq!((position.x, position.y, position.z), (1.5, 70.0, -2.5));
+    assert_eq!((position.yaw, position.pitch), (105.0, 5.0));
+    assert_eq!(
+        session.rotation.unwrap(),
+        AuthoritativeRotation {
+            yaw: 105.0,
+            pitch: 5.0
+        }
+    );
+}
+
 fn sample_chunk() -> Chunk {
     Chunk {
         coordinate: ChunkCoordinate::new(-3, 4),
@@ -134,6 +165,110 @@ fn world_contents_and_connection_resets_clear_loaded_chunks() {
     state.apply(WorldEvent::LoadChunk(sample_chunk())).unwrap();
     state.apply(WorldEvent::Disconnect).unwrap();
     assert!(state.loaded_chunks().is_empty());
+}
+
+#[test]
+fn live_block_updates_mutate_loaded_palette_storage_at_negative_chunk_edges() {
+    let mut state = active();
+    state.apply(WorldEvent::LoadChunk(sample_chunk())).unwrap();
+    let coordinate = ChunkCoordinate::new(-3, 4);
+    let position = BlockCoordinates {
+        x: -48,
+        y: -64,
+        z: 79,
+    };
+    let collision = BlockCollisionProfile::synthetic([
+        (RuntimeBlockStateId(0), CollisionShape::Empty),
+        (RuntimeBlockStateId(1), CollisionShape::FullCube),
+    ]);
+    let player = PlayerMovementState::from_authoritative(
+        LocalPlayerPose::new(-47.5, -64.0, 79.5, 0.0, 0.0),
+        Vec3d::default(),
+    )
+    .unwrap();
+    let geometry = state.session().unwrap().dimension_geometry;
+    let render_snapshot = state.loaded_chunks().get_shared(coordinate).unwrap();
+    assert!(
+        !player
+            .collision_diagnostics(state.loaded_chunks(), geometry, &collision)
+            .candidates
+            .iter()
+            .any(|candidate| candidate.state == Some(RuntimeBlockStateId(1)))
+    );
+    let placed = state
+        .apply_block_updates(&[BlockStateUpdate {
+            position,
+            state: RuntimeBlockStateId(1),
+        }])
+        .unwrap();
+    assert_eq!(placed.changed_chunks, vec![coordinate]);
+    assert_eq!(placed.ignored_unloaded_or_out_of_bounds, 0);
+    assert_eq!(
+        state.loaded_chunks().get(coordinate).unwrap().sections[0].block(0, 0, 15),
+        Some(RuntimeBlockStateId(1))
+    );
+    assert_eq!(
+        render_snapshot.sections[0].block(0, 0, 15),
+        Some(RuntimeBlockStateId(0)),
+        "copy-on-write mutation must not alter an in-flight render revision"
+    );
+    assert_eq!(
+        state.loaded_chunks().get(coordinate).unwrap().sections[0]
+            .blocks
+            .form(),
+        cubic_world::PaletteForm::Direct
+    );
+    assert!(
+        player
+            .collision_diagnostics(state.loaded_chunks(), geometry, &collision)
+            .candidates
+            .iter()
+            .any(|candidate| candidate.state == Some(RuntimeBlockStateId(1)))
+    );
+
+    let removed = state
+        .apply_block_updates(&[BlockStateUpdate {
+            position,
+            state: RuntimeBlockStateId(0),
+        }])
+        .unwrap();
+    assert_eq!(removed.changed_chunks, vec![coordinate]);
+    assert_eq!(
+        state.loaded_chunks().get(coordinate).unwrap().sections[0].block(0, 0, 15),
+        Some(RuntimeBlockStateId(0))
+    );
+    assert!(
+        !player
+            .collision_diagnostics(state.loaded_chunks(), geometry, &collision)
+            .candidates
+            .iter()
+            .any(|candidate| candidate.state == Some(RuntimeBlockStateId(1)))
+    );
+}
+
+#[test]
+fn block_update_batches_are_bounded_and_ignore_unloaded_chunks() {
+    let mut state = active();
+    let ignored = state
+        .apply_block_updates(&[BlockStateUpdate {
+            position: BlockCoordinates { x: 0, y: 0, z: 0 },
+            state: RuntimeBlockStateId(1),
+        }])
+        .unwrap();
+    assert!(ignored.changed_chunks.is_empty());
+    assert_eq!(ignored.ignored_unloaded_or_out_of_bounds, 1);
+
+    let oversized = vec![
+        BlockStateUpdate {
+            position: BlockCoordinates { x: 0, y: 0, z: 0 },
+            state: RuntimeBlockStateId(1),
+        };
+        MAX_BLOCK_UPDATES_PER_EVENT + 1
+    ];
+    assert!(matches!(
+        state.apply_block_updates(&oversized),
+        Err(WorldError::TooManyBlockUpdates { .. })
+    ));
 }
 
 #[test]

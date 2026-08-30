@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::block_resources::{
     BlockResources, Direction, ModelApplication, RenderLayer, rotate_blockstate_corner,
-    rotate_blockstate_direction,
+    rotate_blockstate_direction, uvlock_quarter_turns,
 };
 
 pub const MAX_CHUNK_MESH_FACES: usize = 1_000_000;
@@ -252,8 +252,10 @@ fn push_model_face(
     };
     let mut uvs = face.uv;
     if model.uvlock {
-        uvs.rotate_left(usize::from(
-            ((model.x_rotation + model.y_rotation) / 90) % 4,
+        uvs.rotate_left(uvlock_quarter_turns(
+            face.direction,
+            model.x_rotation,
+            model.y_rotation,
         ));
     }
     for (corner, uv) in face.corners.into_iter().zip(uvs) {
@@ -558,6 +560,7 @@ mod tests {
     #[test]
     fn blockstate_rotation_and_uvlock_preserve_the_top_left_texture_convention() {
         let face = crate::block_resources::ModelFace {
+            direction: Direction::North,
             corners: [
                 [0.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0],
@@ -608,8 +611,8 @@ mod tests {
             &face,
         )
         .unwrap();
-        assert_eq!(locked.vertices[0].uv, [0.0, 0.0]);
-        assert_eq!(locked.vertices[3].uv, [0.0, 1.0]);
+        assert_eq!(locked.vertices[0].uv, [0.0, 1.0]);
+        assert_eq!(locked.vertices[3].uv, [1.0, 1.0]);
     }
 
     #[test]

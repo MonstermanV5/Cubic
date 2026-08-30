@@ -11,8 +11,8 @@ use std::{
 
 use bytemuck::{Pod, Zeroable};
 use cubic_world::{
-    AuthoritativeTransform, Chunk, ChunkCoordinate, ChunkRenderDelta, DimensionGeometry,
-    WorldRenderUpdate,
+    Chunk, ChunkCoordinate, ChunkRenderDelta, DimensionGeometry, LocalPlayerPose, RenderLookSample,
+    RenderPoseSample, WorldRenderUpdate,
 };
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
@@ -26,6 +26,12 @@ use crate::{
 
 const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
 const MAX_PENDING_MESH_JOBS: usize = 32;
+const MAX_MESH_RESULTS_PER_PREPARE: usize = 16;
+const MAX_MESH_DISPATCHES_PER_PREPARE: usize = 8;
+const MESH_INTEGRATION_TIME_BUDGET: Duration = Duration::from_millis(4);
+const _: () = assert!(MAX_MESH_RESULTS_PER_PREPARE < MAX_PENDING_MESH_JOBS);
+const SIMULATION_TICK: Duration = Duration::from_millis(50);
+const TERRAIN_CULL_MODE: Option<Face> = Some(Face::Back);
 
 pub(crate) struct WorldRenderer {
     pipeline: RenderPipeline,
@@ -42,7 +48,7 @@ pub(crate) struct WorldRenderer {
     revision: u64,
     geometry: Option<DimensionGeometry>,
     dimension: Option<String>,
-    pose: Option<AuthoritativeTransform>,
+    pose: Option<PosePresentation>,
     worker: Option<MeshWorker>,
     progress: MeshProgress,
 }
@@ -194,7 +200,11 @@ impl WorldRenderer {
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
-                cull_mode: None,
+                // Minecraft zero-thickness cross models deliberately contain
+                // opposite-winding faces on the same plane. Back-face culling
+                // selects exactly one for a view instead of depth-testing two
+                // coplanar fragments against each other.
+                cull_mode: TERRAIN_CULL_MODE,
                 front_face: FrontFace::Ccw,
                 ..Default::default()
             },
@@ -225,7 +235,7 @@ impl WorldRenderer {
             geometry: None,
             dimension: None,
             pose: None,
-            worker: MeshWorker::new(resources),
+            worker: MeshWorker::new(resources, device.clone()),
             progress: MeshProgress::new(),
         }
     }
@@ -254,7 +264,13 @@ impl WorldRenderer {
         }
         self.dimension = update.dimension.or_else(|| self.dimension.take());
         self.geometry = update.geometry.or(self.geometry);
-        self.pose = update.pose.or(self.pose);
+        if let Some(sample) = update.pose {
+            if let Some(presentation) = &mut self.pose {
+                presentation.apply(sample);
+            } else {
+                self.pose = Some(PosePresentation::new(sample));
+            }
+        }
         for delta in update.chunks {
             match delta {
                 ChunkRenderDelta::Loaded(chunk) => {
@@ -271,17 +287,30 @@ impl WorldRenderer {
         }
     }
 
+    pub(crate) fn preview_look(&mut self, sequence: u64, yaw_delta: f32, pitch_delta: f32) {
+        if let Some(pose) = &mut self.pose {
+            pose.preview_look(sequence, yaw_delta, pitch_delta);
+        }
+    }
+
     fn mark_with_neighbors(&mut self, coordinate: ChunkCoordinate) {
         self.revision = self.revision.wrapping_add(1);
         mark_dirty_with_neighbors(&mut self.dirty, coordinate, self.revision);
     }
 
-    pub(crate) fn prepare(&mut self, device: &Device, queue: &Queue, width: u32, height: u32) {
-        while let Some(result) = self
-            .worker
-            .as_ref()
-            .and_then(|worker| worker.results.try_recv().ok())
-        {
+    pub(crate) fn prepare(&mut self, _device: &Device, queue: &Queue, width: u32, height: u32) {
+        let started = Instant::now();
+        let integration_started = Instant::now();
+        let mut integrated = 0;
+        while mesh_integration_permitted(integrated, started.elapsed()) {
+            let Some(result) = self
+                .worker
+                .as_ref()
+                .and_then(|worker| worker.results.try_recv().ok())
+            else {
+                break;
+            };
+            integrated += 1;
             self.progress.record(&result.mesh);
             self.pending.remove(&result.coordinate);
             if result.generation != self.generation
@@ -291,12 +320,11 @@ impl WorldRenderer {
             }
             self.dirty.remove(&result.coordinate);
             match result.mesh {
-                Ok(mesh) if mesh.indices.is_empty() => {
+                Ok(PreparedChunkMesh::Empty { .. }) => {
                     self.meshes.remove(&result.coordinate);
                 }
-                Ok(mesh) => {
-                    self.meshes
-                        .insert(result.coordinate, GpuChunkMesh::new(device, &mesh));
+                Ok(PreparedChunkMesh::Ready { mesh, .. }) => {
+                    self.meshes.insert(result.coordinate, mesh);
                 }
                 Err(error) => {
                     self.meshes.remove(&result.coordinate);
@@ -304,27 +332,55 @@ impl WorldRenderer {
                 }
             }
         }
-        self.dispatch_jobs();
+        let integration_elapsed = integration_started.elapsed();
+        let dispatch_dirty_before = self.dirty.len();
+        let dispatch_pending_before = self.pending.len();
+        let dispatch_started = Instant::now();
+        let dispatched = self.dispatch_jobs(started);
+        let dispatch_elapsed = dispatch_started.elapsed();
+        let progress_started = Instant::now();
         self.log_mesh_progress(false);
-        if let Some(pose) = self.pose {
+        let progress_elapsed = progress_started.elapsed();
+        let camera_started = Instant::now();
+        if let Some(pose) = self.pose.map(|pose| pose.display(Instant::now())) {
             let camera = CameraUniform::from_pose(pose, width, height);
             queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera));
         }
+        let camera_elapsed = camera_started.elapsed();
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_millis(50) {
+            tracing::debug!(target: "movement::latency", ?elapsed, ?integration_elapsed, ?dispatch_elapsed, ?progress_elapsed, ?camera_elapsed, integrated, dispatched, dispatch_dirty_before, dispatch_pending_before, dispatch_capacity = MAX_PENDING_MESH_JOBS, time_budget_ms = MESH_INTEGRATION_TIME_BUDGET.as_millis(), "world render preparation delayed event-loop service");
+        }
     }
 
-    fn dispatch_jobs(&mut self) {
+    fn dispatch_jobs(&mut self, prepare_started: Instant) -> usize {
         let Some(geometry) = self.geometry else {
-            return;
+            return 0;
         };
         let Some(worker) = &mut self.worker else {
-            return;
+            return 0;
         };
-        self.dirty
-            .retain(|coordinate, _| self.chunks.contains_key(coordinate));
-        let priority_origin = self.pose.map(player_chunk);
-        while let Some((coordinate, revision)) =
-            next_mesh_candidate(&self.dirty, &self.pending, priority_origin)
-        {
+        let priority_origin = self.pose.map(|pose| player_chunk(pose.current));
+        let mut dispatched = 0;
+        while mesh_dispatch_permitted(dispatched, prepare_started.elapsed()) {
+            // `pending` accounts for every accepted worker job until its result
+            // is integrated. Once that bounded capacity is occupied, scanning
+            // the dirty map and constructing a neighbor snapshot can only end
+            // in a failed `try_send`. Avoid doing that work on winit's event
+            // thread while terrain streaming is already at capacity.
+            if !mesh_dispatch_capacity_available(self.pending.len()) {
+                break;
+            }
+            let Some((coordinate, revision)) =
+                next_mesh_candidate(&self.dirty, &self.pending, priority_origin)
+            else {
+                break;
+            };
+            if !self.chunks.contains_key(&coordinate) {
+                self.dirty.remove(&coordinate);
+                self.meshes.remove(&coordinate);
+                continue;
+            }
             let local_chunks = neighbors_including(coordinate)
                 .into_iter()
                 .filter_map(|key| self.chunks.get(&key).map(|chunk| (key, Arc::clone(chunk))))
@@ -338,14 +394,19 @@ impl WorldRenderer {
             };
             if worker.try_send(job) {
                 self.pending.insert(coordinate);
+                dispatched += 1;
             } else {
                 break;
             }
         }
+        dispatched
     }
 
     pub(crate) fn has_pending_work(&self) -> bool {
-        self.worker.is_some() && (!self.dirty.is_empty() || !self.pending.is_empty())
+        (self.worker.is_some() && (!self.dirty.is_empty() || !self.pending.is_empty()))
+            || self
+                .pose
+                .is_some_and(|pose| pose.is_interpolating(Instant::now()))
     }
 
     pub(crate) fn draw<'a>(&'a self, pass: &mut RenderPass<'a>) {
@@ -370,7 +431,7 @@ impl WorldRenderer {
         super::WorldRenderStats {
             dimension: self.dimension.clone(),
             geometry: self.geometry,
-            pose: self.pose,
+            pose: self.pose.map(|pose| pose.display(Instant::now())),
             loaded_chunks: self.chunks.len(),
             meshed_chunks: self.meshes.len(),
             pending_meshes: self.dirty.len(),
@@ -437,6 +498,112 @@ impl WorldRenderer {
     }
 }
 
+fn mesh_integration_permitted(completed: usize, elapsed: Duration) -> bool {
+    completed < MAX_MESH_RESULTS_PER_PREPARE
+        && (completed == 0 || elapsed < MESH_INTEGRATION_TIME_BUDGET)
+}
+
+fn mesh_dispatch_permitted(dispatched: usize, elapsed: Duration) -> bool {
+    dispatched < MAX_MESH_DISPATCHES_PER_PREPARE && elapsed < MESH_INTEGRATION_TIME_BUDGET
+}
+
+fn mesh_dispatch_capacity_available(pending: usize) -> bool {
+    pending < MAX_PENDING_MESH_JOBS
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PosePresentation {
+    previous: LocalPlayerPose,
+    current: LocalPlayerPose,
+    tick_at: Instant,
+    acknowledged_look: RenderLookSample,
+    produced_look: RenderLookSample,
+    display_yaw: f32,
+    display_pitch: f32,
+}
+
+impl PosePresentation {
+    fn new(sample: RenderPoseSample) -> Self {
+        Self {
+            previous: sample.pose,
+            current: sample.pose,
+            tick_at: sample.tick_at,
+            acknowledged_look: sample.look,
+            produced_look: sample.look,
+            display_yaw: sample.pose.yaw.rem_euclid(360.0),
+            display_pitch: sample.pose.pitch.clamp(-90.0, 90.0),
+        }
+    }
+
+    fn apply(&mut self, sample: RenderPoseSample) {
+        if sample.discontinuity {
+            if sample.look.sequence > self.produced_look.sequence {
+                self.produced_look = sample.look;
+            }
+            let pending_yaw = self.produced_look.yaw_total - sample.look.yaw_total;
+            let pending_pitch = self.produced_look.pitch_total - sample.look.pitch_total;
+            self.display_yaw = (sample.pose.yaw + pending_yaw as f32).rem_euclid(360.0);
+            self.display_pitch = (sample.pose.pitch + pending_pitch as f32).clamp(-90.0, 90.0);
+        } else if sample.look.sequence > self.produced_look.sequence {
+            // The renderer may be recreated after suspension and legitimately
+            // miss platform look events that the simulation already consumed.
+            self.produced_look = sample.look;
+            self.display_yaw = sample.pose.yaw.rem_euclid(360.0);
+            self.display_pitch = sample.pose.pitch.clamp(-90.0, 90.0);
+        }
+        self.previous = if sample.discontinuity {
+            sample.pose
+        } else {
+            self.current
+        };
+        self.current = sample.pose;
+        self.tick_at = sample.tick_at;
+        if sample.look.sequence >= self.acknowledged_look.sequence {
+            self.acknowledged_look = sample.look;
+        }
+        tracing::trace!(target: "movement::look", new_simulated_pose = true, discontinuity = sample.discontinuity, ?sample.tick_at, simulation_yaw = sample.pose.yaw, simulation_pitch = sample.pose.pitch, acknowledged_sequence = self.acknowledged_look.sequence, acknowledged_yaw = self.acknowledged_look.yaw_total, acknowledged_pitch = self.acknowledged_look.pitch_total, produced_sequence = self.produced_look.sequence, produced_yaw = self.produced_look.yaw_total, produced_pitch = self.produced_look.pitch_total, outstanding_yaw = self.produced_look.yaw_total - self.acknowledged_look.yaw_total, outstanding_pitch = self.produced_look.pitch_total - self.acknowledged_look.pitch_total, display_yaw = self.display_yaw, display_pitch = self.display_pitch, "applied simulation look sample to render presentation");
+    }
+
+    fn preview_look(&mut self, sequence: u64, yaw_delta: f32, pitch_delta: f32) {
+        if sequence <= self.produced_look.sequence
+            || !yaw_delta.is_finite()
+            || !pitch_delta.is_finite()
+        {
+            return;
+        }
+        self.produced_look.sequence = sequence;
+        self.produced_look.yaw_total += f64::from(yaw_delta);
+        self.produced_look.pitch_total += f64::from(pitch_delta);
+        self.display_yaw = (self.display_yaw + yaw_delta).rem_euclid(360.0);
+        self.display_pitch = (self.display_pitch + pitch_delta).clamp(-90.0, 90.0);
+        tracing::trace!(target: "movement::look", sequence, yaw_delta, pitch_delta, produced_yaw = self.produced_look.yaw_total, produced_pitch = self.produced_look.pitch_total, acknowledged_sequence = self.acknowledged_look.sequence, acknowledged_yaw = self.acknowledged_look.yaw_total, acknowledged_pitch = self.acknowledged_look.pitch_total, outstanding_yaw = self.produced_look.yaw_total - self.acknowledged_look.yaw_total, outstanding_pitch = self.produced_look.pitch_total - self.acknowledged_look.pitch_total, display_yaw = self.display_yaw, display_pitch = self.display_pitch, "integrated raw mouse event into persistent display orientation");
+    }
+
+    fn display(self, now: Instant) -> LocalPlayerPose {
+        let alpha = now.saturating_duration_since(self.tick_at).as_secs_f64()
+            / SIMULATION_TICK.as_secs_f64();
+        let alpha = alpha.clamp(0.0, 1.0);
+        let lerp = |old: f64, current: f64| old + (current - old) * alpha;
+        let mut pose = self.current;
+        pose.x = lerp(self.previous.x, self.current.x);
+        pose.y = lerp(self.previous.y, self.current.y);
+        pose.z = lerp(self.previous.z, self.current.z);
+        pose.eye_height = lerp(self.previous.eye_height, self.current.eye_height);
+        pose.yaw = self.display_yaw;
+        pose.pitch = self.display_pitch;
+        tracing::trace!(target: "movement::look", ?now, new_simulated_pose = false, simulation_yaw = self.current.yaw, simulation_pitch = self.current.pitch, acknowledged_sequence = self.acknowledged_look.sequence, produced_sequence = self.produced_look.sequence, outstanding_yaw = self.produced_look.yaw_total - self.acknowledged_look.yaw_total, outstanding_pitch = self.produced_look.pitch_total - self.acknowledged_look.pitch_total, display_yaw = pose.yaw, display_pitch = pose.pitch, "sampled persistent display orientation for render frame");
+        pose
+    }
+
+    fn is_interpolating(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.tick_at) < SIMULATION_TICK
+            && (self.previous.x != self.current.x
+                || self.previous.y != self.current.y
+                || self.previous.z != self.current.z
+                || self.previous.eye_height != self.current.eye_height)
+    }
+}
+
 impl Drop for WorldRenderer {
     fn drop(&mut self) {
         self.log_mesh_progress(true);
@@ -451,7 +618,7 @@ struct MeshWorker {
 }
 
 impl MeshWorker {
-    fn new(resources: BlockResources) -> Option<Self> {
+    fn new(resources: BlockResources, device: Device) -> Option<Self> {
         let (result_tx, results) = mpsc::sync_channel(MAX_PENDING_MESH_JOBS);
         let available = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         let (worker_count, queue_per_worker) = worker_layout(available);
@@ -463,13 +630,26 @@ impl MeshWorker {
             let result_tx = result_tx.clone();
             let resources = Arc::clone(&resources);
             let active = Arc::clone(&active);
+            let device = device.clone();
             let spawn = thread::Builder::new()
                 .name(format!("cubic-chunk-mesher-{index}"))
                 .spawn(move || {
                     while let Ok(job) = job_rx.recv() {
                         active.fetch_add(1, Ordering::AcqRel);
                         let mesh =
-                            mesh_chunk(job.coordinate, &job.chunks, job.geometry, &resources);
+                            mesh_chunk(job.coordinate, &job.chunks, job.geometry, &resources).map(
+                                |mesh| {
+                                    let statistics = mesh.statistics;
+                                    if mesh.indices.is_empty() {
+                                        PreparedChunkMesh::Empty { statistics }
+                                    } else {
+                                        PreparedChunkMesh::Ready {
+                                            mesh: GpuChunkMesh::new(&device, &mesh),
+                                            statistics,
+                                        }
+                                    }
+                                },
+                            );
                         active.fetch_sub(1, Ordering::AcqRel);
                         if result_tx
                             .send(MeshResult {
@@ -579,12 +759,13 @@ impl MeshProgress {
         }
     }
 
-    fn record(&mut self, result: &Result<ChunkMesh, crate::mesher::MeshError>) {
+    fn record(&mut self, result: &Result<PreparedChunkMesh, crate::mesher::MeshError>) {
         self.completed = self.completed.saturating_add(1);
         let Ok(mesh) = result else { return };
-        self.total_cpu_time = self.total_cpu_time.saturating_add(mesh.statistics.cpu_time);
-        self.maximum_cpu_time = self.maximum_cpu_time.max(mesh.statistics.cpu_time);
-        self.statistics.accumulate(mesh.statistics);
+        let statistics = mesh.statistics();
+        self.total_cpu_time = self.total_cpu_time.saturating_add(statistics.cpu_time);
+        self.maximum_cpu_time = self.maximum_cpu_time.max(statistics.cpu_time);
+        self.statistics.accumulate(statistics);
     }
 
     fn report_due(&self, now: Instant, final_summary: bool) -> (bool, bool) {
@@ -638,7 +819,25 @@ struct MeshResult {
     coordinate: ChunkCoordinate,
     generation: u64,
     revision: u64,
-    mesh: Result<ChunkMesh, crate::mesher::MeshError>,
+    mesh: Result<PreparedChunkMesh, crate::mesher::MeshError>,
+}
+
+enum PreparedChunkMesh {
+    Empty {
+        statistics: MeshStatistics,
+    },
+    Ready {
+        mesh: GpuChunkMesh,
+        statistics: MeshStatistics,
+    },
+}
+
+impl PreparedChunkMesh {
+    const fn statistics(&self) -> MeshStatistics {
+        match self {
+            Self::Empty { statistics } | Self::Ready { statistics, .. } => *statistics,
+        }
+    }
 }
 
 struct GpuChunkMesh {
@@ -708,14 +907,18 @@ impl CameraUniform {
             ],
         }
     }
-    fn from_pose(pose: AuthoritativeTransform, width: u32, height: u32) -> Self {
+    fn from_pose(pose: LocalPlayerPose, width: u32, height: u32) -> Self {
         let aspect = width.max(1) as f32 / height.max(1) as f32;
-        let (forward, _, _) = camera_basis(pose.yaw, pose.pitch);
-        let eye = [pose.x as f32, pose.y as f32 + 1.62, pose.z as f32];
+        let (forward, right, up) = camera_basis(pose.yaw, pose.pitch);
+        let eye = [
+            pose.x as f32,
+            (pose.y + pose.eye_height) as f32,
+            pose.z as f32,
+        ];
         Self {
             view_projection: multiply(
                 perspective(70_f32.to_radians(), aspect, 0.05, 2048.0),
-                look_to(eye, forward),
+                look_to_basis(eye, forward, right, up),
             ),
         }
     }
@@ -741,7 +944,7 @@ fn mark_dirty_with_neighbors(
     }
 }
 
-fn player_chunk(pose: AuthoritativeTransform) -> ChunkCoordinate {
+fn player_chunk(pose: LocalPlayerPose) -> ChunkCoordinate {
     ChunkCoordinate::new(
         (pose.x / 16.0).floor() as i32,
         (pose.z / 16.0).floor() as i32,
@@ -791,14 +994,17 @@ fn camera_basis(yaw_degrees: f32, pitch_degrees: f32) -> ([f32; 3], [f32; 3], [f
         -pitch.sin(),
         yaw.cos() * pitch.cos(),
     ]);
-    let right = normalize(cross(forward, [0., 1., 0.]));
-    let up = cross(right, forward);
+    // Derive right directly from yaw. Crossing forward with fixed world-up is
+    // singular at Minecraft's legal +/-90-degree pitch poles and causes the
+    // view basis to flip even though the eye position remains unchanged.
+    let right = normalize([-yaw.cos(), 0.0, -yaw.sin()]);
+    let up = normalize(cross(right, forward));
     (forward, right, up)
 }
-fn look_to(eye: [f32; 3], forward: [f32; 3]) -> [[f32; 4]; 4] {
+fn look_to_basis(eye: [f32; 3], forward: [f32; 3], right: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
     let f = normalize(forward);
-    let r = normalize(cross(f, [0., 1., 0.]));
-    let u = cross(r, f);
+    let r = normalize(right);
+    let u = normalize(up);
     [
         [r[0], u[0], -f[0], 0.],
         [r[1], u[1], -f[1], 0.],
@@ -830,6 +1036,127 @@ fn multiply(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy)]
+    enum MouseTrace {
+        Horizontal,
+        Vertical,
+        Diagonal,
+        ClockwiseCircle,
+        CounterClockwiseCircle,
+        TightFastCircle,
+        SlowLargeCircle,
+        FigureEight,
+        HorizontalReversal,
+        VerticalReversal,
+    }
+
+    fn trace_deltas(trace: MouseTrace, count: usize) -> Vec<(f32, f32)> {
+        let point = |index: usize| {
+            let phase = index as f32 / count as f32 * std::f32::consts::TAU;
+            match trace {
+                MouseTrace::Horizontal => (index as f32 * 0.35, 0.0),
+                MouseTrace::Vertical => (0.0, index as f32 * 0.35),
+                MouseTrace::Diagonal => (index as f32 * 0.25, index as f32 * 0.2),
+                MouseTrace::ClockwiseCircle => (20.0 * phase.sin(), 20.0 * (1.0 - phase.cos())),
+                MouseTrace::CounterClockwiseCircle => {
+                    (-20.0 * phase.sin(), 20.0 * (1.0 - phase.cos()))
+                }
+                MouseTrace::TightFastCircle => (
+                    8.0 * (phase * 30.0).sin(),
+                    8.0 * (1.0 - (phase * 30.0).cos()),
+                ),
+                MouseTrace::SlowLargeCircle => (40.0 * phase.sin(), 40.0 * (1.0 - phase.cos())),
+                MouseTrace::FigureEight => (30.0 * phase.sin(), 18.0 * (phase * 2.0).sin()),
+                MouseTrace::HorizontalReversal => (18.0 * (phase * 30.0).sin(), 0.0),
+                MouseTrace::VerticalReversal => (0.0, 18.0 * (phase * 30.0).sin()),
+            }
+        };
+        let mut previous = point(0);
+        (1..=count)
+            .map(|index| {
+                let current = point(index);
+                let delta = (current.0 - previous.0, current.1 - previous.1);
+                previous = current;
+                delta
+            })
+            .collect()
+    }
+
+    fn angle_error(actual: f32, expected: f32) -> f32 {
+        ((actual - expected + 180.0).rem_euclid(360.0) - 180.0).abs()
+    }
+
+    fn assert_trace_follows_raw_path(trace: MouseTrace) -> (f32, f32) {
+        let start = Instant::now();
+        // Starting near the upper pitch limit exercises the nonlinear clamp
+        // that a circular gesture crosses in the real camera.
+        let initial = LocalPlayerPose::new(0.0, 64.0, 0.0, 15.0, 80.0);
+        let mut presentation = PosePresentation::new(RenderPoseSample {
+            pose: initial,
+            tick_at: start,
+            look: RenderLookSample::default(),
+            discontinuity: true,
+        });
+        let mut reference_yaw = initial.yaw;
+        let mut reference_pitch = initial.pitch;
+        let mut produced = RenderLookSample::default();
+        let mut acknowledged = RenderLookSample::default();
+        let mut simulated_yaw = initial.yaw;
+        let mut simulated_pitch = initial.pitch;
+        let mut persistent_max_error = 0.0_f32;
+        let mut legacy_max_error = 0.0_f32;
+
+        for (index, (yaw, pitch)) in trace_deltas(trace, 240).into_iter().enumerate() {
+            let sequence = index as u64 + 1;
+            produced.sequence = sequence;
+            produced.yaw_total += f64::from(yaw);
+            produced.pitch_total += f64::from(pitch);
+            reference_yaw = (reference_yaw + yaw).rem_euclid(360.0);
+            reference_pitch = (reference_pitch + pitch).clamp(-90.0, 90.0);
+            presentation.preview_look(sequence, yaw, pitch);
+
+            // Four or more direction reversals can occur between these 20 Hz
+            // samples in the fast traces.
+            let new_simulated_pose = sequence.is_multiple_of(12);
+            if new_simulated_pose {
+                simulated_yaw = reference_yaw;
+                simulated_pitch = reference_pitch;
+                acknowledged = produced;
+                presentation.apply(RenderPoseSample {
+                    pose: LocalPlayerPose::new(
+                        sequence as f64 / 100.0,
+                        64.0,
+                        0.0,
+                        simulated_yaw,
+                        simulated_pitch,
+                    ),
+                    tick_at: start + Duration::from_millis(sequence),
+                    look: acknowledged,
+                    discontinuity: false,
+                });
+            }
+
+            let displayed = presentation.display(start + Duration::from_millis(sequence));
+            persistent_max_error = persistent_max_error
+                .max(angle_error(displayed.yaw, reference_yaw))
+                .max((displayed.pitch - reference_pitch).abs());
+
+            let legacy_yaw = (simulated_yaw + (produced.yaw_total - acknowledged.yaw_total) as f32)
+                .rem_euclid(360.0);
+            let legacy_pitch = (simulated_pitch
+                + (produced.pitch_total - acknowledged.pitch_total) as f32)
+                .clamp(-90.0, 90.0);
+            legacy_max_error = legacy_max_error
+                .max(angle_error(legacy_yaw, reference_yaw))
+                .max((legacy_pitch - reference_pitch).abs());
+        }
+        assert!(
+            persistent_max_error < 1.0e-4,
+            "trajectory error {persistent_max_error}"
+        );
+        (legacy_max_error, persistent_max_error)
+    }
+
     fn assert_vector_close(actual: [f32; 3], expected: [f32; 3]) {
         for (actual, expected) in actual.into_iter().zip(expected) {
             assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
@@ -849,18 +1176,273 @@ mod tests {
 
     #[test]
     fn camera_matrix_is_finite_and_aspect_sensitive() {
-        let pose = AuthoritativeTransform {
+        let pose = LocalPlayerPose {
             x: 1.,
             y: 64.,
             z: -2.,
             yaw: 30.,
             pitch: -10.,
-            teleport_id: 1,
+            eye_height: 1.62,
         };
         let a = CameraUniform::from_pose(pose, 1280, 720);
         let b = CameraUniform::from_pose(pose, 720, 720);
         assert!(a.view_projection.iter().flatten().all(|v| v.is_finite()));
         assert_ne!(a.view_projection, b.view_projection);
+    }
+
+    #[test]
+    fn render_only_look_preview_wraps_yaw_and_clamps_pitch() {
+        let now = Instant::now();
+        let pose = LocalPlayerPose::new(1.0, 64.0, 2.0, 350.0, 80.0);
+        let mut presentation = PosePresentation::new(RenderPoseSample {
+            pose,
+            tick_at: now,
+            look: RenderLookSample::default(),
+            discontinuity: true,
+        });
+        presentation.preview_look(1, 20.0, 30.0);
+        let displayed = presentation.display(now);
+        assert_eq!((displayed.yaw, displayed.pitch), (10.0, 90.0));
+        presentation.preview_look(2, f32::NAN, -20.0);
+        let displayed = presentation.display(now);
+        assert_eq!((displayed.yaw, displayed.pitch), (10.0, 90.0));
+    }
+
+    #[test]
+    fn partial_tick_presentation_interpolates_translation_and_eye_height_only() {
+        let start = Instant::now();
+        let previous = LocalPlayerPose {
+            x: 0.0,
+            y: 64.0,
+            z: 0.0,
+            yaw: 10.0,
+            pitch: 5.0,
+            eye_height: 1.62,
+        };
+        let current = LocalPlayerPose {
+            x: 1.0,
+            y: 65.0,
+            z: -2.0,
+            yaw: 30.0,
+            pitch: 15.0,
+            eye_height: 1.27,
+        };
+        let mut presentation = PosePresentation::new(RenderPoseSample {
+            pose: previous,
+            tick_at: start - SIMULATION_TICK,
+            look: RenderLookSample::default(),
+            discontinuity: true,
+        });
+        presentation.apply(RenderPoseSample {
+            pose: current,
+            tick_at: start,
+            look: RenderLookSample::default(),
+            discontinuity: false,
+        });
+
+        let halfway = presentation.display(start + SIMULATION_TICK / 2);
+        assert_eq!((halfway.x, halfway.y, halfway.z), (0.5, 64.5, -1.0));
+        assert!((halfway.eye_height - 1.445).abs() < 1.0e-9);
+        // Ordinary 20 Hz samples update translation but cannot replace the
+        // persistent display-rate orientation without a mouse event.
+        assert_eq!((halfway.yaw, halfway.pitch), (10.0, 5.0));
+        let at_tick = presentation.display(start + SIMULATION_TICK);
+        assert_eq!((at_tick.x, at_tick.y, at_tick.z), (1.0, 65.0, -2.0));
+        assert_eq!((at_tick.yaw, at_tick.pitch), (10.0, 5.0));
+    }
+
+    #[test]
+    fn a_new_jump_pose_starts_moving_on_the_first_post_tick_frame() {
+        let start = Instant::now();
+        let grounded = LocalPlayerPose::new(0.0, 64.0, 0.0, 0.0, 0.0);
+        let airborne = LocalPlayerPose::new(0.0, 64.42, 0.0, 0.0, 0.0);
+        let mut presentation = PosePresentation::new(RenderPoseSample {
+            pose: grounded,
+            tick_at: start - SIMULATION_TICK,
+            look: RenderLookSample::default(),
+            discontinuity: true,
+        });
+        presentation.apply(RenderPoseSample {
+            pose: airborne,
+            tick_at: start,
+            look: RenderLookSample::default(),
+            discontinuity: false,
+        });
+
+        let first_frame = presentation.display(start + Duration::from_millis(2));
+        assert!(first_frame.y > grounded.y);
+        assert!(first_frame.y < airborne.y);
+        assert!((first_frame.y - 64.0168).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn corrections_snap_and_cumulative_look_ack_never_builds_a_backlog() {
+        let start = Instant::now();
+        let initial = LocalPlayerPose::new(0.0, 64.0, 0.0, 0.0, 0.0);
+        let mut presentation = PosePresentation::new(RenderPoseSample {
+            pose: initial,
+            tick_at: start,
+            look: RenderLookSample::default(),
+            discontinuity: true,
+        });
+        let mut yaw_total = 0.0_f64;
+        let mut pitch_total = 0.0_f64;
+        for sequence in 1..=10_000_u64 {
+            let yaw = 0.125;
+            let pitch = if sequence % 2 == 0 { 0.025 } else { -0.025 };
+            presentation.preview_look(sequence, yaw, pitch);
+            yaw_total += f64::from(yaw);
+            pitch_total += f64::from(pitch);
+            if sequence % 10 == 0 {
+                let pose = LocalPlayerPose::new(
+                    f64::from(sequence as u32) / 100.0,
+                    64.0,
+                    0.0,
+                    yaw_total as f32,
+                    pitch_total as f32,
+                );
+                presentation.apply(RenderPoseSample {
+                    pose,
+                    tick_at: start + Duration::from_millis(sequence / 10 * 50),
+                    look: RenderLookSample {
+                        sequence,
+                        yaw_total,
+                        pitch_total,
+                    },
+                    discontinuity: false,
+                });
+                let displayed = presentation.display(presentation.tick_at);
+                assert!((displayed.yaw - pose.yaw.rem_euclid(360.0)).abs() < 1.0e-4);
+                assert!((displayed.pitch - pose.pitch).abs() < 1.0e-4);
+                assert_eq!(presentation.produced_look, presentation.acknowledged_look);
+            }
+        }
+
+        let corrected = LocalPlayerPose::new(100.0, 70.0, -30.0, 45.0, 10.0);
+        presentation.apply(RenderPoseSample {
+            pose: corrected,
+            tick_at: start + Duration::from_secs(60),
+            look: presentation.acknowledged_look,
+            discontinuity: true,
+        });
+        assert_eq!(
+            presentation.display(start + Duration::from_secs(60)),
+            corrected
+        );
+    }
+
+    #[test]
+    fn frequent_movement_pose_updates_never_drop_pending_mouse_preview() {
+        let start = Instant::now();
+        let initial = LocalPlayerPose::new(0.0, 64.0, 0.0, 0.0, 0.0);
+        let mut presentation = PosePresentation::new(RenderPoseSample {
+            pose: initial,
+            tick_at: start,
+            look: RenderLookSample::default(),
+            discontinuity: true,
+        });
+        let mut produced_yaw = 0.0_f64;
+        let mut reference_yaw = 0.0_f32;
+
+        for sequence in 1..=2_000_u64 {
+            let yaw_delta = if sequence % 3 == 0 { -0.075 } else { 0.125 };
+            presentation.preview_look(sequence, yaw_delta, 0.0);
+            produced_yaw += f64::from(yaw_delta);
+            reference_yaw = (reference_yaw + yaw_delta).rem_euclid(360.0);
+
+            // Model the extra fixed-tick pose publications seen while held or
+            // rapidly changing movement keys. They may acknowledge only the
+            // mouse input actually consumed by that simulation tick.
+            if sequence % 7 == 0 {
+                let acknowledged_yaw = produced_yaw;
+                presentation.apply(RenderPoseSample {
+                    pose: LocalPlayerPose::new(
+                        sequence as f64 / 100.0,
+                        64.0,
+                        0.0,
+                        acknowledged_yaw as f32,
+                        0.0,
+                    ),
+                    tick_at: start + Duration::from_millis(sequence),
+                    look: RenderLookSample {
+                        sequence,
+                        yaw_total: acknowledged_yaw,
+                        pitch_total: 0.0,
+                    },
+                    discontinuity: false,
+                });
+            }
+
+            let displayed = presentation.display(start + Duration::from_millis(sequence));
+            assert!(angle_error(displayed.yaw, reference_yaw) < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn persistent_display_look_matches_straight_circle_reversal_and_figure_eight_paths() {
+        let straight = assert_trace_follows_raw_path(MouseTrace::Horizontal);
+        let vertical = assert_trace_follows_raw_path(MouseTrace::Vertical);
+        let diagonal = assert_trace_follows_raw_path(MouseTrace::Diagonal);
+        let clockwise = assert_trace_follows_raw_path(MouseTrace::ClockwiseCircle);
+        let counter = assert_trace_follows_raw_path(MouseTrace::CounterClockwiseCircle);
+        let tight = assert_trace_follows_raw_path(MouseTrace::TightFastCircle);
+        let large = assert_trace_follows_raw_path(MouseTrace::SlowLargeCircle);
+        let figure_eight = assert_trace_follows_raw_path(MouseTrace::FigureEight);
+        let horizontal_reversal = assert_trace_follows_raw_path(MouseTrace::HorizontalReversal);
+        let vertical_reversal = assert_trace_follows_raw_path(MouseTrace::VerticalReversal);
+
+        assert!(straight.0 < 1.0e-4 && horizontal_reversal.0 < 1.0e-4);
+        assert!(vertical.0 < 1.0e-4);
+        assert!(
+            vertical_reversal.0 > 1.0,
+            "vertical reversal: {vertical_reversal:?}"
+        );
+        assert!(clockwise.0 < 1.0e-4 && counter.0 < 1.0e-4);
+        assert!(tight.0 > 1.0 && figure_eight.0 > 0.5);
+        assert!(large.0 < 1.0e-4);
+        assert!(diagonal.1 < 1.0e-4);
+    }
+
+    #[test]
+    fn local_tick_acknowledgement_does_not_move_display_but_correction_rebases_it() {
+        let start = Instant::now();
+        let mut presentation = PosePresentation::new(RenderPoseSample {
+            pose: LocalPlayerPose::new(0.0, 64.0, 0.0, 10.0, 5.0),
+            tick_at: start,
+            look: RenderLookSample::default(),
+            discontinuity: true,
+        });
+        presentation.preview_look(1, 20.0, 10.0);
+        presentation.preview_look(2, -3.0, 4.0);
+        let before_ack = presentation.display(start);
+        presentation.apply(RenderPoseSample {
+            pose: LocalPlayerPose::new(1.0, 64.0, 0.0, 27.0, 19.0),
+            tick_at: start + Duration::from_millis(50),
+            look: RenderLookSample {
+                sequence: 2,
+                yaw_total: 17.0,
+                pitch_total: 14.0,
+            },
+            discontinuity: false,
+        });
+        let after_ack = presentation.display(start + Duration::from_millis(50));
+        assert_eq!((before_ack.yaw, before_ack.pitch), (27.0, 19.0));
+        assert_eq!((after_ack.yaw, after_ack.pitch), (27.0, 19.0));
+
+        presentation.preview_look(3, 2.0, -1.0);
+        presentation.apply(RenderPoseSample {
+            pose: LocalPlayerPose::new(20.0, 70.0, -5.0, 90.0, -20.0),
+            tick_at: start + Duration::from_millis(75),
+            look: RenderLookSample {
+                sequence: 2,
+                yaw_total: 17.0,
+                pitch_total: 14.0,
+            },
+            discontinuity: true,
+        });
+        let corrected = presentation.display(start + Duration::from_millis(75));
+        assert_eq!((corrected.yaw, corrected.pitch), (92.0, -21.0));
+        assert_eq!((corrected.x, corrected.y, corrected.z), (20.0, 70.0, -5.0));
     }
 
     #[test]
@@ -883,14 +1465,53 @@ mod tests {
     }
 
     #[test]
+    fn camera_basis_is_finite_and_continuous_at_pitch_poles() {
+        for yaw in [0.0, 90.0, 180.0, 270.0, 37.25] {
+            let mut previous_right = None;
+            for pitch in [-90.0, -89.999, -89.0, 0.0, 89.0, 89.999, 90.0] {
+                let (forward, right, up) = camera_basis(yaw, pitch);
+                for vector in [forward, right, up] {
+                    assert!(vector.into_iter().all(f32::is_finite));
+                    assert!((dot(vector, vector) - 1.0).abs() < 1.0e-5);
+                }
+                assert!(dot(forward, right).abs() < 1.0e-5);
+                assert!(dot(forward, up).abs() < 1.0e-5);
+                assert!(dot(right, up).abs() < 1.0e-5);
+                if let Some(previous) = previous_right {
+                    assert!(dot(previous, right) > 0.99999);
+                }
+                previous_right = Some(right);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_pitch_poles_keep_a_finite_view_at_the_eye_origin() {
+        for yaw in [0.0, 90.0, 180.0, 270.0, 123.5] {
+            for pitch in [-90.0, 90.0] {
+                let pose = LocalPlayerPose::new(4.0, 70.0, -3.0, yaw, pitch);
+                let (forward, right, up) = camera_basis(yaw, pitch);
+                let eye = [
+                    pose.x as f32,
+                    (pose.y + pose.eye_height) as f32,
+                    pose.z as f32,
+                ];
+                let view = look_to_basis(eye, forward, right, up);
+                assert!(view.into_iter().flatten().all(f32::is_finite));
+                assert_eq!(eye, [4.0, 71.62, -3.0]);
+            }
+        }
+    }
+
+    #[test]
     fn view_projection_places_east_on_left_when_facing_south() {
-        let pose = AuthoritativeTransform {
+        let pose = LocalPlayerPose {
             x: 0.0,
             y: 64.0,
             z: 0.0,
             yaw: 0.0,
             pitch: 0.0,
-            teleport_id: 1,
+            eye_height: 1.62,
         };
         let camera = CameraUniform::from_pose(pose, 1280, 720);
         let east = transform(camera.view_projection, [1.0, 65.62, 10.0, 1.0]);
@@ -955,13 +1576,13 @@ mod tests {
         let east = ChunkCoordinate::new(5, 0);
         let dirty = BTreeMap::from([(west, 1), (east, 2)]);
         let pending = BTreeSet::new();
-        let pose = |x| AuthoritativeTransform {
+        let pose = |x| LocalPlayerPose {
             x,
             y: 64.0,
             z: 0.0,
             yaw: 0.0,
             pitch: 0.0,
-            teleport_id: 1,
+            eye_height: 1.62,
         };
 
         assert_eq!(player_chunk(pose(-0.1)), ChunkCoordinate::new(-1, 0));
@@ -986,6 +1607,27 @@ mod tests {
             sender.try_send(()),
             Err(mpsc::TrySendError::Full(()))
         ));
+    }
+
+    #[test]
+    fn mesh_integration_allows_initial_progress_and_dispatch_respects_deadline() {
+        assert!(mesh_integration_permitted(0, Duration::from_secs(1)));
+        assert!(mesh_integration_permitted(1, Duration::from_millis(3)));
+        assert!(!mesh_integration_permitted(1, Duration::from_millis(4)));
+        assert!(!mesh_integration_permitted(
+            MAX_MESH_RESULTS_PER_PREPARE,
+            Duration::ZERO
+        ));
+        assert!(!mesh_dispatch_permitted(0, Duration::from_secs(1)));
+        assert!(mesh_dispatch_permitted(0, Duration::from_millis(3)));
+        assert!(mesh_dispatch_permitted(1, Duration::from_millis(3)));
+        assert!(!mesh_dispatch_permitted(1, Duration::from_millis(4)));
+        assert!(!mesh_dispatch_permitted(
+            MAX_MESH_DISPATCHES_PER_PREPARE,
+            Duration::ZERO
+        ));
+        assert!(mesh_dispatch_capacity_available(MAX_PENDING_MESH_JOBS - 1));
+        assert!(!mesh_dispatch_capacity_available(MAX_PENDING_MESH_JOBS));
     }
 
     #[test]
@@ -1067,5 +1709,10 @@ mod tests {
         mark_dirty_with_neighbors(&mut dirty, east, 3);
         assert_eq!(dirty.get(&center), Some(&3));
         assert_eq!(dirty.get(&east), Some(&3));
+    }
+
+    #[test]
+    fn terrain_backface_culling_prevents_coplanar_cross_face_fighting() {
+        assert_eq!(TERRAIN_CULL_MODE, Some(Face::Back));
     }
 }

@@ -19,6 +19,7 @@ cubic-world = { path = "../cubic-world" }
 tokio.workspace = true
 time = { workspace = true, features = ["local-offset"] }
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]

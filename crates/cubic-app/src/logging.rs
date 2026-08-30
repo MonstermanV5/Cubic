@@ -3,7 +3,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::Path,
-    sync::{Arc, Mutex},
 };
 
 use time::OffsetDateTime;
@@ -11,33 +10,40 @@ use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
 
 const RETAINED_LOGS: usize = 5;
+const BUFFERED_LOG_LINES: usize = 8_192;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LogLevel {
     Info,
     Debug,
+    Trace,
 }
 
 impl LogLevel {
     fn configured() -> Self {
         std::env::var("CUBIC_LOG_LEVEL")
             .ok()
-            .and_then(|value| Self::parse(&value))
-            .unwrap_or(Self::Info)
+            .map_or(Self::Info, |value| Self::resolve(&value))
     }
 
     fn parse(value: &str) -> Option<Self> {
         match value {
             "info" | "INFO" => Some(Self::Info),
             "debug" | "DEBUG" => Some(Self::Debug),
+            "trace" | "TRACE" => Some(Self::Trace),
             _ => None,
         }
+    }
+
+    fn resolve(value: &str) -> Self {
+        Self::parse(value).unwrap_or(Self::Info)
     }
 
     const fn filter(self) -> LevelFilter {
         match self {
             Self::Info => LevelFilter::INFO,
             Self::Debug => LevelFilter::DEBUG,
+            Self::Trace => LevelFilter::TRACE,
         }
     }
 }
@@ -64,21 +70,24 @@ impl fmt::Display for LoggingError {
     }
 }
 
-pub(crate) fn initialize() -> Result<(), LoggingError> {
+pub(crate) fn initialize() -> Result<tracing_appender::non_blocking::WorkerGuard, LoggingError> {
     let root =
         cubic_platform::persistent_data_directory().ok_or(LoggingError::NoPlatformDataDirectory)?;
     let file = prepare_log_file(&root.join("logs"))?;
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(BUFFERED_LOG_LINES)
+        .lossy(true)
+        .finish(TeeWriter { file });
     tracing_subscriber::fmt()
-        .with_writer(TeeMakeWriter {
-            file: Arc::new(Mutex::new(file)),
-        })
+        .with_writer(writer)
         .with_timer(SystemLocalTime)
         .with_thread_names(true)
         .with_target(true)
         .with_ansi(false)
         .with_max_level(LogLevel::configured().filter())
         .try_init()
-        .map_err(|error| LoggingError::Subscriber(error.to_string()))
+        .map_err(|error| LoggingError::Subscriber(error.to_string()))?;
+    Ok(guard)
 }
 
 pub(crate) fn initialize_stderr_only() {
@@ -145,42 +154,19 @@ fn archive_name(index: usize) -> String {
     format!("previous-{index}.log")
 }
 
-#[derive(Clone)]
-struct TeeMakeWriter {
-    file: Arc<Mutex<File>>,
-}
-
-impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TeeMakeWriter {
-    type Writer = TeeWriter;
-
-    fn make_writer(&'writer self) -> Self::Writer {
-        TeeWriter {
-            file: Arc::clone(&self.file),
-        }
-    }
-}
-
 struct TeeWriter {
-    file: Arc<Mutex<File>>,
+    file: File,
 }
 
 impl Write for TeeWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::other("log lock poisoned"))?;
-        file.write_all(buffer)?;
+        self.file.write_all(buffer)?;
         io::stderr().write_all(buffer)?;
         Ok(buffer.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::other("log lock poisoned"))?;
-        file.flush()?;
+        self.file.flush()?;
         io::stderr().flush()
     }
 }
@@ -212,10 +198,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configured_levels_are_deliberately_small() {
+    fn configured_levels_accept_supported_case_forms_and_fall_back_safely() {
         assert_eq!(LogLevel::parse("info"), Some(LogLevel::Info));
+        assert_eq!(LogLevel::parse("INFO"), Some(LogLevel::Info));
+        assert_eq!(LogLevel::parse("debug"), Some(LogLevel::Debug));
         assert_eq!(LogLevel::parse("DEBUG"), Some(LogLevel::Debug));
-        assert_eq!(LogLevel::parse("trace"), None);
+        assert_eq!(LogLevel::parse("trace"), Some(LogLevel::Trace));
+        assert_eq!(LogLevel::parse("TRACE"), Some(LogLevel::Trace));
+        assert_eq!(LogLevel::resolve("unsupported"), LogLevel::Info);
+        assert_eq!(LogLevel::Info.filter(), LevelFilter::INFO);
+        assert_eq!(LogLevel::Debug.filter(), LevelFilter::DEBUG);
+        assert_eq!(LogLevel::Trace.filter(), LevelFilter::TRACE);
     }
 
     #[test]

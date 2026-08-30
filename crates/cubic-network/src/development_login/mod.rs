@@ -551,6 +551,9 @@ async fn await_initial_play_login(
             PlayClientbound::PlayerChat { .. }
             | PlayClientbound::DisguisedChat { .. }
             | PlayClientbound::SystemChat { .. }
+            | PlayClientbound::PlayerRotation(_)
+            | PlayClientbound::PlayerAbilities(_)
+            | PlayClientbound::SetEntityMotion(_)
             | PlayClientbound::Respawn(_)
             | PlayClientbound::SetDefaultSpawnPosition(_)
             | PlayClientbound::SetTime(_)
@@ -563,6 +566,8 @@ async fn await_initial_play_login(
             | PlayClientbound::LevelChunkWithLight(_)
             | PlayClientbound::ForgetLevelChunk { .. }
             | PlayClientbound::LightUpdate(_)
+            | PlayClientbound::BlockUpdate(_)
+            | PlayClientbound::SectionBlocksUpdate(_)
             | PlayClientbound::Ignored { .. } => {}
         }
     }

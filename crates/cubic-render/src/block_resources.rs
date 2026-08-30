@@ -86,6 +86,7 @@ impl Direction {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ModelFace {
+    pub direction: Direction,
     pub corners: [[f32; 3]; 4],
     pub uv: [[f32; 2]; 4],
     pub texture: String,
@@ -299,8 +300,10 @@ fn prepare_runtime_state(models: &mut StateModels, atlas: &TextureAtlasData) {
         for (_, model) in &mut part.entries {
             for face in &mut model.faces {
                 if model.uvlock {
-                    face.uv.rotate_left(usize::from(
-                        ((model.x_rotation + model.y_rotation) / 90) % 4,
+                    face.uv.rotate_left(uvlock_quarter_turns(
+                        face.direction,
+                        model.x_rotation,
+                        model.y_rotation,
                     ));
                 }
                 face.corners = face.corners.map(|corner| {
@@ -370,6 +373,26 @@ pub(crate) fn rotate_blockstate_direction(
         };
     }
     direction
+}
+
+pub(crate) fn uvlock_quarter_turns(
+    direction: Direction,
+    x_rotation: u16,
+    y_rotation: u16,
+) -> usize {
+    let source = face_corners([0.0; 3], [1.0; 3], direction);
+    let transformed_first = rotate_blockstate_corner(source[0], x_rotation, y_rotation);
+    let target_direction = rotate_blockstate_direction(direction, x_rotation, y_rotation);
+    let target = face_corners([0.0; 3], [1.0; 3], target_direction);
+    target
+        .iter()
+        .position(|corner| {
+            corner
+                .iter()
+                .zip(transformed_first)
+                .all(|(left, right)| (*left - right).abs() < 1.0e-5)
+        })
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug)]
@@ -926,6 +949,7 @@ fn bake_model(model: &ResolvedModel) -> Result<Vec<ModelFace>, BlockResourceErro
             uv_corners.rotate_left(rotations);
             let texture = resolve_texture(&face.texture, &model.textures)?;
             faces.push(ModelFace {
+                direction,
                 corners: corners
                     .map(|corner| [corner[0] / 16.0, corner[1] / 16.0, corner[2] / 16.0]),
                 uv: uv_corners,
@@ -1543,6 +1567,57 @@ mod tests {
     }
 
     #[test]
+    fn zero_thickness_cross_faces_are_coplanar_with_opposite_winding() {
+        let mut source = MemorySource::default();
+        source.insert(
+            "assets/minecraft/models/block/test_cross.json",
+            r##"{"textures":{"cross":"minecraft:block/test"},"elements":[{"from":[0.8,0,8],"to":[15.2,16,8],"faces":{"north":{"texture":"#cross"},"south":{"texture":"#cross"}}}]}"##,
+        );
+        let mut loader = Loader::new(&mut source);
+        let resolved = loader
+            .resolve_model(&identifier("minecraft:block/test_cross"), &mut Vec::new())
+            .unwrap();
+        let faces = bake_model(&resolved).unwrap();
+        assert_eq!(faces.len(), 2);
+
+        let sorted = |mut corners: [[f32; 3]; 4]| {
+            corners.sort_by(|left, right| {
+                left.iter()
+                    .zip(right)
+                    .find_map(|(left, right)| {
+                        let ordering = left.total_cmp(right);
+                        (ordering != std::cmp::Ordering::Equal).then_some(ordering)
+                    })
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            corners
+        };
+        assert_eq!(sorted(faces[0].corners), sorted(faces[1].corners));
+
+        let normal = |corners: [[f32; 3]; 4]| {
+            let a = [
+                corners[1][0] - corners[0][0],
+                corners[1][1] - corners[0][1],
+                corners[1][2] - corners[0][2],
+            ];
+            let b = [
+                corners[2][0] - corners[0][0],
+                corners[2][1] - corners[0][1],
+                corners[2][2] - corners[0][2],
+            ];
+            [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            ]
+        };
+        let first = normal(faces[0].corners);
+        let second = normal(faces[1].corners);
+        let dot = first[0] * second[0] + first[1] * second[1] + first[2] * second[2];
+        assert!(dot < 0.0, "opposing faces must have opposite winding");
+    }
+
+    #[test]
     fn parent_and_texture_cycles_are_rejected() {
         let mut source = MemorySource::default();
         source.insert(
@@ -1973,7 +2048,7 @@ mod tests {
             Some(rotate_blockstate_direction(original_cull, 0, 90))
         );
         let mut expected_uv = original_uv;
-        expected_uv.rotate_left(1);
+        expected_uv.rotate_left(uvlock_quarter_turns(model.faces[0].direction, 0, 90));
         assert_eq!(model.faces[0].uv, expected_uv);
         assert_eq!(model.faces[0].atlas_region, atlas.region("cubic:missing"));
         assert!(state.full_opaque_cube);
@@ -1988,7 +2063,7 @@ mod tests {
         prepare_runtime_state(&mut x_rotated, &atlas);
         let x_model = &x_rotated.parts[0].entries[0].1;
         let mut expected_uv = original_uv;
-        expected_uv.rotate_left(1);
+        expected_uv.rotate_left(uvlock_quarter_turns(model.faces[0].direction, 90, 0));
         assert_eq!(x_model.faces[0].uv, expected_uv);
         assert_eq!(
             x_model.faces[0].corners[0],
@@ -1998,6 +2073,113 @@ mod tests {
             x_model.faces[0].cullface,
             Some(rotate_blockstate_direction(original_cull, 90, 0))
         );
+    }
+
+    #[test]
+    fn uvlock_uses_direction_specific_face_bases_for_stair_rotations() {
+        let y90 = [
+            (Direction::Down, 1),
+            (Direction::Up, 3),
+            (Direction::North, 0),
+            (Direction::South, 0),
+            (Direction::West, 0),
+            (Direction::East, 0),
+        ];
+        for (direction, expected) in y90 {
+            assert_eq!(uvlock_quarter_turns(direction, 0, 90), expected);
+        }
+
+        let x180 = [
+            (Direction::Down, 0),
+            (Direction::Up, 0),
+            (Direction::North, 2),
+            (Direction::South, 2),
+            (Direction::West, 2),
+            (Direction::East, 2),
+        ];
+        for (direction, expected) in x180 {
+            assert_eq!(uvlock_quarter_turns(direction, 180, 0), expected);
+        }
+
+        // Representative official 26.1.2 stairs use Y quarter-turns for all
+        // horizontal facings and X=180 for top-half models. Combining them
+        // remains deterministic for every inner/outer/straight model face.
+        for x in [0, 180] {
+            for y in [0, 90, 180, 270] {
+                for direction in Direction::ALL {
+                    assert!(uvlock_quarter_turns(direction, x, y) < 4);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn representative_official_stair_states_keep_their_model_transforms() {
+        let cases = [
+            ("minecraft:block/oak_stairs", 0, 0, false),
+            ("minecraft:block/oak_stairs", 0, 270, true),
+            ("minecraft:block/oak_stairs_inner", 0, 90, true),
+            ("minecraft:block/oak_stairs_outer", 0, 90, true),
+            ("minecraft:block/oak_stairs_inner", 180, 0, true),
+            ("minecraft:block/oak_stairs_outer", 180, 0, true),
+            ("minecraft:block/oak_stairs", 180, 90, true),
+            ("minecraft:block/oak_stairs_inner", 180, 270, true),
+        ];
+        for (model, x, y, uvlock) in cases {
+            let reference = parse_model_references(&serde_json::json!({
+                "model": model,
+                "x": x,
+                "y": y,
+                "uvlock": uvlock
+            }))
+            .unwrap()
+            .remove(0);
+            assert_eq!(reference.model.as_str(), model);
+            assert_eq!((reference.x, reference.y, reference.uvlock), (x, y, uvlock));
+        }
+    }
+
+    #[test]
+    fn official_door_blockstate_rotations_keep_thin_model_inside_the_cell() {
+        let base_corners = [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [3.0 / 16.0, 0.0, 0.0],
+            [3.0 / 16.0, 0.0, 1.0],
+            [3.0 / 16.0, 1.0, 0.0],
+            [3.0 / 16.0, 1.0, 1.0],
+        ];
+        for y in [0, 90, 180, 270] {
+            let rotated = base_corners.map(|corner| rotate_blockstate_corner(corner, 0, y));
+            assert!(
+                rotated
+                    .iter()
+                    .flatten()
+                    .all(|value| (0.0..=1.0).contains(value))
+            );
+            let min_x = rotated
+                .iter()
+                .map(|corner| corner[0])
+                .fold(f32::INFINITY, f32::min);
+            let max_x = rotated
+                .iter()
+                .map(|corner| corner[0])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let min_z = rotated
+                .iter()
+                .map(|corner| corner[2])
+                .fold(f32::INFINITY, f32::min);
+            let max_z = rotated
+                .iter()
+                .map(|corner| corner[2])
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                (max_x - min_x - 3.0 / 16.0).abs() < 1.0e-6
+                    || (max_z - min_z - 3.0 / 16.0).abs() < 1.0e-6
+            );
+        }
     }
 
     #[test]

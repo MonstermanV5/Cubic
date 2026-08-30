@@ -46,6 +46,7 @@ pub const MAX_PLAYER_PUBLIC_KEY_BYTES: usize = 512;
 pub const MAX_PLAYER_KEY_SIGNATURE_BYTES: usize = 4096;
 pub const MAX_KNOWN_DIMENSIONS: usize = 1_024;
 pub const MAX_WORLD_CLOCKS: usize = 64;
+pub const MAX_SECTION_BLOCK_UPDATES: usize = 4_096;
 
 const LOGIN_START_ID: i32 = 0x00;
 const LOGIN_DISCONNECT_ID: i32 = 0x00;
@@ -93,14 +94,23 @@ const PLAY_CHAT_ACKNOWLEDGEMENT_ID: i32 = 0x06;
 const PLAY_CHAT_MESSAGE_ID: i32 = 0x09;
 const PLAY_CHAT_SESSION_UPDATE_ID: i32 = 0x0a;
 const PLAY_CHUNK_BATCH_RECEIVED_ID: i32 = 0x0b;
+const PLAY_CLIENT_TICK_END_ID: i32 = 0x0d;
 const PLAY_CLIENT_INFORMATION_ID: i32 = 0x0e;
 const PLAY_ACKNOWLEDGE_CONFIGURATION_ID: i32 = 0x10;
 const PLAY_COOKIE_RESPONSE_ID: i32 = 0x15;
 const PLAY_KEEP_ALIVE_RESPONSE_ID: i32 = 0x1c;
+const PLAY_MOVE_PLAYER_POS_ID: i32 = 0x1e;
+const PLAY_MOVE_PLAYER_POS_ROT_ID: i32 = 0x1f;
+const PLAY_MOVE_PLAYER_ROT_ID: i32 = 0x20;
+const PLAY_MOVE_PLAYER_STATUS_ONLY_ID: i32 = 0x21;
+const PLAY_PLAYER_ABILITIES_ID: i32 = 0x28;
+const PLAY_PLAYER_COMMAND_ID: i32 = 0x2a;
+const PLAY_PLAYER_INPUT_ID: i32 = 0x2b;
 const PLAY_PLAYER_LOADED_ID: i32 = 0x2c;
 const PLAY_PONG_ID: i32 = 0x2d;
 
 const PLAY_CHANGE_DIFFICULTY_ID: i32 = 0x0a;
+const PLAY_BLOCK_UPDATE_ID: i32 = 0x08;
 const PLAY_CHUNK_BATCH_FINISHED_ID: i32 = 0x0b;
 const PLAY_CHUNK_BATCH_START_ID: i32 = 0x0c;
 const PLAY_COOKIE_REQUEST_ID: i32 = 0x15;
@@ -117,10 +127,14 @@ const PLAY_DISGUISED_CHAT_ID: i32 = 0x21;
 const PLAY_KEEP_ALIVE_ID: i32 = 0x2c;
 const PLAY_PING_ID: i32 = 0x3d;
 const PLAY_PLAYER_CHAT_ID: i32 = 0x41;
+const PLAY_CLIENTBOUND_PLAYER_ABILITIES_ID: i32 = 0x40;
 const PLAY_PLAYER_POSITION_ID: i32 = 0x48;
+const PLAY_PLAYER_ROTATION_ID: i32 = 0x49;
 const PLAY_RESPAWN_ID: i32 = 0x52;
+const PLAY_SECTION_BLOCKS_UPDATE_ID: i32 = 0x54;
 const PLAY_SET_DEFAULT_SPAWN_POSITION_ID: i32 = 0x61;
 const PLAY_SET_HEALTH_ID: i32 = 0x68;
+const PLAY_SET_ENTITY_MOTION_ID: i32 = 0x65;
 const PLAY_SET_TIME_ID: i32 = 0x71;
 const PLAY_START_CONFIGURATION_ID: i32 = 0x76;
 const PLAY_SYSTEM_CHAT_ID: i32 = 0x79;
@@ -147,6 +161,12 @@ pub const fn packet_identity_cross_checks() -> &'static [PacketIdentityCheck] {
     use PacketDirection::{Clientbound as C, Serverbound as S};
     use ProtocolState::{Configuration as Config, Handshake, Login, Play, Status};
     &[
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:block_update",
+            id: PLAY_BLOCK_UPDATE_ID as u32,
+        },
         PacketIdentityCheck {
             state: Handshake,
             direction: S,
@@ -293,6 +313,48 @@ pub const fn packet_identity_cross_checks() -> &'static [PacketIdentityCheck] {
         },
         PacketIdentityCheck {
             state: Play,
+            direction: S,
+            identity: "minecraft:move_player_pos",
+            id: PLAY_MOVE_PLAYER_POS_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:move_player_pos_rot",
+            id: PLAY_MOVE_PLAYER_POS_ROT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:move_player_rot",
+            id: PLAY_MOVE_PLAYER_ROT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:move_player_status_only",
+            id: PLAY_MOVE_PLAYER_STATUS_ONLY_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:player_abilities",
+            id: PLAY_PLAYER_ABILITIES_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:player_command",
+            id: PLAY_PLAYER_COMMAND_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:player_input",
+            id: PLAY_PLAYER_INPUT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
             direction: C,
             identity: "minecraft:custom_payload",
             id: PLAY_CUSTOM_PAYLOAD_ID as u32,
@@ -348,6 +410,12 @@ pub const fn packet_identity_cross_checks() -> &'static [PacketIdentityCheck] {
         PacketIdentityCheck {
             state: Play,
             direction: C,
+            identity: "minecraft:player_abilities",
+            id: PLAY_CLIENTBOUND_PLAYER_ABILITIES_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
             identity: "minecraft:player_chat",
             id: PLAY_PLAYER_CHAT_ID as u32,
         },
@@ -368,6 +436,12 @@ pub const fn packet_identity_cross_checks() -> &'static [PacketIdentityCheck] {
             direction: C,
             identity: "minecraft:system_chat",
             id: PLAY_SYSTEM_CHAT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:section_blocks_update",
+            id: PLAY_SECTION_BLOCKS_UPDATE_ID as u32,
         },
     ]
 }
@@ -736,6 +810,9 @@ pub enum PlayClientbound {
         id: i32,
     },
     PlayerPosition(PlayerPosition),
+    PlayerRotation(PlayerRotation),
+    PlayerAbilities(PlayerAbilities),
+    SetEntityMotion(EntityMotion),
     Respawn(Respawn),
     SetDefaultSpawnPosition(DefaultSpawnPosition),
     SetTime(WorldTime),
@@ -758,6 +835,8 @@ pub enum PlayClientbound {
         z: i32,
     },
     LightUpdate(LightUpdate),
+    BlockUpdate(BlockUpdate),
+    SectionBlocksUpdate(SectionBlocksUpdate),
     CookieRequest {
         key: String,
     },
@@ -797,6 +876,50 @@ pub enum PlayClientbound {
         packet_id: i32,
         payload_bytes: usize,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlayDecodeWork {
+    Normal,
+    ChunkHeavy,
+}
+
+/// Classifies only decode cost; packet identity remains confined to this
+/// exact-version profile. Networking can keep its 20 Hz control plane alive
+/// while CPU-heavy chunk payloads are decoded on a worker.
+pub fn classify_play_decode_work(
+    frame_body: &[u8],
+) -> Result<PlayDecodeWork, BootstrapProtocolError> {
+    let packet = split_raw_packet(frame_body)?;
+    Ok(if packet.id == PLAY_LEVEL_CHUNK_WITH_LIGHT_ID {
+        PlayDecodeWork::ChunkHeavy
+    } else {
+        PlayDecodeWork::Normal
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockUpdate {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub state_id: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SectionBlocksUpdate {
+    pub section_x: i32,
+    pub section_y: i32,
+    pub section_z: i32,
+    pub updates: Vec<SectionBlockUpdate>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SectionBlockUpdate {
+    pub local_x: u8,
+    pub local_y: u8,
+    pub local_z: u8,
+    pub state_id: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -846,6 +969,49 @@ pub struct PlayerPosition {
     pub yaw: f32,
     pub pitch: f32,
     pub relative_flags: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayerRotation {
+    pub yaw: f32,
+    pub relative_yaw: bool,
+    pub pitch: f32,
+    pub relative_pitch: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EntityMotion {
+    pub entity_id: i32,
+    pub delta_x: f64,
+    pub delta_y: f64,
+    pub delta_z: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlayerInput {
+    pub forward: bool,
+    pub backward: bool,
+    pub left: bool,
+    pub right: bool,
+    pub jump: bool,
+    pub sneak: bool,
+    pub sprint: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayerAbilities {
+    pub invulnerable: bool,
+    pub flying: bool,
+    pub may_fly: bool,
+    pub instant_build: bool,
+    pub flying_speed: f32,
+    pub walking_speed: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlayerCommandAction {
+    StartSprinting,
+    StopSprinting,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -945,6 +1111,8 @@ pub enum BootstrapProtocolError {
         length: usize,
         max: usize,
     },
+    #[error("{context} contains a non-finite number")]
+    NonFinite { context: &'static str },
 }
 
 pub fn encode_login_start(
@@ -1202,6 +1370,52 @@ pub fn decode_play_clientbound(
         PLAY_PLAYER_POSITION_ID => {
             decode_player_position(&mut reader).map(PlayClientbound::PlayerPosition)
         }
+        PLAY_PLAYER_ROTATION_ID => {
+            let result = PlayerRotation {
+                yaw: reader.read_f32()?,
+                relative_yaw: reader.read_bool()?,
+                pitch: reader.read_f32()?,
+                relative_pitch: reader.read_bool()?,
+            };
+            require_consumed(&reader, "Play Player Rotation")?;
+            Ok(PlayClientbound::PlayerRotation(result))
+        }
+        PLAY_CLIENTBOUND_PLAYER_ABILITIES_ID => {
+            let flags = reader.read_u8()?;
+            if flags & !0x0f != 0 {
+                return Err(CodecError::ValueOutOfRange {
+                    context: "Player Abilities flags",
+                    value: i128::from(flags),
+                    min: 0,
+                    max: 0x0f,
+                }
+                .into());
+            }
+            let flying_speed = reader.read_f32()?;
+            let walking_speed = reader.read_f32()?;
+            if !flying_speed.is_finite() || !walking_speed.is_finite() {
+                return Err(BootstrapProtocolError::NonFinite {
+                    context: "Player Abilities speed",
+                });
+            }
+            require_consumed(&reader, "Player Abilities")?;
+            Ok(PlayClientbound::PlayerAbilities(PlayerAbilities {
+                invulnerable: flags & 0x01 != 0,
+                flying: flags & 0x02 != 0,
+                may_fly: flags & 0x04 != 0,
+                instant_build: flags & 0x08 != 0,
+                flying_speed,
+                walking_speed,
+            }))
+        }
+        PLAY_SET_ENTITY_MOTION_ID => {
+            let result = EntityMotion {
+                entity_id: reader.read_var_int()?,
+                ..decode_low_precision_vec3(&mut reader)?
+            };
+            require_consumed(&reader, "Set Entity Motion")?;
+            Ok(PlayClientbound::SetEntityMotion(result))
+        }
         PLAY_RESPAWN_ID => decode_respawn(&mut reader).map(PlayClientbound::Respawn),
         PLAY_SET_DEFAULT_SPAWN_POSITION_ID => {
             decode_default_spawn_position(&mut reader).map(PlayClientbound::SetDefaultSpawnPosition)
@@ -1245,6 +1459,20 @@ pub fn decode_play_clientbound(
             let update = chunk::decode_light_update(&mut reader)?;
             require_consumed(&reader, "Light Update")?;
             Ok(PlayClientbound::LightUpdate(update))
+        }
+        PLAY_BLOCK_UPDATE_ID => {
+            let position = reader.read_block_position()?;
+            let state_id = nonnegative_u32(reader.read_var_int()?, "Block Update state ID")?;
+            require_consumed(&reader, "Block Update")?;
+            Ok(PlayClientbound::BlockUpdate(BlockUpdate {
+                x: position.x(),
+                y: position.y(),
+                z: position.z(),
+                state_id,
+            }))
+        }
+        PLAY_SECTION_BLOCKS_UPDATE_ID => {
+            decode_section_blocks_update(&mut reader).map(PlayClientbound::SectionBlocksUpdate)
         }
         PLAY_COOKIE_REQUEST_ID => {
             let key = reader.read_string(IDENTIFIER_LIMITS)?.to_owned();
@@ -1303,6 +1531,128 @@ pub fn decode_play_clientbound(
             payload_bytes: packet.payload.len(),
         }),
     }
+}
+
+/// Decodes 26.1.2's `LpVec3` representation. This replaced the historical
+/// three-short entity-motion encoding and packs three normalized 15-bit
+/// components plus a bounded integer scale.
+fn decode_low_precision_vec3(
+    reader: &mut CodecReader<'_>,
+) -> Result<EntityMotion, BootstrapProtocolError> {
+    let first = reader.read_u8()?;
+    if first == 0 {
+        return Ok(EntityMotion {
+            entity_id: 0,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            delta_z: 0.0,
+        });
+    }
+    let second = reader.read_u8()?;
+    let upper = u64::from(reader.read_u32()?);
+    let packed = (upper << 16) | (u64::from(second) << 8) | u64::from(first);
+    let mut scale = u64::from(first & 0x03);
+    if first & 0x04 != 0 {
+        scale |= u64::from(reader.read_var_int()? as u32) << 2;
+    }
+    let unpack = |shift: u32| {
+        let value = ((packed >> shift) & 0x7fff_u64).min(32_766) as f64;
+        (value * 2.0 / 32_766.0 - 1.0) * scale as f64
+    };
+    Ok(EntityMotion {
+        entity_id: 0,
+        delta_x: unpack(3),
+        delta_y: unpack(18),
+        delta_z: unpack(33),
+    })
+}
+
+fn decode_section_blocks_update(
+    reader: &mut CodecReader<'_>,
+) -> Result<SectionBlocksUpdate, BootstrapProtocolError> {
+    let packed_section = reader.read_i64()?;
+    let section_x =
+        i32::try_from(packed_section >> 42).map_err(|_| CodecError::ValueOutOfRange {
+            context: "Section Blocks Update section x",
+            value: i128::from(packed_section >> 42),
+            min: i128::from(i32::MIN),
+            max: i128::from(i32::MAX),
+        })?;
+    let section_z =
+        i32::try_from((packed_section << 22) >> 42).map_err(|_| CodecError::ValueOutOfRange {
+            context: "Section Blocks Update section z",
+            value: i128::from((packed_section << 22) >> 42),
+            min: i128::from(i32::MIN),
+            max: i128::from(i32::MAX),
+        })?;
+    let section_y =
+        i32::try_from((packed_section << 44) >> 44).map_err(|_| CodecError::ValueOutOfRange {
+            context: "Section Blocks Update section y",
+            value: i128::from((packed_section << 44) >> 44),
+            min: i128::from(i32::MIN),
+            max: i128::from(i32::MAX),
+        })?;
+    let count = read_count(
+        reader,
+        "Section Blocks Update entries",
+        MAX_SECTION_BLOCK_UPDATES,
+    )?;
+    let mut updates = Vec::new();
+    updates
+        .try_reserve_exact(count)
+        .map_err(|_| CodecError::AllocationFailed {
+            context: "Section Blocks Update entries",
+            requested: count,
+        })?;
+    for _ in 0..count {
+        let packed = reader.read_var_long()?;
+        if packed < 0 {
+            return Err(CodecError::ValueOutOfRange {
+                context: "Section Blocks Update packed state",
+                value: i128::from(packed),
+                min: 0,
+                max: i128::from(i64::MAX),
+            }
+            .into());
+        }
+        let packed = u64::try_from(packed).map_err(|_| CodecError::ValueOutOfRange {
+            context: "Section Blocks Update packed state",
+            value: i128::from(packed),
+            min: 0,
+            max: i128::from(i64::MAX),
+        })?;
+        let state_id = u32::try_from(packed >> 12).map_err(|_| CodecError::ValueOutOfRange {
+            context: "Section Blocks Update state ID",
+            value: i128::from(packed >> 12),
+            min: 0,
+            max: i128::from(u32::MAX),
+        })?;
+        updates.push(SectionBlockUpdate {
+            local_x: u8::try_from((packed >> 8) & 0x0f).unwrap_or(0),
+            local_y: u8::try_from(packed & 0x0f).unwrap_or(0),
+            local_z: u8::try_from((packed >> 4) & 0x0f).unwrap_or(0),
+            state_id,
+        });
+    }
+    require_consumed(reader, "Section Blocks Update")?;
+    Ok(SectionBlocksUpdate {
+        section_x,
+        section_y,
+        section_z,
+        updates,
+    })
+}
+
+fn nonnegative_u32(value: i32, context: &'static str) -> Result<u32, BootstrapProtocolError> {
+    u32::try_from(value).map_err(|_| {
+        CodecError::ValueOutOfRange {
+            context,
+            value: i128::from(value),
+            min: 0,
+            max: i128::from(i32::MAX),
+        }
+        .into()
+    })
 }
 
 fn decode_initial_play_login(
@@ -1493,6 +1843,128 @@ pub fn encode_play_teleport_confirmation(
     frame(writer)
 }
 
+fn movement_flags(on_ground: bool, horizontal_collision: bool) -> u8 {
+    u8::from(on_ground) | (u8::from(horizontal_collision) << 1)
+}
+
+pub fn encode_play_move_position(
+    x: f64,
+    y: f64,
+    z: f64,
+    on_ground: bool,
+    horizontal_collision: bool,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        return Err(BootstrapProtocolError::NonFinite {
+            context: "Move Player Pos",
+        });
+    }
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_MOVE_PLAYER_POS_ID);
+    writer.write_f64(x);
+    writer.write_f64(y);
+    writer.write_f64(z);
+    writer.write_u8(movement_flags(on_ground, horizontal_collision));
+    frame(writer)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn encode_play_move_position_rotation(
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f32,
+    pitch: f32,
+    on_ground: bool,
+    horizontal_collision: bool,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() || !yaw.is_finite() || !pitch.is_finite()
+    {
+        return Err(BootstrapProtocolError::NonFinite {
+            context: "Move Player Pos Rot",
+        });
+    }
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_MOVE_PLAYER_POS_ROT_ID);
+    writer.write_f64(x);
+    writer.write_f64(y);
+    writer.write_f64(z);
+    writer.write_f32(yaw);
+    writer.write_f32(pitch);
+    writer.write_u8(movement_flags(on_ground, horizontal_collision));
+    frame(writer)
+}
+
+pub fn encode_play_move_rotation(
+    yaw: f32,
+    pitch: f32,
+    on_ground: bool,
+    horizontal_collision: bool,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    if !yaw.is_finite() || !pitch.is_finite() {
+        return Err(BootstrapProtocolError::NonFinite {
+            context: "Move Player Rot",
+        });
+    }
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_MOVE_PLAYER_ROT_ID);
+    writer.write_f32(yaw);
+    writer.write_f32(pitch);
+    writer.write_u8(movement_flags(on_ground, horizontal_collision));
+    frame(writer)
+}
+
+pub fn encode_play_move_status(
+    on_ground: bool,
+    horizontal_collision: bool,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_MOVE_PLAYER_STATUS_ONLY_ID);
+    writer.write_u8(movement_flags(on_ground, horizontal_collision));
+    frame(writer)
+}
+
+pub fn encode_play_player_input(input: PlayerInput) -> Result<Vec<u8>, BootstrapProtocolError> {
+    let mut flags = 0_u8;
+    flags |= u8::from(input.forward);
+    flags |= u8::from(input.backward) << 1;
+    flags |= u8::from(input.left) << 2;
+    flags |= u8::from(input.right) << 3;
+    flags |= u8::from(input.jump) << 4;
+    flags |= u8::from(input.sneak) << 5;
+    flags |= u8::from(input.sprint) << 6;
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_PLAYER_INPUT_ID);
+    writer.write_u8(flags);
+    frame(writer)
+}
+
+/// Announces the client's resolved flying state. Protocol 775 carries only
+/// bit 1 in this serverbound packet; capability and speeds remain
+/// server-authoritative in the clientbound abilities packet.
+pub fn encode_play_player_abilities(flying: bool) -> Result<Vec<u8>, BootstrapProtocolError> {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_PLAYER_ABILITIES_ID);
+    writer.write_u8(u8::from(flying) << 1);
+    frame(writer)
+}
+
+pub fn encode_play_player_command(
+    entity_id: i32,
+    action: PlayerCommandAction,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    let action = match action {
+        PlayerCommandAction::StartSprinting => 1,
+        PlayerCommandAction::StopSprinting => 2,
+    };
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_PLAYER_COMMAND_ID);
+    writer.write_var_int(entity_id);
+    writer.write_var_int(action);
+    writer.write_var_int(0);
+    frame(writer)
+}
+
 pub fn encode_play_chunk_batch_received(
     desired_chunks_per_tick: f32,
 ) -> Result<Vec<u8>, BootstrapProtocolError> {
@@ -1500,6 +1972,11 @@ pub fn encode_play_chunk_batch_received(
     writer.write_var_int(PLAY_CHUNK_BATCH_RECEIVED_ID);
     writer.write_f32(desired_chunks_per_tick);
     frame(writer)
+}
+
+/// Ends one protocol-775 client tick. The current packet has no payload.
+pub fn encode_play_client_tick_end() -> Result<Vec<u8>, BootstrapProtocolError> {
+    packet_without_payload(PLAY_CLIENT_TICK_END_ID)
 }
 
 pub fn encode_play_client_information(

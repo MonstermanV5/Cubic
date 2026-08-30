@@ -2,6 +2,10 @@
 
 Phase 12 adds the exact-version generated packet-registry boundary while retaining the isolated Java 26.1.2 / protocol 775 bootstrap profile for verified live codecs. TCP and session policy remain in `cubic-network`; packet schema details remain in `cubic-protocol`.
 
+Phase 17 extends only that isolated profile with the verified protocol-775 movement family. Serverbound IDs `0x1e`/`0x1f`/`0x20`/`0x21` encode position, position+rotation, rotation, and status-only updates; `0x28` reports the flying bit in Player Abilities, `0x2a` encodes sprint Player Command transitions, and `0x2b` encodes the seven current Player Input bits, including sneak. Empty Client Tick End `0x0d` follows each World Mode simulation tick after its movement/input updates. The terminal movement flags byte uses on-ground bit 0 and horizontal-collision bit 1. Clientbound Player Abilities `0x40` carries flags plus flying/walking speeds; Player Position `0x48`, Player Rotation `0x49`, and Set Entity Motion `0x65` are decoded structurally. Current entity motion uses variable-length `LpVec3`, not the obsolete three-short layout. These facts are cross-checked against generated Phase 12 identities and the official 26.1.2 codecs; generic world/renderer code contains no raw IDs.
+
+Phase 17 also consumes authoritative live world mutation without adding Phase 19 interaction: clientbound Block Update `0x08` is packed Position plus VarInt runtime state, and Section Blocks Update `0x54` is fixed packed SectionPos plus a bounded VarInt count and VarLong entries (`state<<12 | localX<<8 | localZ<<4 | localY`). Both IDs remain in `bootstrap::v775`; networking projects them into packet-ID-free semantic updates. Section batches are capped at 4,096 entries before allocation.
+
 ## Layer boundary
 
 The intended data flow is:

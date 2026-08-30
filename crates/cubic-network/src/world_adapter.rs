@@ -6,8 +6,8 @@ use cubic_protocol::bootstrap::v775::{
 };
 use cubic_version::MinecraftIdentifier;
 use cubic_world::{
-    AuthoritativeRotation, BlockCoordinates, BlockEntitySummary, Chunk, ChunkCoordinate,
-    ChunkLightSummary, ChunkSection, ClockState, Difficulty, DimensionGeometry,
+    AuthoritativeRotation, BlockCoordinates, BlockEntitySummary, BlockStateUpdate, Chunk,
+    ChunkCoordinate, ChunkLightSummary, ChunkSection, ClockState, Difficulty, DimensionGeometry,
     DimensionTypeReference, EnterWorld, GameMode, HeightmapData, LastDeathLocation,
     PalettedContainer, PlayerPositionUpdate, RelativeTransformFlags, Respawn, RespawnRotation,
     RuntimeBiomeId, RuntimeBlockStateId, RuntimeDimensionType, SpawnContext, SpawnPoint,
@@ -95,6 +95,7 @@ pub(crate) enum ChunkAdaptation {
         coordinate: ChunkCoordinate,
         light: ChunkLightSummary,
     },
+    Blocks(Vec<BlockStateUpdate>),
     Other(v775::PlayClientbound),
 }
 
@@ -110,6 +111,35 @@ pub(crate) fn adapt_chunk_packet(packet: v775::PlayClientbound) -> ChunkAdaptati
             coordinate: ChunkCoordinate::new(update.x, update.z),
             light: semantic_light(update.light),
         },
+        v775::PlayClientbound::BlockUpdate(update) => {
+            ChunkAdaptation::Blocks(vec![BlockStateUpdate {
+                position: BlockCoordinates {
+                    x: update.x,
+                    y: update.y,
+                    z: update.z,
+                },
+                state: RuntimeBlockStateId(update.state_id),
+            }])
+        }
+        v775::PlayClientbound::SectionBlocksUpdate(update) => {
+            let base_x = update.section_x * 16;
+            let base_y = update.section_y * 16;
+            let base_z = update.section_z * 16;
+            ChunkAdaptation::Blocks(
+                update
+                    .updates
+                    .into_iter()
+                    .map(|entry| BlockStateUpdate {
+                        position: BlockCoordinates {
+                            x: base_x + i32::from(entry.local_x),
+                            y: base_y + i32::from(entry.local_y),
+                            z: base_z + i32::from(entry.local_z),
+                        },
+                        state: RuntimeBlockStateId(entry.state_id),
+                    })
+                    .collect(),
+            )
+        }
         other => ChunkAdaptation::Other(other),
     }
 }
@@ -143,6 +173,14 @@ pub(crate) fn play_world_event(
     let event = match packet {
         v775::PlayClientbound::PlayerPosition(position) => Some(
             WorldEvent::SynchronizePlayerPosition(player_position(*position)),
+        ),
+        v775::PlayClientbound::PlayerRotation(rotation) => Some(
+            WorldEvent::SynchronizePlayerRotation(cubic_world::PlayerRotationUpdate {
+                yaw: rotation.yaw,
+                pitch: rotation.pitch,
+                relative_yaw: rotation.relative_yaw,
+                relative_pitch: rotation.relative_pitch,
+            }),
         ),
         v775::PlayClientbound::Respawn(respawn) => {
             Some(WorldEvent::Respawn(respawn_event(respawn)?))
@@ -507,6 +545,72 @@ mod tests {
             Some(RuntimeBlockStateId(17))
         );
         assert_eq!(chunk.sections[0].biome(0, 0, 0), Some(RuntimeBiomeId(4)));
+    }
+
+    #[test]
+    fn both_v775_live_block_update_families_become_semantic_updates() {
+        let ChunkAdaptation::Blocks(single) =
+            adapt_chunk_packet(v775::PlayClientbound::BlockUpdate(v775::BlockUpdate {
+                x: -17,
+                y: 63,
+                z: 32,
+                state_id: 91,
+            }))
+        else {
+            panic!("expected semantic block update")
+        };
+        assert_eq!(
+            single,
+            vec![BlockStateUpdate {
+                position: BlockCoordinates {
+                    x: -17,
+                    y: 63,
+                    z: 32
+                },
+                state: RuntimeBlockStateId(91)
+            }]
+        );
+
+        let ChunkAdaptation::Blocks(section) = adapt_chunk_packet(
+            v775::PlayClientbound::SectionBlocksUpdate(v775::SectionBlocksUpdate {
+                section_x: -2,
+                section_y: -4,
+                section_z: 3,
+                updates: vec![
+                    v775::SectionBlockUpdate {
+                        local_x: 15,
+                        local_y: 0,
+                        local_z: 1,
+                        state_id: 1,
+                    },
+                    v775::SectionBlockUpdate {
+                        local_x: 0,
+                        local_y: 15,
+                        local_z: 14,
+                        state_id: 2,
+                    },
+                ],
+            }),
+        ) else {
+            panic!("expected semantic section updates")
+        };
+        assert_eq!(
+            section[0].position,
+            BlockCoordinates {
+                x: -17,
+                y: -64,
+                z: 49
+            }
+        );
+        assert_eq!(
+            section[1].position,
+            BlockCoordinates {
+                x: -32,
+                y: -49,
+                z: 62
+            }
+        );
+        assert_eq!(section[1].state, RuntimeBlockStateId(2));
     }
 
     #[test]

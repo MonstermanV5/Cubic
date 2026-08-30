@@ -59,6 +59,12 @@ pub struct BlockCoordinates {
     pub z: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockStateUpdate {
+    pub position: BlockCoordinates,
+    pub state: crate::RuntimeBlockStateId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LastDeathLocation {
     pub dimension: MinecraftIdentifier,
@@ -126,6 +132,14 @@ pub struct PlayerPositionUpdate {
     pub yaw: f32,
     pub pitch: f32,
     pub relative: RelativeTransformFlags,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayerRotationUpdate {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub relative_yaw: bool,
+    pub relative_pitch: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -238,6 +252,7 @@ pub enum WorldEvent {
     EnterWorld(EnterWorld),
     Respawn(Respawn),
     SynchronizePlayerPosition(PlayerPositionUpdate),
+    SynchronizePlayerRotation(PlayerRotationUpdate),
     SetSpawn(SpawnPoint),
     SetTime(WorldTime),
     SetDifficulty {

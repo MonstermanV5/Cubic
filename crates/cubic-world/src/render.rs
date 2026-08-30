@@ -1,10 +1,8 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use cubic_version::{GameData, MinecraftIdentifier, VersionError};
 
-use crate::{
-    AuthoritativeTransform, Chunk, ChunkCoordinate, DimensionGeometry, RuntimeBlockStateId,
-};
+use crate::{Chunk, ChunkCoordinate, DimensionGeometry, LocalPlayerPose, RuntimeBlockStateId};
 
 /// Version-selected semantic classification needed by the Phase 15 diagnostic renderer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,13 +46,37 @@ pub enum ChunkRenderDelta {
     Unloaded(ChunkCoordinate),
 }
 
+/// Cumulative render-side acknowledgement for event-driven mouse look.
+/// Totals make preview rebasing constant-size instead of retaining raw events.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RenderLookSample {
+    pub sequence: u64,
+    pub yaw_total: f64,
+    pub pitch_total: f64,
+}
+
+/// One fixed-tick pose sample for display-rate presentation.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderPoseSample {
+    pub pose: LocalPlayerPose,
+    pub tick_at: Instant,
+    pub look: RenderLookSample,
+    /// Corrections and world changes snap instead of interpolating through
+    /// authoritative geometry.
+    pub discontinuity: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorldRenderUpdate {
     pub generation: u64,
     pub reset: bool,
     pub dimension: Option<String>,
     pub geometry: Option<DimensionGeometry>,
-    pub pose: Option<AuthoritativeTransform>,
+    pub pose: Option<RenderPoseSample>,
+    /// Publication time used only for bounded input-to-frame diagnostics.
+    pub pose_published_at: Option<Instant>,
+    /// Coalesced low-frequency marker for a grounded jump pose.
+    pub pose_contains_jump: bool,
     pub chunks: Vec<ChunkRenderDelta>,
 }
 

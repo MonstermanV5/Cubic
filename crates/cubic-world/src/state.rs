@@ -3,15 +3,24 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 
 use crate::{
-    AuthoritativeRotation, AuthoritativeTransform, EnterWorld, LoadedChunks, PlayerPositionUpdate,
-    RespawnRotation, RuntimeRegistrySnapshot, SpawnPoint, WorldBorder, WorldEvent, WorldSession,
-    WorldTime,
+    AuthoritativeRotation, AuthoritativeTransform, BlockStateUpdate, ChunkCoordinate, EnterWorld,
+    LoadedChunks, PlayerPositionUpdate, RespawnRotation, RuntimeRegistrySnapshot, SpawnPoint,
+    WorldBorder, WorldEvent, WorldSession, WorldTime,
 };
 
 pub const MAX_KNOWN_DIMENSIONS: usize = 1_024;
 pub const MAX_RUNTIME_REGISTRIES: usize = 512;
 pub const MAX_RUNTIME_REGISTRY_ENTRIES: usize = 1_048_576;
 pub const MAX_WORLD_CLOCKS: usize = 64;
+pub const MAX_BLOCK_UPDATES_PER_EVENT: usize = 4_096;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockUpdateResult {
+    pub revision: u64,
+    /// Sorted unique loaded chunks whose semantic contents changed.
+    pub changed_chunks: Vec<ChunkCoordinate>,
+    pub ignored_unloaded_or_out_of_bounds: usize,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum WorldLifecycle {
@@ -73,6 +82,8 @@ pub enum WorldError {
     DuplicateWorldClock,
     #[error("world-state revision counter is exhausted")]
     RevisionOverflow,
+    #[error("block update count {count} exceeds limit {max}")]
+    TooManyBlockUpdates { count: usize, max: usize },
     #[error("{field} must be finite and within its permitted range")]
     InvalidNumber { field: &'static str },
     #[error("dimension type raw ID {raw_id} has no authoritative geometry")]
@@ -202,6 +213,37 @@ impl WorldState {
                 session.position = Some(position);
                 (ResetScope::None, false)
             }
+            WorldEvent::SynchronizePlayerRotation(update) => {
+                let session = self.active_mut("SynchronizePlayerRotation")?;
+                let previous = match session.rotation {
+                    Some(rotation) => rotation,
+                    None if update.relative_yaw || update.relative_pitch => {
+                        return Err(WorldError::RelativeWithoutBaseline { field: "rotation" });
+                    }
+                    None => AuthoritativeRotation {
+                        yaw: 0.0,
+                        pitch: 0.0,
+                    },
+                };
+                let yaw = if update.relative_yaw {
+                    previous.yaw + update.yaw
+                } else {
+                    update.yaw
+                };
+                let pitch = if update.relative_pitch {
+                    previous.pitch + update.pitch
+                } else {
+                    update.pitch
+                }
+                .clamp(-90.0, 90.0);
+                validate_rotation(AuthoritativeRotation { yaw, pitch })?;
+                session.rotation = Some(AuthoritativeRotation { yaw, pitch });
+                if let Some(position) = &mut session.position {
+                    position.yaw = yaw;
+                    position.pitch = pitch;
+                }
+                (ResetScope::None, false)
+            }
             WorldEvent::SetSpawn(spawn) => {
                 validate_spawn(&spawn)?;
                 self.active_mut("SetSpawn")?.spawn_point = Some(spawn);
@@ -268,6 +310,80 @@ impl WorldState {
             revision: self.revision,
             reset,
             dimension_changed,
+        })
+    }
+
+    pub fn apply_block_updates(
+        &mut self,
+        updates: &[BlockStateUpdate],
+    ) -> Result<BlockUpdateResult, WorldError> {
+        self.require(WorldLifecycle::Active, "BlockStateUpdate")?;
+        if updates.len() > MAX_BLOCK_UPDATES_PER_EVENT {
+            return Err(WorldError::TooManyBlockUpdates {
+                count: updates.len(),
+                max: MAX_BLOCK_UPDATES_PER_EVENT,
+            });
+        }
+        let geometry = self
+            .session
+            .as_ref()
+            .map(|session| session.dimension_geometry)
+            .ok_or(WorldError::InvalidLifecycle {
+                event: "BlockStateUpdate",
+                lifecycle: self.lifecycle,
+            })?;
+        let mut changed = BTreeSet::new();
+        let mut ignored = 0_usize;
+        for update in updates {
+            let Some(relative_y) = update.position.y.checked_sub(geometry.min_y) else {
+                ignored = ignored.saturating_add(1);
+                continue;
+            };
+            let Ok(relative_y_u32) = u32::try_from(relative_y) else {
+                ignored = ignored.saturating_add(1);
+                continue;
+            };
+            if relative_y_u32 >= geometry.height {
+                ignored = ignored.saturating_add(1);
+                continue;
+            }
+            let coordinate = ChunkCoordinate::new(
+                update.position.x.div_euclid(16),
+                update.position.z.div_euclid(16),
+            );
+            let (Ok(section_offset), Ok(local_x), Ok(local_y), Ok(local_z)) = (
+                usize::try_from(relative_y / 16),
+                u8::try_from(update.position.x.rem_euclid(16)),
+                u8::try_from(relative_y.rem_euclid(16)),
+                u8::try_from(update.position.z.rem_euclid(16)),
+            ) else {
+                ignored = ignored.saturating_add(1);
+                continue;
+            };
+            let updated = self.chunks.update_block(
+                coordinate,
+                section_offset,
+                local_x,
+                local_y,
+                local_z,
+                update.state,
+            );
+            if updated {
+                changed.insert(coordinate);
+            } else {
+                ignored = ignored.saturating_add(1);
+            }
+        }
+        if !changed.is_empty() {
+            self.revision = self
+                .revision
+                .checked_add(1)
+                .ok_or(WorldError::RevisionOverflow)?;
+        }
+        Ok(BlockUpdateResult {
+            revision: self.revision,
+            changed_chunks: changed.into_iter().collect(),
+            ignored_unloaded_or_out_of_bounds: ignored,
         })
     }
 

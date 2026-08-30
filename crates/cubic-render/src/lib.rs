@@ -28,7 +28,7 @@ use world::WorldRenderer;
 pub struct WorldRenderStats {
     pub dimension: Option<String>,
     pub geometry: Option<cubic_world::DimensionGeometry>,
-    pub pose: Option<cubic_world::AuthoritativeTransform>,
+    pub pose: Option<cubic_world::LocalPlayerPose>,
     pub loaded_chunks: usize,
     pub meshed_chunks: usize,
     pub pending_meshes: usize,
@@ -200,6 +200,14 @@ impl Renderer {
     pub fn apply_world_update(&mut self, update: WorldRenderUpdate) {
         if let Some(world) = &mut self.world_renderer {
             world.apply(update);
+        }
+    }
+
+    /// Applies a render-only look preview between fixed simulation ticks. The
+    /// network simulation receives the same delta separately and remains authoritative.
+    pub fn preview_world_look(&mut self, sequence: u64, yaw_delta: f32, pitch_delta: f32) {
+        if let Some(world) = &mut self.world_renderer {
+            world.preview_look(sequence, yaw_delta, pitch_delta);
         }
     }
 

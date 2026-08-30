@@ -10,13 +10,14 @@ use std::{
 
 use cubic_render::{BlockResources, FrameStatus, Renderer, RendererInitError};
 use cubic_ui::{ChatMode, ChatSessionPort};
-use cubic_world::WorldRenderUpdate;
+use cubic_world::{MovementInput, WorldRenderUpdate};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::WindowEvent,
+    event::{DeviceEvent, ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    window::{Window, WindowId},
+    keyboard::{KeyCode, PhysicalKey},
+    window::{CursorGrabMode, Window, WindowId},
 };
 
 #[cfg(target_os = "ios")]
@@ -61,6 +62,27 @@ const INITIAL_HEIGHT: f64 = 720.0;
 const CHAT_CJK_FONT_KEY: &str = "cubic-system-cjk";
 #[cfg(target_os = "windows")]
 const MAX_SYSTEM_FONT_BYTES: u64 = 64 * 1024 * 1024;
+const MOUSE_SENSITIVITY_DEGREES_PER_PIXEL: f32 = 0.12;
+
+fn update_movement_key(input: &mut MovementInput, key: KeyCode, pressed: bool) -> bool {
+    let target = match key {
+        KeyCode::KeyW => Some(&mut input.forward),
+        KeyCode::KeyS => Some(&mut input.backward),
+        KeyCode::KeyA => Some(&mut input.left),
+        KeyCode::KeyD => Some(&mut input.right),
+        KeyCode::Space => Some(&mut input.jump),
+        KeyCode::ShiftLeft => Some(&mut input.sneak),
+        KeyCode::ControlLeft => Some(&mut input.sprint),
+        _ => None,
+    };
+    if let Some(target) = target
+        && *target != pressed
+    {
+        *target = pressed;
+        return true;
+    }
+    false
+}
 
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +152,13 @@ pub fn run_chat(port: Box<dyn ChatSessionPort>) -> Result<(), PlatformError> {
 /// Platform-neutral boundary implemented by application orchestration, not by the UI or renderer.
 pub trait WorldSessionPort {
     fn take_world_update(&mut self) -> Option<WorldRenderUpdate>;
+    /// Installs the platform wake callback used when a latency-sensitive local
+    /// pose update becomes available. The callback only wakes the event loop;
+    /// world data remains transferred through the bounded/coalescing mailbox.
+    fn set_render_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>);
+    fn set_movement_input(&self, sequence: u64, input: MovementInput);
+    fn reset_movement_input(&self, sequence: u64);
+    fn add_look_delta(&self, sequence: u64, yaw: f32, pitch: f32);
     fn disconnect(&self);
 }
 
@@ -140,6 +169,11 @@ pub fn run_world(
 ) -> Result<(), PlatformError> {
     let event_loop = EventLoop::new().map_err(PlatformError::CreateEventLoop)?;
     event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
+    let mut port = port;
+    port.set_render_waker(Arc::new(move || {
+        let _ = proxy.send_event(());
+    }));
     let mut application = WorldApplication::new(port, resources);
     event_loop
         .run_app(&mut application)
@@ -158,6 +192,11 @@ struct WorldApplication {
     resources: BlockResources,
     startup_error: Option<StartupError>,
     occluded: bool,
+    input: MovementInput,
+    input_sequence: u64,
+    look_sequence: u64,
+    cursor_captured: bool,
+    pending_pose_presentation: Option<(Instant, Instant, bool)>,
 }
 
 impl WorldApplication {
@@ -169,6 +208,11 @@ impl WorldApplication {
             resources,
             startup_error: None,
             occluded: false,
+            input: MovementInput::default(),
+            input_sequence: 0,
+            look_sequence: 0,
+            cursor_captured: false,
+            pending_pose_presentation: None,
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), StartupError> {
@@ -197,9 +241,93 @@ impl WorldApplication {
             window.request_redraw();
         }
     }
+
+    fn integrate_world_updates(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(update) = self.port.take_world_update() {
+            if let Some(published_at) = update.pose_published_at {
+                let observed_at = Instant::now();
+                if update.pose_contains_jump {
+                    tracing::debug!(target: "movement::latency", ?published_at, ?observed_at, handoff = ?observed_at.saturating_duration_since(published_at), "render event loop observed predicted jump pose");
+                } else {
+                    tracing::trace!(target: "movement::latency", ?published_at, ?observed_at, handoff = ?observed_at.saturating_duration_since(published_at), "render event loop observed simulated local pose");
+                }
+                self.pending_pose_presentation =
+                    Some((published_at, observed_at, update.pose_contains_jump));
+            }
+            if let Some(renderer) = &mut self.renderer {
+                renderer.apply_world_update(update);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn set_cursor_capture(&mut self, captured: bool) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        if captured {
+            let grabbed = window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            if grabbed.is_ok() {
+                window.set_cursor_visible(false);
+                self.cursor_captured = true;
+            }
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+            self.cursor_captured = false;
+        }
+    }
+
+    fn clear_input(&mut self) {
+        self.input_sequence = self.input_sequence.saturating_add(1);
+        self.input = MovementInput::default();
+        self.port.reset_movement_input(self.input_sequence);
+        tracing::trace!(target: "movement::input", sequence = self.input_sequence, "platform recorded synthetic focus/control release");
+    }
+
+    fn update_key(&mut self, key: KeyCode, pressed: bool) {
+        let arrived = Instant::now();
+        if update_movement_key(&mut self.input, key, pressed) {
+            self.input_sequence = self.input_sequence.saturating_add(1);
+            self.port
+                .set_movement_input(self.input_sequence, self.input);
+            tracing::debug!(
+                target: "movement::input",
+                ?arrived,
+                ?key,
+                pressed,
+                sequence = self.input_sequence,
+                forward = self.input.forward,
+                backward = self.input.backward,
+                left = self.input.left,
+                right = self.input.right,
+                jump = self.input.jump,
+                sneak = self.input.sneak,
+                sprint = self.input.sprint,
+                "platform recorded movement input transition"
+            );
+        }
+        let elapsed = arrived.elapsed();
+        if elapsed > Duration::from_millis(50) {
+            tracing::warn!(target: "movement::latency", ?elapsed, ?key, pressed, "winit movement input event handling was slow");
+        }
+    }
 }
 
 impl ApplicationHandler for WorldApplication {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, (): ()) {
+        // Pose publication wakes this callback directly, avoiding the former
+        // idle 50 ms polling delay before a simulated jump/movement update
+        // could become visible.
+        if self.integrate_world_updates() {
+            self.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.renderer.is_none()
             && self.startup_error.is_none()
@@ -211,6 +339,8 @@ impl ApplicationHandler for WorldApplication {
         }
     }
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.clear_input();
+        self.set_cursor_capture(false);
         self.renderer = None;
     }
     fn window_event(
@@ -228,8 +358,28 @@ impl ApplicationHandler for WorldApplication {
         }
         match event {
             WindowEvent::CloseRequested => {
+                self.clear_input();
                 self.port.disconnect();
                 event_loop.exit();
+            }
+            WindowEvent::Focused(false) => {
+                self.clear_input();
+                self.set_cursor_capture(false);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => self.set_cursor_capture(true),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if code == KeyCode::Escape && event.state == ElementState::Pressed {
+                        self.clear_input();
+                        self.set_cursor_capture(false);
+                    } else {
+                        self.update_key(code, event.state == ElementState::Pressed);
+                    }
+                }
             }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = &mut self.renderer {
@@ -251,6 +401,16 @@ impl ApplicationHandler for WorldApplication {
                     tracing::error!(%error, "fatal World Mode rendering error");
                     event_loop.exit();
                 }
+                if let Some((published_at, observed_at, contains_jump)) =
+                    self.pending_pose_presentation.take()
+                {
+                    let submitted_at = Instant::now();
+                    if contains_jump {
+                        tracing::debug!(target: "movement::latency", ?submitted_at, publish_to_frame = ?submitted_at.saturating_duration_since(published_at), observe_to_frame = ?submitted_at.saturating_duration_since(observed_at), "submitted first world frame after predicted jump pose publication");
+                    } else {
+                        tracing::trace!(target: "movement::latency", ?submitted_at, publish_to_frame = ?submitted_at.saturating_duration_since(published_at), observe_to_frame = ?submitted_at.saturating_duration_since(observed_at), "submitted first world frame after simulated local pose publication");
+                    }
+                }
                 if let Some(window) = &self.window {
                     let stats = renderer.world_stats();
                     let dimension = stats.dimension.as_deref().unwrap_or("awaiting world");
@@ -267,7 +427,12 @@ impl ApplicationHandler for WorldApplication {
                     );
                     let pose = stats.pose.map_or_else(
                         || "pos=?".to_owned(),
-                        |value| format!("pos={:.1},{:.1},{:.1}", value.x, value.y, value.z),
+                        |value| {
+                            format!(
+                                "pos={:.1},{:.1},{:.1} yaw={:.0} pitch={:.0}",
+                                value.x, value.y, value.z, value.yaw, value.pitch
+                            )
+                        },
                     );
                     window.set_title(&format!("Cubic — World Mode | {dimension} | {geometry} | {pose} | chunks={} meshes={} pending={}", stats.loaded_chunks, stats.meshed_chunks, stats.pending_meshes));
                 }
@@ -276,13 +441,7 @@ impl ApplicationHandler for WorldApplication {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let mut changed = false;
-        while let Some(update) = self.port.take_world_update() {
-            if let Some(renderer) = &mut self.renderer {
-                renderer.apply_world_update(update);
-                changed = true;
-            }
-        }
+        let changed = self.integrate_world_updates();
         let pending = self
             .renderer
             .as_ref()
@@ -295,7 +454,33 @@ impl ApplicationHandler for WorldApplication {
             Instant::now() + Duration::from_millis(delay),
         ));
     }
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        if self.cursor_captured
+            && let DeviceEvent::MouseMotion { delta: (x, y) } = event
+        {
+            let arrived = Instant::now();
+            let yaw = x as f32 * MOUSE_SENSITIVITY_DEGREES_PER_PIXEL;
+            let pitch = y as f32 * MOUSE_SENSITIVITY_DEGREES_PER_PIXEL;
+            tracing::trace!(target: "movement::look", ?arrived, raw_dx = x, raw_dy = y, yaw_delta = yaw, pitch_delta = pitch, "received raw winit mouse motion");
+            self.look_sequence = self.look_sequence.saturating_add(1);
+            self.port.add_look_delta(self.look_sequence, yaw, pitch);
+            if let Some(renderer) = &mut self.renderer {
+                renderer.preview_world_look(self.look_sequence, yaw, pitch);
+            }
+            self.request_redraw();
+            let elapsed = arrived.elapsed();
+            if elapsed > Duration::from_millis(50) {
+                tracing::warn!(target: "movement::latency", ?elapsed, "winit mouse input event handling was slow");
+            }
+        }
+    }
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.clear_input();
         self.port.disconnect();
         tracing::info!("Cubic World Mode stopped cleanly");
     }
@@ -714,6 +899,18 @@ impl Error for StartupError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn movement_keys_are_idempotent_and_focus_clear_has_a_complete_default() {
+        let mut input = MovementInput::default();
+        assert!(update_movement_key(&mut input, KeyCode::KeyW, true));
+        assert!(update_movement_key(&mut input, KeyCode::ShiftLeft, true));
+        assert!(update_movement_key(&mut input, KeyCode::ControlLeft, true));
+        assert!(input.forward && input.sneak && input.sprint);
+        assert!(!update_movement_key(&mut input, KeyCode::KeyW, true));
+        input = MovementInput::default();
+        assert_eq!(input, MovementInput::default());
+    }
 
     #[test]
     fn cjk_font_is_appended_without_replacing_existing_fallbacks() {

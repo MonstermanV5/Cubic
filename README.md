@@ -4,11 +4,11 @@
 
 Cubic is an independent project intended to become a Minecraft: Java Edition-compatible multiplayer client, primarily implemented in Rust.
 
-Cubic does not contain Mojang or Microsoft code or assets. Minecraft gameplay is not implemented. The repository currently contains the architectural scaffold, native graphics bootstrap, protocol/NBT and generated-data foundations, authenticated Chat Mode, semantic world/chunk state, and Phase 16's accepted runtime-only official block-resource/model terrain path.
+Cubic does not contain Mojang or Microsoft code or assets. The repository currently contains the architectural scaffold, native graphics bootstrap, protocol/NBT and generated-data foundations, authenticated Chat Mode, semantic world/chunk state, Phase 16's accepted runtime-only official block-resource/model terrain path, and Phase 17's accepted basic movement/collision foundation.
 
 ## Current state
 
-With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status`, `dev-login`, and `chat` retain their accepted behavior. `world <server> --username <name>` opens a separate offline-development window that renders bounded decoded chunks from the authoritative player camera using official exact-version block resources verified and cached by Cubic. It requires the Phase 11 generated game-data artifact and may populate the Phase 10 official client cache before opening the window. Movement, entities, collision, and Play Mode remain unimplemented; Chat Mode remains independent. See `docs/WORLD_RENDERING.md` and `docs/BLOCK_RESOURCES.md`.
+With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status`, `dev-login`, and `chat` retain their accepted behavior. `world <server> --username <name>` opens a separate offline-development window that renders bounded decoded chunks using official exact-version block resources verified and cached by Cubic. It includes the accepted Phase 17 Windows movement controller and local predicted camera. It requires the Phase 11 generated game-data artifact and may populate the Phase 10 official client cache before opening the window. Comprehensive vanilla block collision-shape fidelity and sneak-edge prevention are assigned to Phase 17B. Entities, block interaction, and general Play Mode remain unimplemented; Chat Mode remains independent. See `docs/WORLD_RENDERING.md`, `docs/BLOCK_RESOURCES.md`, and `docs/MOVEMENT.md`.
 
 ## Build and validate
 
