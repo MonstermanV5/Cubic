@@ -5,6 +5,7 @@
 //! prediction. Protocol packet construction remains outside this crate.
 
 mod chunk;
+mod collision_vanilla;
 mod model;
 mod movement;
 mod render;

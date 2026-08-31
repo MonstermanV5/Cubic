@@ -24,6 +24,8 @@ Each generic registry has a namespaced identifier and deterministically ordered 
 
 Blocks additionally contain their block raw ID, exactly one default global state ID, ordered property domains, and ordered concrete states. Each state records its global version-specific state ID and complete property assignment. `GameData` exposes exact registry, block, raw-ID, state-ID, property-set, item, and entity-type lookups without exposing report parsing to callers.
 
+The official block report does **not** contain physical collision voxel shapes or the executable block-class behavior that produces them. Phase 17B therefore does not extend schema 1 with invented or incomplete shape fields. `cubic-world` consumes generated identifiers/properties through a separately selected exact-version collision-rule adapter. This keeps factual version data immutable, keeps behavior code reviewable and replaceable, and avoids conflating physical collision with visual, outline, targeting, or occlusion shapes. A future authoritative shape generator may evolve the schema, but must replace rather than compete with this boundary.
+
 Artifacts live beneath an explicit caller-selected root:
 
 ```text

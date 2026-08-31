@@ -6,7 +6,10 @@ use std::{
 use cubic_version::GameData;
 use thiserror::Error;
 
-use crate::{DimensionGeometry, LoadedChunks, RuntimeBlockStateId};
+use crate::{
+    DimensionGeometry, LoadedChunks, RuntimeBlockStateId,
+    collision_vanilla::{CollisionOffset, CollisionRuleSet},
+};
 
 pub const MAX_COLLISION_BOXES_PER_STATE: usize = 8;
 const PLAYER_WIDTH: f64 = 0.6;
@@ -125,14 +128,18 @@ pub enum CollisionShape {
 #[derive(Clone, Debug)]
 pub struct BlockCollisionProfile {
     states: BTreeMap<RuntimeBlockStateId, CollisionShape>,
+    offsets: BTreeMap<RuntimeBlockStateId, CollisionOffset>,
     slipperiness: BTreeMap<RuntimeBlockStateId, f64>,
     approximate_states: BTreeSet<RuntimeBlockStateId>,
+    source_shape_bounds: Aabb,
 }
 
 impl BlockCollisionProfile {
     #[must_use]
     pub fn from_game_data(data: &GameData) -> Self {
+        let rules = CollisionRuleSet::for_version(&data.artifact().minecraft_version);
         let mut states = BTreeMap::new();
+        let mut offsets = BTreeMap::new();
         let mut slipperiness = BTreeMap::new();
         let mut approximate_states = BTreeSet::new();
         for block in &data.artifact().blocks {
@@ -143,17 +150,28 @@ impl BlockCollisionProfile {
                 .map_or(block.identifier.as_str(), |(_, path)| path);
             for state in &block.states {
                 let id = RuntimeBlockStateId(state.state_id);
-                states.insert(id, classify_shape(path, &state.properties));
+                states.insert(id, rules.shape(path, &state.properties));
+                offsets.insert(id, rules.offset(path));
                 slipperiness.insert(id, classify_slipperiness(path));
-                if !has_explicit_collision_shape(path) {
+                if !rules.has_verified_shape(path) {
                     approximate_states.insert(id);
                 }
             }
         }
+        let source_shape_bounds = collision_shape_envelope(
+            states.values(),
+            offsets
+                .values()
+                .copied()
+                .map(CollisionOffset::maximum_horizontal)
+                .fold(0.0, f64::max),
+        );
         Self {
             states,
+            offsets,
             slipperiness,
             approximate_states,
+            source_shape_bounds,
         }
     }
 
@@ -163,13 +181,17 @@ impl BlockCollisionProfile {
     ) -> Self {
         let mut result = Self {
             states: BTreeMap::new(),
+            offsets: BTreeMap::new(),
             slipperiness: BTreeMap::new(),
             approximate_states: BTreeSet::new(),
+            source_shape_bounds: full_cube_bounds(),
         };
         for (id, shape) in states {
             result.states.insert(id, shape);
+            result.offsets.insert(id, CollisionOffset::None);
             result.slipperiness.insert(id, 0.6);
         }
+        result.source_shape_bounds = collision_shape_envelope(result.states.values(), 0.0);
         result
     }
 
@@ -187,177 +209,43 @@ impl BlockCollisionProfile {
     pub fn is_approximate(&self, state: RuntimeBlockStateId) -> bool {
         !self.states.contains_key(&state) || self.approximate_states.contains(&state)
     }
-}
 
-fn has_explicit_collision_shape(path: &str) -> bool {
-    is_non_colliding(path)
-        || path.ends_with("_slab")
-        || path.ends_with("_carpet")
-        || path == "moss_carpet"
-        || path == "pale_moss_carpet"
-        || path == "snow"
-        || path.ends_with("_stairs")
-        || path.ends_with("_door")
-}
-
-fn classify_shape(
-    path: &str,
-    properties: &std::collections::BTreeMap<String, String>,
-) -> CollisionShape {
-    if is_non_colliding(path) {
-        return CollisionShape::Empty;
+    fn offset(&self, state: RuntimeBlockStateId, x: i32, z: i32) -> Vec3d {
+        self.offsets
+            .get(&state)
+            .copied()
+            .unwrap_or_default()
+            .at(x, z)
     }
-    if path.ends_with("_slab") {
-        return match properties.get("type").map(String::as_str) {
-            Some("bottom") => boxes(&[Aabb::new(
-                Vec3d::new(0.0, 0.0, 0.0),
-                Vec3d::new(1.0, 0.5, 1.0),
-            )]),
-            Some("top") => boxes(&[Aabb::new(
-                Vec3d::new(0.0, 0.5, 0.0),
-                Vec3d::new(1.0, 1.0, 1.0),
-            )]),
-            _ => CollisionShape::FullCube,
+}
+
+fn full_cube_bounds() -> Aabb {
+    Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(1.0, 1.0, 1.0))
+}
+
+fn collision_shape_envelope<'a>(
+    shapes: impl IntoIterator<Item = &'a CollisionShape>,
+    maximum_horizontal_offset: f64,
+) -> Aabb {
+    let mut envelope = full_cube_bounds();
+    for shape in shapes {
+        let CollisionShape::Boxes(boxes) = shape else {
+            continue;
         };
-    }
-    if path.ends_with("_carpet") || path == "moss_carpet" || path == "pale_moss_carpet" {
-        return boxes(&[Aabb::new(
-            Vec3d::new(0.0, 0.0, 0.0),
-            Vec3d::new(1.0, 1.0 / 16.0, 1.0),
-        )]);
-    }
-    if path == "snow" {
-        let layers = properties
-            .get("layers")
-            .and_then(|value| value.parse::<u8>().ok())
-            .unwrap_or(1)
-            .clamp(1, 8);
-        return boxes(&[Aabb::new(
-            Vec3d::new(0.0, 0.0, 0.0),
-            Vec3d::new(1.0, f64::from(layers) / 8.0, 1.0),
-        )]);
-    }
-    if path.ends_with("_stairs") {
-        return stair_shape(properties);
-    }
-    if path.ends_with("_door") {
-        return door_shape(properties);
-    }
-    CollisionShape::FullCube
-}
-
-fn boxes(values: &[Aabb]) -> CollisionShape {
-    CollisionShape::Boxes(Arc::from(values))
-}
-
-fn stair_shape(properties: &std::collections::BTreeMap<String, String>) -> CollisionShape {
-    let top = properties.get("half").is_some_and(|value| value == "top");
-    let (base_min, base_max, step_min, step_max) = if top {
-        (0.5, 1.0, 0.0, 0.5)
-    } else {
-        (0.0, 0.5, 0.5, 1.0)
-    };
-    let upper = match properties.get("facing").map(String::as_str) {
-        Some("north") => Aabb::new(
-            Vec3d::new(0.0, step_min, 0.0),
-            Vec3d::new(1.0, step_max, 0.5),
-        ),
-        Some("south") => Aabb::new(
-            Vec3d::new(0.0, step_min, 0.5),
-            Vec3d::new(1.0, step_max, 1.0),
-        ),
-        Some("west") => Aabb::new(
-            Vec3d::new(0.0, step_min, 0.0),
-            Vec3d::new(0.5, step_max, 1.0),
-        ),
-        _ => Aabb::new(
-            Vec3d::new(0.5, step_min, 0.0),
-            Vec3d::new(1.0, step_max, 1.0),
-        ),
-    };
-    boxes(&[
-        Aabb::new(
-            Vec3d::new(0.0, base_min, 0.0),
-            Vec3d::new(1.0, base_max, 1.0),
-        ),
-        upper,
-    ])
-}
-
-fn door_shape(properties: &std::collections::BTreeMap<String, String>) -> CollisionShape {
-    const THICKNESS: f64 = 3.0 / 16.0;
-    let facing = properties.get("facing").map(String::as_str);
-    let open = properties.get("open").is_some_and(|value| value == "true");
-    let right_hinge = properties
-        .get("hinge")
-        .is_some_and(|value| value == "right");
-    let plane = if !open {
-        match facing {
-            Some("east") => 0,
-            Some("south") => 1,
-            Some("west") => 2,
-            Some("north") => 3,
-            _ => return CollisionShape::FullCube,
+        for bounds in boxes.iter().take(MAX_COLLISION_BOXES_PER_STATE) {
+            envelope.min.x = envelope.min.x.min(bounds.min.x);
+            envelope.min.y = envelope.min.y.min(bounds.min.y);
+            envelope.min.z = envelope.min.z.min(bounds.min.z);
+            envelope.max.x = envelope.max.x.max(bounds.max.x);
+            envelope.max.y = envelope.max.y.max(bounds.max.y);
+            envelope.max.z = envelope.max.z.max(bounds.max.z);
         }
-    } else {
-        match (facing, right_hinge) {
-            (Some("east"), false) | (Some("west"), true) => 1,
-            (Some("east"), true) | (Some("west"), false) => 3,
-            (Some("north"), false) | (Some("south"), true) => 0,
-            (Some("north"), true) | (Some("south"), false) => 2,
-            _ => return CollisionShape::FullCube,
-        }
-    };
-    let bounds = match plane {
-        // West, north, east, south cell boundaries respectively. These match
-        // the official 26.1.2 door blockstate rotations around the block
-        // centre and apply identically to upper/lower halves.
-        0 => Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(THICKNESS, 1.0, 1.0)),
-        1 => Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(1.0, 1.0, THICKNESS)),
-        2 => Aabb::new(
-            Vec3d::new(1.0 - THICKNESS, 0.0, 0.0),
-            Vec3d::new(1.0, 1.0, 1.0),
-        ),
-        _ => Aabb::new(
-            Vec3d::new(0.0, 0.0, 1.0 - THICKNESS),
-            Vec3d::new(1.0, 1.0, 1.0),
-        ),
-    };
-    boxes(&[bounds])
-}
-
-fn is_non_colliding(path: &str) -> bool {
-    matches!(
-        path,
-        "air"
-            | "cave_air"
-            | "void_air"
-            | "water"
-            | "lava"
-            | "short_grass"
-            | "tall_grass"
-            | "fern"
-            | "large_fern"
-            | "dead_bush"
-            | "vine"
-            | "glow_lichen"
-            | "torch"
-            | "wall_torch"
-            | "redstone_torch"
-            | "redstone_wall_torch"
-            | "redstone_wire"
-            | "tripwire"
-            | "fire"
-            | "soul_fire"
-            | "seagrass"
-            | "tall_seagrass"
-            | "kelp"
-            | "kelp_plant"
-    ) || path.ends_with("_sapling")
-        || path.ends_with("_flower")
-        || path.ends_with("_coral")
-        || path.ends_with("_coral_fan")
-        || path.ends_with("_wall_coral_fan")
+    }
+    envelope.min.x -= maximum_horizontal_offset;
+    envelope.min.z -= maximum_horizontal_offset;
+    envelope.max.x += maximum_horizontal_offset;
+    envelope.max.z += maximum_horizontal_offset;
+    envelope
 }
 
 fn classify_slipperiness(path: &str) -> f64 {
@@ -459,6 +347,10 @@ pub struct PlayerMovementState {
     pub may_fly: bool,
     pub flying: bool,
     pub flying_speed: f64,
+    // Vanilla keeps sneak-edge protection active during a short descent while
+    // support remains within the player's step height. This is movement state,
+    // not a block-specific property.
+    fall_distance: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -532,6 +424,7 @@ impl PlayerMovementState {
             may_fly: false,
             flying: false,
             flying_speed: DEFAULT_FLYING_SPEED,
+            fall_distance: 0.0,
         })
     }
 
@@ -549,6 +442,7 @@ impl PlayerMovementState {
         self.velocity = velocity;
         self.on_ground = false;
         self.horizontal_collision = false;
+        self.fall_distance = 0.0;
         Ok(())
     }
 
@@ -591,6 +485,7 @@ impl PlayerMovementState {
         if self.flying {
             self.pose_kind = PlayerPoseKind::Standing;
             self.pose.eye_height = STANDING_EYE_HEIGHT;
+            self.fall_distance = 0.0;
         }
         Ok(())
     }
@@ -604,6 +499,7 @@ impl PlayerMovementState {
         }
         self.flying = resolved;
         if resolved {
+            self.fall_distance = 0.0;
             if self.on_ground {
                 self.velocity.y = JUMP_VELOCITY;
                 self.on_ground = false;
@@ -723,8 +619,29 @@ impl PlayerMovementState {
                 },
             self.velocity.z,
         );
+        let bounds = self.bounding_box();
+        let should_back_off = if input.sneak && !self.flying && requested.y <= 0.0 {
+            grounded_at_start
+                || (self.fall_distance < STEP_HEIGHT
+                    && !can_fall_at_least(
+                        bounds,
+                        0.0,
+                        0.0,
+                        STEP_HEIGHT - self.fall_distance,
+                        chunks,
+                        geometry,
+                        profile,
+                    )?)
+        } else {
+            false
+        };
+        let requested = if should_back_off {
+            back_off_from_edge(bounds, requested, chunks, geometry, profile)?
+        } else {
+            requested
+        };
         let (applied, stepped) = collide(
-            self.bounding_box(),
+            bounds,
             requested,
             chunks,
             geometry,
@@ -744,6 +661,14 @@ impl PlayerMovementState {
         // comparison incorrectly made a stationary player airborne every
         // other tick and selected air acceleration/friction.
         self.on_ground = requested.y < 0.0 && (requested.y - applied.y).abs() >= COLLISION_EPSILON;
+        if self.flying {
+            self.fall_distance = 0.0;
+        } else if applied.y < 0.0 {
+            self.fall_distance -= applied.y;
+        }
+        if self.on_ground {
+            self.fall_distance = 0.0;
+        }
         if (requested.x - applied.x).abs() > COLLISION_EPSILON {
             self.velocity.x = 0.0;
         }
@@ -774,7 +699,7 @@ impl PlayerMovementState {
             self.velocity.y = (self.velocity.y - GRAVITY) * VERTICAL_DRAG;
             None
         };
-        if !self.pose.is_finite() || !self.velocity.is_finite() {
+        if !self.pose.is_finite() || !self.velocity.is_finite() || !self.fall_distance.is_finite() {
             return Err(SimulationError::NonFinite {
                 field: "simulation result",
             });
@@ -1010,12 +935,24 @@ fn collect_obstacles(
     geometry: DimensionGeometry,
     profile: &BlockCollisionProfile,
 ) -> Result<Vec<Aabb>, SimulationError> {
-    let min_x = (broadphase.min.x - COLLISION_EPSILON).floor() as i32;
-    let max_x = (broadphase.max.x + COLLISION_EPSILON).floor() as i32;
-    let min_y = (broadphase.min.y - COLLISION_EPSILON).floor() as i32;
-    let max_y = (broadphase.max.y + COLLISION_EPSILON).floor() as i32;
-    let min_z = (broadphase.min.z - COLLISION_EPSILON).floor() as i32;
-    let max_z = (broadphase.max.z + COLLISION_EPSILON).floor() as i32;
+    let (min_x, max_x) = source_cell_range(
+        broadphase.min.x,
+        broadphase.max.x,
+        profile.source_shape_bounds.min.x,
+        profile.source_shape_bounds.max.x,
+    );
+    let (min_y, max_y) = source_cell_range(
+        broadphase.min.y,
+        broadphase.max.y,
+        profile.source_shape_bounds.min.y,
+        profile.source_shape_bounds.max.y,
+    );
+    let (min_z, max_z) = source_cell_range(
+        broadphase.min.z,
+        broadphase.max.z,
+        profile.source_shape_bounds.min.z,
+        profile.source_shape_bounds.max.z,
+    );
     let cells = i64::from(max_x - min_x + 1)
         .saturating_mul(i64::from(max_y - min_y + 1))
         .saturating_mul(i64::from(max_z - min_z + 1));
@@ -1026,15 +963,15 @@ fn collect_obstacles(
     for y in min_y..=max_y {
         for z in min_z..=max_z {
             for x in min_x..=max_x {
-                let shape = if y < geometry.min_y {
-                    &CollisionShape::FullCube
+                let (shape, offset) = if y < geometry.min_y {
+                    (&CollisionShape::FullCube, Vec3d::default())
                 } else if y >= geometry.min_y + i32::try_from(geometry.height).unwrap_or(i32::MAX) {
-                    &CollisionShape::Empty
+                    (&CollisionShape::Empty, Vec3d::default())
                 } else if let Some(state) = block_state_at(chunks, geometry, x, y, z) {
-                    profile.shape(state)
+                    (profile.shape(state), profile.offset(state, x, z))
                 } else {
                     // Missing chunks are conservative solid boundaries rather than accidental noclip.
-                    &CollisionShape::FullCube
+                    (&CollisionShape::FullCube, Vec3d::default())
                 };
                 match shape {
                     CollisionShape::Empty => {}
@@ -1044,7 +981,13 @@ fn collect_obstacles(
                     )),
                     CollisionShape::Boxes(boxes) => {
                         obstacles.extend(boxes.iter().take(MAX_COLLISION_BOXES_PER_STATE).map(
-                            |bounds| bounds.translated(f64::from(x), f64::from(y), f64::from(z)),
+                            |bounds| {
+                                bounds.translated(
+                                    f64::from(x) + offset.x,
+                                    f64::from(y) + offset.y,
+                                    f64::from(z) + offset.z,
+                                )
+                            },
                         ))
                     }
                 }
@@ -1054,11 +997,104 @@ fn collect_obstacles(
     Ok(obstacles)
 }
 
+fn source_cell_range(
+    broadphase_min: f64,
+    broadphase_max: f64,
+    local_min: f64,
+    local_max: f64,
+) -> (i32, i32) {
+    // The normal source cell contributes [0, 1]. Shapes may legitimately
+    // extend beyond it (fences reach 1.5 blocks high), so include owning cells
+    // displaced by the profile's bounded local envelope. This changes only
+    // which source states are inspected; their exact AABBs remain unclamped.
+    let negative_extension = (-local_min).max(0.0);
+    let positive_extension = (local_max - 1.0).max(0.0);
+    (
+        (broadphase_min - positive_extension - COLLISION_EPSILON).floor() as i32,
+        (broadphase_max + negative_extension + COLLISION_EPSILON).floor() as i32,
+    )
+}
+
+/// Reproduces the bounded 26.1.2 `Player.maybeBackOffFromEdge` movement
+/// adjustment. Each horizontal component is reduced toward zero in 0.05-block
+/// increments until the shrunken player footprint has support within the
+/// ordinary 0.6-block step distance. This changes the requested displacement;
+/// it does not clamp the player's coordinates to a block grid.
+fn back_off_from_edge(
+    bounds: Aabb,
+    requested: Vec3d,
+    chunks: &LoadedChunks,
+    geometry: DimensionGeometry,
+    profile: &BlockCollisionProfile,
+) -> Result<Vec3d, SimulationError> {
+    const EDGE_INCREMENT: f64 = 0.05;
+    let mut x = requested.x;
+    let mut z = requested.z;
+    let x_increment = x.signum() * EDGE_INCREMENT;
+    let z_increment = z.signum() * EDGE_INCREMENT;
+    while x != 0.0 && can_fall_at_least(bounds, x, 0.0, STEP_HEIGHT, chunks, geometry, profile)? {
+        x = reduce_toward_zero(x, x_increment, EDGE_INCREMENT);
+    }
+    while z != 0.0 && can_fall_at_least(bounds, 0.0, z, STEP_HEIGHT, chunks, geometry, profile)? {
+        z = reduce_toward_zero(z, z_increment, EDGE_INCREMENT);
+    }
+    while x != 0.0
+        && z != 0.0
+        && can_fall_at_least(bounds, x, z, STEP_HEIGHT, chunks, geometry, profile)?
+    {
+        x = reduce_toward_zero(x, x_increment, EDGE_INCREMENT);
+        z = reduce_toward_zero(z, z_increment, EDGE_INCREMENT);
+    }
+    Ok(Vec3d::new(x, requested.y, z))
+}
+
+fn reduce_toward_zero(value: f64, increment: f64, threshold: f64) -> f64 {
+    if value.abs() <= threshold {
+        0.0
+    } else {
+        value - increment
+    }
+}
+
+fn can_fall_at_least(
+    bounds: Aabb,
+    x: f64,
+    z: f64,
+    distance: f64,
+    chunks: &LoadedChunks,
+    geometry: DimensionGeometry,
+    profile: &BlockCollisionProfile,
+) -> Result<bool, SimulationError> {
+    let probe = Aabb::new(
+        Vec3d::new(
+            bounds.min.x + COLLISION_EPSILON + x,
+            bounds.min.y - distance - COLLISION_EPSILON,
+            bounds.min.z + COLLISION_EPSILON + z,
+        ),
+        Vec3d::new(
+            bounds.max.x - COLLISION_EPSILON + x,
+            bounds.min.y,
+            bounds.max.z - COLLISION_EPSILON + z,
+        ),
+    );
+    let obstacles = collect_obstacles(probe, chunks, geometry, profile)?;
+    Ok(!obstacles.iter().any(|obstacle| {
+        strict_overlaps(probe.min.x, probe.max.x, obstacle.min.x, obstacle.max.x)
+            && strict_overlaps(probe.min.y, probe.max.y, obstacle.min.y, obstacle.max.y)
+            && strict_overlaps(probe.min.z, probe.max.z, obstacle.min.z, obstacle.max.z)
+    }))
+}
+
+fn strict_overlaps(min: f64, max: f64, other_min: f64, other_max: f64) -> bool {
+    max > other_min && min < other_max
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         Chunk, ChunkCoordinate, ChunkLightSummary, ChunkSection, PalettedContainer, RuntimeBiomeId,
+        collision_vanilla::{classify_shape, has_verified_shape},
     };
 
     fn geometry() -> DimensionGeometry {
@@ -1066,6 +1102,10 @@ mod tests {
             min_y: 0,
             height: 32,
         }
+    }
+
+    fn boxes(values: &[Aabb]) -> CollisionShape {
+        CollisionShape::Boxes(Arc::from(values))
     }
     fn section(value: RuntimeBlockStateId) -> ChunkSection {
         ChunkSection {
@@ -1172,6 +1212,103 @@ mod tests {
             ),
         ]);
         (chunks, profile)
+    }
+
+    fn single_shape_world(
+        x: i32,
+        y: u8,
+        z: i32,
+        state: RuntimeBlockStateId,
+        shape: CollisionShape,
+    ) -> (LoadedChunks, BlockCollisionProfile) {
+        let chunk_x = x.div_euclid(16);
+        let chunk_z = z.div_euclid(16);
+        let local_x = usize::try_from(x.rem_euclid(16)).unwrap();
+        let local_z = usize::try_from(z.rem_euclid(16)).unwrap();
+        let mut values = vec![RuntimeBlockStateId(0); 4096];
+        values[usize::from(y) * 256 + local_z * 16 + local_x] = state;
+        let mut chunks = LoadedChunks::default();
+        chunks
+            .insert(Chunk {
+                coordinate: ChunkCoordinate::new(chunk_x, chunk_z),
+                sections: vec![
+                    ChunkSection {
+                        non_empty_block_count: 1,
+                        fluid_count: 0,
+                        blocks: PalettedContainer::Direct { values },
+                        biomes: PalettedContainer::Single {
+                            value: RuntimeBiomeId(0),
+                            entries: 64,
+                        },
+                    },
+                    section(RuntimeBlockStateId(0)),
+                ],
+                heightmaps: vec![],
+                block_entities: vec![],
+                light: ChunkLightSummary::default(),
+            })
+            .unwrap();
+        (
+            chunks,
+            BlockCollisionProfile::synthetic([
+                (RuntimeBlockStateId(0), CollisionShape::Empty),
+                (state, shape),
+            ]),
+        )
+    }
+
+    fn partial_height_edge_world(shape: CollisionShape) -> (LoadedChunks, BlockCollisionProfile) {
+        let mut values = vec![RuntimeBlockStateId(0); 4096];
+        for z in 7..=8 {
+            values[256 + z * 16 + 7] = RuntimeBlockStateId(1);
+            values[256 + z * 16 + 8] = RuntimeBlockStateId(2);
+        }
+        let mut chunks = LoadedChunks::default();
+        chunks
+            .insert(Chunk {
+                coordinate: ChunkCoordinate::new(0, 0),
+                sections: vec![
+                    ChunkSection {
+                        non_empty_block_count: 4,
+                        fluid_count: 0,
+                        blocks: PalettedContainer::Direct { values },
+                        biomes: PalettedContainer::Single {
+                            value: RuntimeBiomeId(0),
+                            entries: 64,
+                        },
+                    },
+                    section(RuntimeBlockStateId(0)),
+                ],
+                heightmaps: vec![],
+                block_entities: vec![],
+                light: ChunkLightSummary::default(),
+            })
+            .unwrap();
+        (
+            chunks,
+            BlockCollisionProfile::synthetic([
+                (RuntimeBlockStateId(0), CollisionShape::Empty),
+                (RuntimeBlockStateId(1), CollisionShape::FullCube),
+                (RuntimeBlockStateId(2), shape),
+            ]),
+        )
+    }
+
+    fn descending_edge_player(
+        x: f64,
+        y: f64,
+        z: f64,
+        fall_distance: f64,
+        velocity: Vec3d,
+    ) -> PlayerMovementState {
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(x, y, z, 0.0, 0.0),
+            velocity,
+        )
+        .unwrap();
+        state.on_ground = false;
+        state.fall_distance = fall_distance;
+        state
     }
 
     fn player() -> PlayerMovementState {
@@ -2005,6 +2142,46 @@ mod tests {
     }
 
     #[test]
+    fn verified_empty_stems_neither_block_movement_nor_create_support() {
+        for path in [
+            "pumpkin_stem",
+            "melon_stem",
+            "attached_pumpkin_stem",
+            "attached_melon_stem",
+        ] {
+            let shape = classify_shape(path, &BTreeMap::new());
+            assert_eq!(shape, CollisionShape::Empty, "{path}");
+            let (chunks, profile) = single_shape_world(8, 1, 8, RuntimeBlockStateId(20), shape);
+
+            let beside = Aabb::new(Vec3d::new(7.2, 1.0, 7.7), Vec3d::new(7.8, 2.8, 8.3));
+            let horizontal = collide(
+                beside,
+                Vec3d::new(1.5, 0.0, 0.0),
+                &chunks,
+                geometry(),
+                &profile,
+                false,
+            )
+            .unwrap()
+            .0;
+            assert_close(horizontal.x, 1.5);
+
+            let above = Aabb::new(Vec3d::new(8.2, 2.0, 8.2), Vec3d::new(8.8, 3.8, 8.8));
+            let downward = collide(
+                above,
+                Vec3d::new(0.0, -2.0, 0.0),
+                &chunks,
+                geometry(),
+                &profile,
+                false,
+            )
+            .unwrap()
+            .0;
+            assert_close(downward.y, -2.0);
+        }
+    }
+
+    #[test]
     fn step_candidate_clears_half_block_but_not_tall_or_ceiling_blocked_obstacles() {
         let bounds = Aabb::new(Vec3d::new(8.0, 1.0, 7.7), Vec3d::new(8.6, 2.8, 8.3));
         let (slab_world, profile) = obstacle_world(RuntimeBlockStateId(2), false);
@@ -2116,8 +2293,8 @@ mod tests {
                 }
             }
         }
-        assert!(has_explicit_collision_shape("oak_door"));
-        assert!(has_explicit_collision_shape("iron_door"));
+        assert!(has_verified_shape("oak_door"));
+        assert!(has_verified_shape("iron_door"));
     }
 
     #[test]
@@ -2281,5 +2458,603 @@ mod tests {
             )
             .unwrap();
         assert!(flying.may_fly && flying.flying);
+    }
+
+    #[test]
+    fn sneak_edge_prevention_reduces_motion_but_keeps_supported_motion() {
+        let (mut chunks, profile) = flat_world();
+        for z in 0..16 {
+            for x in 9..16 {
+                let _ = chunks.update_block(
+                    ChunkCoordinate::new(0, 0),
+                    0,
+                    x,
+                    0,
+                    z,
+                    RuntimeBlockStateId(0),
+                );
+            }
+        }
+
+        let edge = Aabb::new(Vec3d::new(8.9, 1.0, 7.7), Vec3d::new(9.5, 2.8, 8.3));
+        let adjusted = back_off_from_edge(
+            edge,
+            Vec3d::new(0.2, -COLLISION_EPSILON, 0.0),
+            &chunks,
+            geometry(),
+            &profile,
+        )
+        .unwrap();
+        assert!(adjusted.x <= 0.05 + COLLISION_EPSILON);
+
+        let supported = Aabb::new(Vec3d::new(8.1, 1.0, 7.7), Vec3d::new(8.7, 2.8, 8.3));
+        let unchanged = back_off_from_edge(
+            supported,
+            Vec3d::new(0.2, -COLLISION_EPSILON, 0.0),
+            &chunks,
+            geometry(),
+            &profile,
+        )
+        .unwrap();
+        assert_close(unchanged.x, 0.2);
+
+        let ordinary = collide(
+            edge,
+            Vec3d::new(0.2, -COLLISION_EPSILON, 0.0),
+            &chunks,
+            geometry(),
+            &profile,
+            true,
+        )
+        .unwrap()
+        .0;
+        assert_close(ordinary.x, 0.2);
+    }
+
+    #[test]
+    fn sneak_edge_prevention_handles_diagonal_and_negative_boundaries() {
+        let (mut chunks, profile) = flat_world();
+        for z in 9..16 {
+            for x in 0..16 {
+                let _ = chunks.update_block(
+                    ChunkCoordinate::new(0, 0),
+                    0,
+                    x,
+                    0,
+                    z,
+                    RuntimeBlockStateId(0),
+                );
+            }
+        }
+        for z in 0..16 {
+            for x in 9..16 {
+                let _ = chunks.update_block(
+                    ChunkCoordinate::new(0, 0),
+                    0,
+                    x,
+                    0,
+                    z,
+                    RuntimeBlockStateId(0),
+                );
+            }
+        }
+        let corner = Aabb::new(Vec3d::new(8.9, 1.0, 8.9), Vec3d::new(9.5, 2.8, 9.5));
+        let adjusted = back_off_from_edge(
+            corner,
+            Vec3d::new(0.2, -COLLISION_EPSILON, 0.2),
+            &chunks,
+            geometry(),
+            &profile,
+        )
+        .unwrap();
+        assert!(adjusted.x <= 0.05 + COLLISION_EPSILON);
+        assert!(adjusted.z <= 0.05 + COLLISION_EPSILON);
+
+        let negative_bounds = Aabb::new(Vec3d::new(0.3, 1.0, 0.2), Vec3d::new(0.9, 2.8, 0.8));
+        let obstacle = Aabb::new(Vec3d::new(-1.0, 0.0, 0.0), Vec3d::new(0.0, 3.0, 1.0));
+        assert_close(resolve_x(negative_bounds, -0.8, &[obstacle]), -0.3);
+    }
+
+    #[test]
+    fn sneak_edge_remains_active_during_a_partial_height_descent() {
+        let height = 7.0 / 8.0;
+        let partial = boxes(&[Aabb::new(
+            Vec3d::new(0.0, 0.0, 0.0),
+            Vec3d::new(1.0, height, 1.0),
+        )]);
+        let (chunks, profile) = partial_height_edge_world(partial);
+
+        // This is the exact state after leaving the full block for the lower
+        // support: no longer onGround, but only 1/8 block into a fall whose
+        // destination remains within the player's 0.6-block step height.
+        let make_player = || {
+            descending_edge_player(
+                9.2,
+                1.0 + height,
+                8.0,
+                1.0 - height,
+                Vec3d::new(0.2, 0.0, 0.0),
+            )
+        };
+        let mut sneaking = make_player();
+        let protected = sneaking
+            .tick(
+                MovementInput {
+                    sneak: true,
+                    ..Default::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(protected.applied.x <= 0.05 + COLLISION_EPSILON);
+        assert!(sneaking.pose.x < 9.3);
+
+        let mut released = make_player();
+        let ordinary = released
+            .tick(MovementInput::default(), &chunks, geometry(), &profile)
+            .unwrap();
+        assert_close(ordinary.applied.x, 0.2);
+        assert!(released.pose.x > sneaking.pose.x + 0.1);
+
+        // Reversing the transition still uses the ordinary generic step-up
+        // candidate; edge protection does not turn the lower surface into a
+        // one-way ledge.
+        let reverse = Aabb::new(
+            Vec3d::new(8.0, 1.0 + height, 7.7),
+            Vec3d::new(8.6, 1.0 + height + 1.8, 8.3),
+        );
+        let (applied, stepped) = collide(
+            reverse,
+            Vec3d::new(-0.5, -COLLISION_EPSILON, 0.0),
+            &chunks,
+            geometry(),
+            &profile,
+            true,
+        )
+        .unwrap();
+        assert!(stepped);
+        assert_close(applied.x, -0.5);
+        assert_close(applied.y, 1.0 - height);
+    }
+
+    #[test]
+    fn snow_layer_descents_use_actual_heights_and_remaining_step_distance() {
+        for layers in [7_u8, 8] {
+            let shape = classify_shape(
+                "snow",
+                &BTreeMap::from([("layers".to_owned(), layers.to_string())]),
+            );
+            let height = f64::from(layers - 1) / 8.0;
+            let (chunks, profile) = partial_height_edge_world(shape);
+            let mut state = descending_edge_player(
+                9.2,
+                1.0 + height,
+                8.0,
+                1.0 - height,
+                Vec3d::new(0.2, 0.0, 0.0),
+            );
+            let result = state
+                .tick(
+                    MovementInput {
+                        sneak: true,
+                        ..Default::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+            assert!(
+                result.applied.x <= 0.05 + COLLISION_EPSILON,
+                "snow layers={layers}"
+            );
+        }
+
+        // Three collision layers are 5/8 below a full block, just beyond the
+        // 0.6-block step height. Vanilla no longer treats that as staying on
+        // the ground surface, so it must not invent edge protection there.
+        let layers = 4_u8;
+        let shape = classify_shape(
+            "snow",
+            &BTreeMap::from([("layers".to_owned(), layers.to_string())]),
+        );
+        let height = f64::from(layers - 1) / 8.0;
+        let (chunks, profile) = partial_height_edge_world(shape);
+        let mut state = descending_edge_player(
+            9.2,
+            1.0 + height,
+            8.0,
+            1.0 - height,
+            Vec3d::new(0.2, 0.0, 0.0),
+        );
+        let result = state
+            .tick(
+                MovementInput {
+                    sneak: true,
+                    ..Default::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert_close(result.applied.x, 0.2);
+    }
+
+    #[test]
+    fn descending_sneak_edge_handles_diagonal_corner_and_negative_coordinates() {
+        let height = 0.75;
+        let shape = boxes(&[Aabb::new(
+            Vec3d::new(0.0, 0.0, 0.0),
+            Vec3d::new(1.0, height, 1.0),
+        )]);
+        let (chunks, profile) =
+            single_shape_world(-8, 0, -8, RuntimeBlockStateId(9), shape.clone());
+        let mut negative =
+            descending_edge_player(-6.8, height, -7.5, 1.0 - height, Vec3d::new(0.2, 0.0, 0.0));
+        let result = negative
+            .tick(
+                MovementInput {
+                    sneak: true,
+                    ..Default::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(result.applied.x <= 0.05 + COLLISION_EPSILON);
+
+        let (chunks, profile) = single_shape_world(8, 0, 8, RuntimeBlockStateId(9), shape);
+        let mut diagonal =
+            descending_edge_player(9.2, height, 9.2, 1.0 - height, Vec3d::new(0.2, 0.0, 0.2));
+        let result = diagonal
+            .tick(
+                MovementInput {
+                    sneak: true,
+                    ..Default::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(result.applied.x <= 0.05 + COLLISION_EPSILON);
+        assert!(result.applied.z <= 0.05 + COLLISION_EPSILON);
+    }
+
+    #[test]
+    fn multiple_small_descents_preserve_edge_protection_until_step_height_is_exceeded() {
+        let cases = [
+            (
+                "path",
+                15.0 / 16.0,
+                classify_shape("dirt_path", &BTreeMap::new()),
+            ),
+            (
+                "synthetic",
+                0.75,
+                boxes(&[Aabb::new(
+                    Vec3d::new(0.0, 0.0, 0.0),
+                    Vec3d::new(1.0, 0.75, 1.0),
+                )]),
+            ),
+            (
+                "lower slab",
+                0.5,
+                classify_shape(
+                    "stone_slab",
+                    &BTreeMap::from([("type".to_owned(), "bottom".to_owned())]),
+                ),
+            ),
+        ];
+        for (name, height, shape) in cases {
+            let fall_distance = 1.0 - height;
+            let (chunks, profile) = partial_height_edge_world(shape);
+            let mut state = descending_edge_player(
+                9.2,
+                1.0 + height,
+                8.0,
+                fall_distance,
+                Vec3d::new(0.2, 0.0, 0.0),
+            );
+            assert!(
+                !can_fall_at_least(
+                    state.bounding_box(),
+                    0.0,
+                    0.0,
+                    STEP_HEIGHT - fall_distance,
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap(),
+                "current {name} support missing at height={height} fall_distance={fall_distance}"
+            );
+            let result = state
+                .tick(
+                    MovementInput {
+                        sneak: true,
+                        ..Default::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+            assert!(
+                result.applied.x <= 0.05 + COLLISION_EPSILON,
+                "{name} height={height} fall_distance={fall_distance} applied={:?}",
+                result.applied
+            );
+        }
+    }
+
+    #[test]
+    fn partial_overhead_and_support_shapes_clip_only_their_real_boxes() {
+        let player_bounds = Aabb::new(Vec3d::new(0.2, 0.0, 0.2), Vec3d::new(0.8, 1.8, 0.8));
+        let high_ceiling = Aabb::new(Vec3d::new(0.0, 2.5, 0.0), Vec3d::new(1.0, 3.0, 1.0));
+        assert_close(resolve_y(player_bounds, 1.0, &[high_ceiling]), 0.7);
+
+        let falling = Aabb::new(Vec3d::new(0.2, 2.0, 0.2), Vec3d::new(0.8, 3.8, 0.8));
+        let lower_slab = Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(1.0, 0.5, 1.0));
+        assert_close(resolve_y(falling, -3.0, &[lower_slab]), -1.5);
+        assert_close(resolve_y(falling, -3.0, &[]), -3.0);
+    }
+
+    #[test]
+    fn source_cell_shapes_extending_above_one_block_are_collected_generically() {
+        let tall_narrow = boxes(&[Aabb::new(
+            Vec3d::new(6.0 / 16.0, 0.0, 6.0 / 16.0),
+            Vec3d::new(10.0 / 16.0, 1.5, 10.0 / 16.0),
+        )]);
+        let (chunks, profile) = single_shape_world(8, 0, 8, RuntimeBlockStateId(9), tall_narrow);
+
+        let upper_half = Aabb::new(Vec3d::new(7.6, 1.1, 8.4), Vec3d::new(8.2, 2.9, 9.0));
+        let movement = collide(
+            upper_half,
+            Vec3d::new(0.5, 0.0, 0.0),
+            &chunks,
+            geometry(),
+            &profile,
+            false,
+        )
+        .unwrap()
+        .0;
+        assert_close(movement.x, 8.375 - 8.2);
+
+        let beside = Aabb::new(Vec3d::new(7.6, 1.1, 8.7), Vec3d::new(8.2, 2.9, 9.3));
+        let movement = collide(
+            beside,
+            Vec3d::new(0.5, 0.0, 0.0),
+            &chunks,
+            geometry(),
+            &profile,
+            false,
+        )
+        .unwrap()
+        .0;
+        assert_close(movement.x, 0.5);
+
+        let falling = Aabb::new(Vec3d::new(8.4, 2.0, 8.4), Vec3d::new(9.0, 3.8, 9.0));
+        let movement = collide(
+            falling,
+            Vec3d::new(0.0, -1.0, 0.0),
+            &chunks,
+            geometry(),
+            &profile,
+            false,
+        )
+        .unwrap()
+        .0;
+        assert_close(movement.y, -0.5);
+
+        let supported = Aabb::new(Vec3d::new(8.4, 1.5, 8.4), Vec3d::new(9.0, 3.3, 9.0));
+        let support = collide(
+            supported,
+            Vec3d::new(0.0, -0.1, 0.0),
+            &chunks,
+            geometry(),
+            &profile,
+            true,
+        )
+        .unwrap()
+        .0;
+        assert_close(support.y, 0.0);
+        let leave_support = collide(
+            supported,
+            Vec3d::new(-0.5, 0.0, 0.0),
+            &chunks,
+            geometry(),
+            &profile,
+            true,
+        )
+        .unwrap()
+        .0;
+        assert_close(leave_support.x, -0.5);
+
+        assert_eq!(source_cell_range(1.1, 2.9, 0.0, 1.5).0, 0);
+        assert_eq!(source_cell_range(-0.5, 1.3, 0.0, 1.5).0, -2);
+    }
+
+    #[test]
+    fn fence_geometry_blocks_upper_portion_without_becoming_a_full_cell() {
+        let fence = classify_shape(
+            "oak_fence",
+            &BTreeMap::from([
+                ("north".to_owned(), "true".to_owned()),
+                ("east".to_owned(), "true".to_owned()),
+                ("south".to_owned(), "false".to_owned()),
+                ("west".to_owned(), "false".to_owned()),
+            ]),
+        );
+        let (chunks, profile) = single_shape_world(-8, 0, -8, RuntimeBlockStateId(10), fence);
+        let obstacles = collect_obstacles(
+            Aabb::new(Vec3d::new(-8.7, 1.0, -8.7), Vec3d::new(-7.3, 2.9, -7.3)),
+            &chunks,
+            geometry(),
+            &profile,
+        )
+        .unwrap();
+        assert!(obstacles.iter().all(|bounds| bounds.max.y == 1.5));
+        assert!(obstacles.iter().any(|bounds| {
+            bounds.min.x == -7.375
+                && bounds.max.x == -7.0
+                && bounds.min.z == -7.625
+                && bounds.max.z == -7.375
+        }));
+
+        let into_post = Aabb::new(Vec3d::new(-8.9, 1.01, -7.6), Vec3d::new(-8.3, 2.81, -7.0));
+        let clipped = collide(
+            into_post,
+            Vec3d::new(0.8, 0.0, 0.0),
+            &chunks,
+            geometry(),
+            &profile,
+            false,
+        )
+        .unwrap()
+        .0;
+        assert!(clipped.x < 0.8);
+
+        let parallel = collide(
+            Aabb::new(
+                Vec3d::new(-8.95, 1.01, -8.95),
+                Vec3d::new(-8.65, 2.81, -8.65),
+            ),
+            Vec3d::new(0.0, 0.0, 0.5),
+            &chunks,
+            geometry(),
+            &profile,
+            false,
+        )
+        .unwrap()
+        .0;
+        assert_close(parallel.z, 0.5);
+    }
+
+    #[test]
+    fn fence_gate_open_close_updates_replace_the_collision_immediately() {
+        let closed = classify_shape(
+            "oak_fence_gate",
+            &BTreeMap::from([
+                ("facing".to_owned(), "north".to_owned()),
+                ("open".to_owned(), "false".to_owned()),
+                ("in_wall".to_owned(), "true".to_owned()),
+            ]),
+        );
+        let (mut chunks, mut profile) =
+            single_shape_world(8, 0, 8, RuntimeBlockStateId(11), closed.clone());
+        profile
+            .states
+            .insert(RuntimeBlockStateId(12), CollisionShape::Empty);
+        profile.source_shape_bounds = collision_shape_envelope(profile.states.values(), 0.0);
+        let player = Aabb::new(Vec3d::new(8.2, 1.05, 7.6), Vec3d::new(8.8, 2.85, 8.2));
+        let blocked = collide(
+            player,
+            Vec3d::new(0.0, 0.0, 0.5),
+            &chunks,
+            geometry(),
+            &profile,
+            false,
+        )
+        .unwrap()
+        .0;
+        assert!(blocked.z < 0.5);
+
+        assert!(chunks.update_block(
+            ChunkCoordinate::new(0, 0),
+            0,
+            8,
+            0,
+            8,
+            RuntimeBlockStateId(12),
+        ));
+        let open = collide(
+            player,
+            Vec3d::new(0.0, 0.0, 0.5),
+            &chunks,
+            geometry(),
+            &profile,
+            false,
+        )
+        .unwrap()
+        .0;
+        assert_close(open.z, 0.5);
+
+        assert!(chunks.update_block(
+            ChunkCoordinate::new(0, 0),
+            0,
+            8,
+            0,
+            8,
+            RuntimeBlockStateId(11),
+        ));
+        let closed_again = collide(
+            player,
+            Vec3d::new(0.0, 0.0, 0.5),
+            &chunks,
+            geometry(),
+            &profile,
+            false,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(closed_again, blocked);
+
+        let east_west = classify_shape(
+            "oak_fence_gate",
+            &BTreeMap::from([
+                ("facing".to_owned(), "east".to_owned()),
+                ("open".to_owned(), "false".to_owned()),
+            ]),
+        );
+        assert!(matches!(east_west, CollisionShape::Boxes(values) if values[0].max.y == 1.5));
+    }
+
+    #[test]
+    fn releasing_sneak_restores_ordinary_edge_motion_on_the_next_tick() {
+        let (mut chunks, profile) = flat_world();
+        for z in 0..16 {
+            for x in 9..16 {
+                let _ = chunks.update_block(
+                    ChunkCoordinate::new(0, 0),
+                    0,
+                    x,
+                    0,
+                    z,
+                    RuntimeBlockStateId(0),
+                );
+            }
+        }
+        let make_player = || {
+            let mut state = PlayerMovementState::from_authoritative(
+                LocalPlayerPose::new(9.2, 1.0, 8.0, 0.0, 0.0),
+                Vec3d::new(0.2, 0.0, 0.0),
+            )
+            .unwrap();
+            state.on_ground = true;
+            state
+        };
+        let mut sneaking = make_player();
+        let protected = sneaking
+            .tick(
+                MovementInput {
+                    sneak: true,
+                    ..Default::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        let mut released = make_player();
+        let ordinary = released
+            .tick(MovementInput::default(), &chunks, geometry(), &profile)
+            .unwrap();
+        assert!(protected.applied.x <= 0.05 + COLLISION_EPSILON);
+        assert!(ordinary.applied.x > protected.applied.x + 0.1);
     }
 }
