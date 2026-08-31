@@ -1,6 +1,6 @@
 # Phase 8 Chat Mode MVP
 
-Chat Mode is Cubic's low-power, full-window Minecraft chat experience. The Phase 8 MVP targets only a controlled vanilla Java 26.1.2 / protocol 775 server. It is not a terminal logger and it does not render or model the Minecraft world.
+Chat Mode is Cubic's low-power, full-window Minecraft chat experience. The Phase 8 MVP targeted a controlled vanilla Java 26.1.2 / protocol 775 server. It is not a terminal logger. Phase 18 now lets a world-capable session select this presentation without drawing the retained live world.
 
 ## Architecture
 
@@ -24,7 +24,7 @@ History retains at most 500 messages and 256 KiB of projected sender/text bytes,
 
 Handled clientbound Play traffic: Keep Alive, Ping, Player Position, Chunk Batch Finished, Cookie Request, Player Chat, Disguised Chat, System Chat, Disconnect, Set Health (low-health warning), and Start Configuration. The matching minimum replies are sent. All packet IDs and shapes remain in `cubic_protocol::bootstrap::v775`; Phase 12 will replace or absorb them with generated packet data.
 
-Other complete bounded frames, including chunk/light/entity/world data, are discarded immediately. Cubic does not decode chunks, build world state, retain entity data, move the player, or render Minecraft.
+The standalone `chat` command still discards other complete bounded world frames. The Phase 18 `world` composition instead keeps its existing bounded authoritative world pipeline active while Chat presentation is selected; this does not turn the UI into an owner of world state.
 
 ## Manual acceptance
 
@@ -52,4 +52,16 @@ Phase 9 reuses this exact UI with `chat <address> --backend xal`: stored credent
 
 Exploratory Autcraft testing showed that some independently decorated rank/pronoun/channel messages can retain their prefix while Cubic's current presentation loses the visible message body; translation keys can also remain untranslated. This is recorded as a Phase 25 presentation limitation rather than server-specific behavior. Cubic does not add proxy-specific rendering rules.
 
-Phase 18 owns seamless Chat Mode/Play Mode switching. Phase 25 owns complete text/UI/server-presentation semantics.
+Phase 25 owns complete text/UI/server-presentation semantics.
+
+## Phase 18 shared-session mode
+
+The `world` development command now exposes a `CHAT` control over the live world and a prominent `PLAY` control in the existing Chat Mode header. Both views retain the same TCP connection and network task; changing mode sends no Login, Configuration, reconnect, respawn, or player-creation request. Incoming chat history remains bounded by the Phase 8 limits and survives both transitions.
+
+Entering Chat clears all gameplay held/edge state, releases pointer capture, and routes native input only through egui. Typing movement-key letters cannot move the player. Returning to Play clears input once more, requires fresh gameplay key transitions, and leaves pointer recapture explicit.
+
+World packets and authoritative state continue while Chat is visible. The renderer receives only latest coalesced chunk revisions and pose state; it submits event-driven UI frames but performs no terrain frame, mesh-result integration, or new mesh dispatch. Existing worker/result channels remain capped at 32 and the dirty map remains bounded by the loaded-chunk cap. On return, current-pose distance priority rebuilds nearby dirty chunks first. Cubic has no particles or audio subsystem yet, so neither performs hidden work.
+
+Semantic safety alerts appear as conspicuous notices and use the priority event slot rather than the spam-droppable regular chat queue. Health packets generate damage, one low-health transition warning at six health or below, and one death warning. The exact 26.1.2 Set Entity Data packet (`0x63`) supplies the base Entity air field when sent as its standalone index-1/INT update; crossing 60 air units generates one drowning warning until air recovers. While Chat is active, an authoritative correction at least eight blocks from local prediction generates a displacement warning; smaller reconciliation jitter does not. These event kinds are platform-neutral so a later iOS host can map them to haptics without protocol logic in UI code.
+
+The optimized Windows localhost acceptance passed: Play -> Chat -> Play retained the same live session, chat typing remained isolated from gameplay, world changes continued while hidden, returning to Play converged to the current world, and the safety-warning path behaved sufficiently for Phase 18 acceptance.

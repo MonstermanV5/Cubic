@@ -644,6 +644,7 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
     tracing::info!(version = %version, blockstates = resources.blockstate_count, models = resources.model_count, textures = resources.texture_count, atlas_width = resources.atlas.width, atlas_height = resources.atlas.height, atlas_bytes = resources.atlas.rgba.len(), fallbacks = resources.fallback_count, "vanilla block resources prepared");
     let options = ChatSessionOptions::default();
     let (chat_handle, chat_runner) = ChatSessionHandle::bounded(&options);
+    chat_handle.set_presentation_mode(cubic_core::SessionPresentationMode::Play);
     let (world_handle, world_runner) = WorldRenderHandle::new();
     let (control_handle, control_runner) = WorldControlHandle::new();
     let network_address = address.clone();
@@ -681,9 +682,11 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
     tracing::info!(address = %address, username = %username, "opening development World Mode");
     let result = cubic_platform::run_world(
         Box::new(NetworkWorldPort {
-            chat: chat_handle,
             world: world_handle,
             controls: control_handle,
+        }),
+        Box::new(NetworkChatPort {
+            handle: chat_handle,
         }),
         resources,
     );
@@ -701,15 +704,12 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
 }
 
 struct NetworkWorldPort {
-    chat: ChatSessionHandle,
     world: WorldRenderHandle,
     controls: WorldControlHandle,
 }
 
 impl cubic_platform::WorldSessionPort for NetworkWorldPort {
     fn take_world_update(&mut self) -> Option<cubic_world::WorldRenderUpdate> {
-        while self.chat.try_next_event().is_some() {}
-        let _critical = self.chat.take_critical_event();
         self.world.take_update()
     }
 
@@ -719,7 +719,6 @@ impl cubic_platform::WorldSessionPort for NetworkWorldPort {
 
     fn disconnect(&self) {
         self.controls.clear();
-        let _result = self.chat.disconnect();
     }
 
     fn set_movement_input(&self, sequence: u64, input: cubic_world::MovementInput) {
@@ -791,6 +790,10 @@ impl ChatSessionPort for NetworkChatPort {
         self.handle
             .try_send_message(message)
             .map_err(|error| error.to_string())
+    }
+
+    fn set_presentation_mode(&self, mode: cubic_core::SessionPresentationMode) {
+        self.handle.set_presentation_mode(mode);
     }
 
     fn disconnect(&mut self) {

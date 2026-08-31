@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes current and intended boundaries. Phases 1-17 provide the scaffold through accepted official-resource terrain rendering and basic local movement/collision. Phase 17B is the in-progress vanilla physical block-collision fidelity follow-up; Phase 18 retains its original numbering, and entities, interaction, and later environment systems remain unimplemented.
+This document describes current and intended boundaries. Phases 1-17B provide the scaffold through accepted official-resource terrain rendering, movement, and vanilla block-collision fidelity. Phase 18's Play/Chat lifecycle is in progress; entities, interaction, and later environment systems remain unimplemented.
 
 ## Workspace responsibilities
 
@@ -70,6 +70,8 @@ winit events         -> egui input/layout       -> cubic-render   -> wgpu
 ```
 
 The network task retains `MinecraftConnection` after Phase 7 reaches Play. It handles required control/chat packets, Phase 14 chunk lifecycle, Phase 17 single/section live block updates, and the optional World Mode movement controller. Live updates mutate loaded semantic sections in place, immediately affect collision, and publish coalesced affected-chunk render replacements; the renderer's existing neighbor invalidation and revision/generation checks prevent stale geometry from winning. Unloaded/out-of-dimension updates are ignored safely. The UI never owns a socket and rendering never blocks on network I/O.
+
+Phase 18 composes those same endpoints in one native application: an explicit `Play`/`Chat` presentation mode controls input routing and render workload, not connection ownership. The network-owned `WorldState`, 20 Hz controller, keepalive/control handling, and bounded chat queues continue unchanged in both modes. Chat mode applies coalesced immutable chunk updates to render-side desired state but does not call terrain preparation or submit a world pass. The bounded dirty map is therefore the backlog; superseded revisions coalesce. Returning to Play uses the latest predicted pose as the existing near-first dispatch origin. There is currently no particle or audio subsystem to suspend; adding either later must follow this presentation policy rather than own session lifetime.
 
 winit waits rather than polls. A 200 ms low-frequency wake checks bounded cross-thread state, but requests a GPU redraw only for changed input/session presentation, resize/recovery, or direct window interaction. Networking remains active independently. `egui-winit` owns native clipboard event/output integration. `cubic-platform` may supply platform-installed font bytes to egui at Chat Mode startup; this target-specific font discovery remains outside `cubic-ui` and the renderer. See `CHAT_MODE.md` for the exact MVP boundary.
 

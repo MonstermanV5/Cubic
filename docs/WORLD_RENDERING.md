@@ -24,6 +24,10 @@ Minecraft `uvlock` is face-local. Cubic compares each source face basis with its
 
 Faces are emitted only when the adjacent semantic state is air or the neighbor is not loaded. Section boundaries use the same absolute lookup as ordinary blocks. Horizontal chunk neighbors are included in each bounded mesh job; arrival, replacement, and unload remesh both sides so temporary boundary faces converge. A `WorldContents` generation reset drops render-side chunk references and GPU buffers immediately, and late worker results from the old generation are ignored. The renderer retains one immutable reference and at most one GPU mesh per loaded chunk; Phase 30 will establish explicit global budgets and deeper streaming policy.
 
+## Phase 18 presentation suspension
+
+Chat presentation does not freeze the world. Render-side chunk snapshots and latest revisions continue to coalesce, but no world surface pass calls `prepare`, so no new mesh work is dispatched and no terrain frame is submitted. The egui chat surface remains event-driven. Returning to Play resumes the same bounded workers and selects dirty coordinates nearest the latest live player chunk first; no reconnect, chunk reload request, or full-world sort is introduced.
+
 ## Development command and limits
 
 ```powershell

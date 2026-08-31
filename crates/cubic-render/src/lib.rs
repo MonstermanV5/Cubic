@@ -257,6 +257,134 @@ impl Renderer {
         }
     }
 
+    /// Renders terrain and a small egui control overlay in one surface frame.
+    /// This is used only in Play presentation; Chat presentation calls
+    /// `render_ui` and therefore performs no world preparation or draw pass.
+    pub fn render_world_ui(
+        &mut self,
+        paint_jobs: &[egui::ClippedPrimitive],
+        textures: egui::TexturesDelta,
+        pixels_per_point: f32,
+    ) -> Result<FrameStatus, RenderError> {
+        self.ui_textures.enqueue(textures);
+        if self.out_of_memory.load(Ordering::Acquire) {
+            return Err(RenderError::OutOfMemory);
+        }
+        if !self.configured {
+            return Ok(FrameStatus::Skipped);
+        }
+        match self.surface.get_current_texture() {
+            CurrentSurfaceTexture::Success(frame) => {
+                self.paint_world_ui(frame, paint_jobs, pixels_per_point);
+                Ok(FrameStatus::Presented)
+            }
+            CurrentSurfaceTexture::Suboptimal(frame) => {
+                self.paint_world_ui(frame, paint_jobs, pixels_per_point);
+                self.reconfigure();
+                Ok(FrameStatus::Reconfigured)
+            }
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => {
+                Ok(FrameStatus::Skipped)
+            }
+            CurrentSurfaceTexture::Outdated => {
+                self.reconfigure();
+                Ok(FrameStatus::Reconfigured)
+            }
+            CurrentSurfaceTexture::Lost => {
+                self.recreate_surface()?;
+                Ok(FrameStatus::Reconfigured)
+            }
+            CurrentSurfaceTexture::Validation => Err(RenderError::SurfaceValidation),
+        }
+    }
+
+    fn paint_world_ui(
+        &mut self,
+        frame: wgpu::SurfaceTexture,
+        paint_jobs: &[egui::ClippedPrimitive],
+        pixels_per_point: f32,
+    ) {
+        if self.world_renderer.is_none() {
+            self.paint_ui(frame, paint_jobs, pixels_per_point);
+            return;
+        }
+        let mut textures = self.ui_textures.take_for_paint();
+        for (id, deltas) in textures.set.drain() {
+            for delta in deltas {
+                self.ui_renderer
+                    .update_texture(&self.device, &self.queue, id, &delta);
+            }
+        }
+        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        let Some(world) = &mut self.world_renderer else {
+            return;
+        };
+        world.prepare(&self.device, &self.queue, self.size.width, self.size.height);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Cubic Play/Chat combined encoder"),
+            });
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.size.width, self.size.height],
+            pixels_per_point,
+        };
+        let extra = self.ui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            paint_jobs,
+            &screen,
+        );
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Cubic Play Mode world pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(CLEAR_COLOR),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: world.depth_view(),
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Clear(1.0),
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            world.draw(&mut pass);
+        }
+        {
+            let pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Cubic Play Mode control overlay"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            self.ui_renderer
+                .render(&mut pass.forget_lifetime(), paint_jobs, &screen);
+        }
+        self.queue
+            .submit(extra.into_iter().chain([encoder.finish()]));
+        self.queue.present(frame);
+        for id in textures.free.drain() {
+            self.ui_renderer.free_texture(&id);
+        }
+    }
+
     fn paint_world(&mut self, frame: wgpu::SurfaceTexture) {
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let Some(world) = &mut self.world_renderer else {

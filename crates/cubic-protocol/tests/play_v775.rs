@@ -601,6 +601,32 @@ fn world_state_packet_counts_flags_and_trailing_data_are_rejected() {
     assert!(v775::decode_play_clientbound(&[0x0a, 0, 0, 0]).is_err());
 }
 
+#[test]
+fn set_entity_data_projects_standalone_player_air_without_retaining_metadata() {
+    // Official 26.1.2 packet report: set_entity_data = 0x63. Entity base
+    // metadata index 1 uses serializer 1 (VarInt) for remaining air supply.
+    let body = [0x63, 0x2a, 0x01, 0x01, 0x3c, 0xff];
+    assert_eq!(
+        v775::decode_play_clientbound(&body).unwrap(),
+        v775::PlayClientbound::EntityData {
+            entity_id: 42,
+            air_supply: Some(60),
+            payload_bytes: 4,
+        }
+    );
+
+    let unrelated = [0x63, 0x2a, 0x00, 0x00, 0x01, 0xff];
+    assert_eq!(
+        v775::decode_play_clientbound(&unrelated).unwrap(),
+        v775::PlayClientbound::EntityData {
+            entity_id: 42,
+            air_supply: None,
+            payload_bytes: 4,
+        }
+    );
+    assert!(v775::decode_play_clientbound(&[0x63, 0x2a, 0x01, 0x01]).is_err());
+}
+
 fn write_spawn_info(writer: &mut CodecWriter, dimension: &str) {
     writer.write_var_int(4);
     writer

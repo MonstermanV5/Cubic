@@ -561,6 +561,7 @@ async fn await_initial_play_login(
             | PlayClientbound::GameEvent { .. }
             | PlayClientbound::InitializeBorder(_)
             | PlayClientbound::Health { .. }
+            | PlayClientbound::EntityData { .. }
             | PlayClientbound::CustomPayload { .. }
             | PlayClientbound::ChunkBatchStart
             | PlayClientbound::LevelChunkWithLight(_)

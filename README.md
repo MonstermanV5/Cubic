@@ -8,7 +8,7 @@ Cubic does not contain Mojang or Microsoft code or assets. The repository curren
 
 ## Current state
 
-With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status`, `dev-login`, and `chat` retain their accepted behavior. `world <server> --username <name>` opens a separate offline-development window that renders bounded decoded chunks using official exact-version block resources verified and cached by Cubic. It includes the accepted Phase 17 Windows movement controller and local predicted camera plus Phase 17B's accepted exact-version collision shapes and sneak-edge prevention. It requires the Phase 11 generated game-data artifact and may populate the Phase 10 official client cache before opening the window. Entities, block interaction, and general Play Mode remain unimplemented; Chat Mode remains independent. See `docs/WORLD_RENDERING.md`, `docs/BLOCK_RESOURCES.md`, and `docs/MOVEMENT.md`.
+With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status`, `dev-login`, and `chat` retain their accepted behavior. `world <server> --username <name>` opens the offline-development Play window that renders bounded decoded chunks using official exact-version block resources verified and cached by Cubic. It includes the accepted Phase 17 movement controller, Phase 17B collision fidelity, and Phase 18's in-progress same-session `CHAT`/`PLAY` presentation toggle. It requires the Phase 11 generated game-data artifact and may populate the Phase 10 official client cache before opening the window. Entities and block interaction remain unimplemented. See `docs/WORLD_RENDERING.md`, `docs/BLOCK_RESOURCES.md`, `docs/MOVEMENT.md`, and `docs/CHAT_MODE.md`.
 
 ## Build and validate
 

@@ -2,14 +2,15 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use cubic_auth::{AuthenticatedMinecraftAccount, MinecraftSessionJoiner, PlayerCertificate};
 use cubic_core::{
-    ChatEvent, ChatMessage, ChatMessageKind, ChatMessageTrust, ChatSessionCommand, StructuredText,
+    ChatEvent, ChatMessage, ChatMessageKind, ChatMessageTrust, ChatSessionCommand, SafetyAlertKind,
+    SessionPresentationMode, StructuredText,
 };
 use cubic_protocol::{
     bootstrap::v775::{self, ClientInformation, PlayClientbound, TextComponent},
@@ -58,6 +59,7 @@ pub struct ChatSessionHandle {
     critical_event: Arc<Mutex<Option<ChatEvent>>>,
     dropped_events: Arc<AtomicUsize>,
     channel_closed_reported: bool,
+    presentation_mode: Arc<AtomicU8>,
 }
 
 pub struct ChatSessionRunner {
@@ -65,6 +67,7 @@ pub struct ChatSessionRunner {
     events: mpsc::Sender<ChatEvent>,
     critical_event: Arc<Mutex<Option<ChatEvent>>>,
     dropped_events: Arc<AtomicUsize>,
+    presentation_mode: Arc<AtomicU8>,
 }
 
 impl ChatSessionHandle {
@@ -74,6 +77,9 @@ impl ChatSessionHandle {
         let (event_tx, event_rx) = mpsc::channel(options.event_capacity.max(1));
         let critical_event = Arc::new(Mutex::new(None));
         let dropped_events = Arc::new(AtomicUsize::new(0));
+        let presentation_mode = Arc::new(AtomicU8::new(presentation_mode_value(
+            SessionPresentationMode::Chat,
+        )));
         (
             Self {
                 commands: command_tx,
@@ -81,12 +87,14 @@ impl ChatSessionHandle {
                 critical_event: Arc::clone(&critical_event),
                 dropped_events: Arc::clone(&dropped_events),
                 channel_closed_reported: false,
+                presentation_mode: Arc::clone(&presentation_mode),
             },
             ChatSessionRunner {
                 commands: command_rx,
                 events: event_tx,
                 critical_event,
                 dropped_events,
+                presentation_mode,
             },
         )
     }
@@ -101,6 +109,11 @@ impl ChatSessionHandle {
         self.commands
             .try_send(ChatSessionCommand::Disconnect)
             .map_err(map_send_error)
+    }
+
+    pub fn set_presentation_mode(&self, mode: SessionPresentationMode) {
+        self.presentation_mode
+            .store(presentation_mode_value(mode), Ordering::Release);
     }
 
     pub fn try_next_event(&mut self) -> Option<ChatEvent> {
@@ -127,6 +140,25 @@ impl ChatSessionHandle {
     #[must_use]
     pub fn dropped_event_count(&self) -> usize {
         self.dropped_events.swap(0, Ordering::AcqRel)
+    }
+}
+
+const fn presentation_mode_value(mode: SessionPresentationMode) -> u8 {
+    match mode {
+        SessionPresentationMode::Play => 0,
+        SessionPresentationMode::Chat => 1,
+    }
+}
+
+impl ChatSessionRunner {
+    fn presentation_mode(&self) -> SessionPresentationMode {
+        if self.presentation_mode.load(Ordering::Acquire)
+            == presentation_mode_value(SessionPresentationMode::Chat)
+        {
+            SessionPresentationMode::Chat
+        } else {
+            SessionPresentationMode::Play
+        }
     }
 }
 
@@ -266,6 +298,86 @@ enum RenderPoseAuthority {
     LocalPrediction,
 }
 
+const LOW_HEALTH_THRESHOLD: f32 = 6.0;
+const DANGEROUS_AIR_THRESHOLD: i32 = 60;
+const LARGE_DISPLACEMENT_THRESHOLD_SQUARED: f64 = 64.0;
+
+#[derive(Default)]
+struct SessionSafetyTracker {
+    health: Option<f32>,
+    air: Option<i32>,
+    low_health_active: bool,
+    drowning_active: bool,
+    dead: bool,
+}
+
+impl SessionSafetyTracker {
+    fn health_alerts(&mut self, health: f32) -> Vec<ChatEvent> {
+        let mut alerts = Vec::with_capacity(2);
+        if health <= 0.0 {
+            if !self.dead {
+                alerts.push(safety_alert(SafetyAlertKind::Death, "You died"));
+            }
+            self.dead = true;
+        } else {
+            self.dead = false;
+            if self.health.is_some_and(|previous| health < previous) {
+                alerts.push(safety_alert(
+                    SafetyAlertKind::Damage,
+                    format!("Health dropped to {health:.1}"),
+                ));
+            }
+        }
+        if health <= LOW_HEALTH_THRESHOLD && health > 0.0 {
+            if !self.low_health_active {
+                alerts.push(safety_alert(
+                    SafetyAlertKind::LowHealth,
+                    format!("Dangerously low health: {health:.1}"),
+                ));
+            }
+            self.low_health_active = true;
+        } else {
+            self.low_health_active = false;
+        }
+        self.health = Some(health);
+        alerts
+    }
+
+    fn air_alert(&mut self, air: i32) -> Option<ChatEvent> {
+        let dangerous = air <= DANGEROUS_AIR_THRESHOLD;
+        let alert = (dangerous && !self.drowning_active).then(|| {
+            safety_alert(
+                SafetyAlertKind::Drowning,
+                format!("Air supply is dangerously low: {air}"),
+            )
+        });
+        self.drowning_active = dangerous;
+        self.air = Some(air);
+        alert
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn safety_alert(kind: SafetyAlertKind, message: impl Into<String>) -> ChatEvent {
+    ChatEvent::SafetyAlert {
+        kind,
+        message: message.into(),
+    }
+}
+
+fn significant_displacement(
+    from: cubic_world::LocalPlayerPose,
+    to: cubic_world::LocalPlayerPose,
+) -> bool {
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let dz = to.z - from.z;
+    dx.mul_add(dx, dy.mul_add(dy, dz * dz)) >= LARGE_DISPLACEMENT_THRESHOLD_SQUARED
+}
+
 fn publish_authoritative_pose(
     render: Option<&WorldRenderRunner>,
     world: &WorldState,
@@ -333,6 +445,7 @@ async fn run_play_session(
 
     let mut salt_counter = 0_i64;
     let mut sent_player_loaded = false;
+    let mut safety = SessionSafetyTracker::default();
     let mut movement = movement.map(|(controls, collisions)| {
         WorldMovementController::new(controls, collisions, player_entity_id)
     });
@@ -522,6 +635,7 @@ async fn run_play_session(
                         if let Some(controller) = &mut movement
                             && let Some(authoritative) = world.session().and_then(|session| session.position)
                         {
+                            let predicted_before = controller.predicted_pose();
                             let pose = controller
                                 .reconcile(position, authoritative, &world)
                                 .map_err(|error| ChatSessionError::Movement(error.to_string()))?;
@@ -531,6 +645,15 @@ async fn run_play_session(
                                     std::time::Instant::now(),
                                     controller.presentation_look(),
                                 );
+                            }
+                            if runner.presentation_mode() == SessionPresentationMode::Chat
+                                && predicted_before
+                                    .is_some_and(|predicted| significant_displacement(predicted, pose))
+                            {
+                                runner.critical(safety_alert(
+                                    SafetyAlertKind::LargeDisplacement,
+                                    "The server moved you a significant distance",
+                                ));
                             }
                         }
                     }
@@ -660,8 +783,21 @@ async fn run_play_session(
                         runner.critical(ChatEvent::Disconnected { reason: reason.plain_text });
                         return Ok(());
                     }
-                    PlayClientbound::Health { health } if health <= 6.0 => {
-                        runner.event(ChatEvent::Warning(format!("Low health: {health:.1}")));
+                    PlayClientbound::Health { health } => {
+                        for event in safety.health_alerts(health) {
+                            runner.critical(event);
+                        }
+                    }
+                    PlayClientbound::EntityData { entity_id, air_supply, .. } => {
+                        let current_player_entity_id = world
+                            .session()
+                            .map_or(player_entity_id, |session| session.player_entity_id);
+                        if entity_id == current_player_entity_id
+                            && let Some(air) = air_supply
+                            && let Some(event) = safety.air_alert(air)
+                        {
+                            runner.critical(event);
+                        }
                     }
                     PlayClientbound::Login(_)
                     | PlayClientbound::Respawn(_)
@@ -670,7 +806,6 @@ async fn run_play_session(
                     | PlayClientbound::ChangeDifficulty { .. }
                     | PlayClientbound::GameEvent { .. }
                     | PlayClientbound::InitializeBorder(_)
-                    | PlayClientbound::Health { .. }
                     | PlayClientbound::CustomPayload { .. }
                     | PlayClientbound::Ignored { .. } => {}
                     PlayClientbound::ResourcePackPush => {
@@ -696,6 +831,7 @@ async fn run_play_session(
                             let entity_id = world.session().map_or(player_entity_id, |session| session.player_entity_id);
                             controller.reset(entity_id);
                         }
+                        safety.reset();
                         tracing::info!(target: "world", summary = %world.summary(), "reconfiguration replaced authoritative world state");
                         if let ChatSecurity::Authenticated(session) = &mut security {
                             session.reset(random_session_uuid());
@@ -1163,6 +1299,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn safety_alert_survives_a_full_event_queue() {
+        let options = ChatSessionOptions {
+            event_capacity: 1,
+            ..ChatSessionOptions::default()
+        };
+        let (handle, runner) = ChatSessionHandle::bounded(&options);
+        runner.event(ChatEvent::Connected);
+        runner.critical(safety_alert(
+            SafetyAlertKind::LowHealth,
+            "Health is critically low",
+        ));
+        assert_eq!(
+            handle.take_critical_event(),
+            Some(ChatEvent::SafetyAlert {
+                kind: SafetyAlertKind::LowHealth,
+                message: "Health is critically low".to_owned(),
+            })
+        );
+    }
+
     #[tokio::test]
     async fn world_mode_ends_each_protocol_tick_even_before_prediction_is_seeded() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1352,5 +1509,69 @@ mod tests {
 
         handle.disconnect().unwrap();
         session.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn presentation_mode_changes_without_replacing_session_channels() {
+        let (mut handle, runner) = ChatSessionHandle::bounded(&ChatSessionOptions::default());
+        let identity = Arc::as_ptr(&handle.critical_event);
+        assert_eq!(runner.presentation_mode(), SessionPresentationMode::Chat);
+        handle.set_presentation_mode(SessionPresentationMode::Play);
+        assert_eq!(runner.presentation_mode(), SessionPresentationMode::Play);
+        handle.set_presentation_mode(SessionPresentationMode::Chat);
+        assert_eq!(runner.presentation_mode(), SessionPresentationMode::Chat);
+        assert_eq!(identity, Arc::as_ptr(&handle.critical_event));
+        assert!(handle.try_next_event().is_none());
+    }
+
+    #[test]
+    fn safety_alerts_are_transition_based_and_do_not_spam() {
+        let mut tracker = SessionSafetyTracker::default();
+        assert!(tracker.health_alerts(20.0).is_empty());
+        let damage = tracker.health_alerts(10.0);
+        assert_eq!(damage.len(), 1);
+        assert!(matches!(
+            damage[0],
+            ChatEvent::SafetyAlert {
+                kind: SafetyAlertKind::Damage,
+                ..
+            }
+        ));
+        let low = tracker.health_alerts(6.0);
+        assert_eq!(low.len(), 2, "damage and low-health crossing are distinct");
+        assert_eq!(tracker.health_alerts(6.0).len(), 0);
+        let death = tracker.health_alerts(0.0);
+        assert!(death.iter().any(|event| matches!(
+            event,
+            ChatEvent::SafetyAlert {
+                kind: SafetyAlertKind::Death,
+                ..
+            }
+        )));
+        assert!(tracker.health_alerts(0.0).is_empty());
+        assert!(tracker.air_alert(300).is_none());
+        assert!(matches!(
+            tracker.air_alert(60),
+            Some(ChatEvent::SafetyAlert {
+                kind: SafetyAlertKind::Drowning,
+                ..
+            })
+        ));
+        assert!(tracker.air_alert(40).is_none());
+        assert!(tracker.air_alert(300).is_none());
+        assert!(tracker.air_alert(59).is_some());
+    }
+
+    #[test]
+    fn displacement_warning_ignores_reconciliation_jitter() {
+        let origin = cubic_world::LocalPlayerPose::new(0.0, 64.0, 0.0, 0.0, 0.0);
+        assert!(!significant_displacement(
+            origin,
+            cubic_world::LocalPlayerPose::new(0.05, 64.01, -0.03, 90.0, 20.0)
+        ));
+        assert!(significant_displacement(
+            origin,
+            cubic_world::LocalPlayerPose::new(8.0, 64.0, 0.0, 0.0, 0.0)
+        ));
     }
 }

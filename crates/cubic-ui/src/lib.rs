@@ -2,17 +2,54 @@
 
 use std::collections::VecDeque;
 
+pub use cubic_core::SessionPresentationMode;
 use cubic_core::{ChatConnectionState, ChatEvent, ChatMessageKind};
 
 pub const MAX_HISTORY_MESSAGES: usize = 500;
 pub const MAX_HISTORY_TEXT_BYTES: usize = 256 * 1024;
 pub const MAX_INPUT_UTF16_UNITS: usize = 256;
 
+/// Explicit presentation state for one persistent session. Switching this
+/// value never owns or recreates the underlying connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PresentationModeController {
+    mode: SessionPresentationMode,
+}
+
+impl PresentationModeController {
+    #[must_use]
+    pub const fn new(mode: SessionPresentationMode) -> Self {
+        Self { mode }
+    }
+
+    #[must_use]
+    pub const fn mode(self) -> SessionPresentationMode {
+        self.mode
+    }
+
+    pub fn enter_chat(&mut self) -> bool {
+        self.replace(SessionPresentationMode::Chat)
+    }
+
+    pub fn enter_play(&mut self) -> bool {
+        self.replace(SessionPresentationMode::Play)
+    }
+
+    fn replace(&mut self, mode: SessionPresentationMode) -> bool {
+        if self.mode == mode {
+            return false;
+        }
+        self.mode = mode;
+        true
+    }
+}
+
 pub trait ChatSessionPort: Send {
     fn try_next_event(&mut self) -> Option<ChatEvent>;
     fn take_critical_event(&mut self) -> Option<ChatEvent>;
     fn dropped_event_count(&mut self) -> usize;
     fn send_message(&mut self, message: String) -> Result<(), String>;
+    fn set_presentation_mode(&self, _mode: SessionPresentationMode) {}
     fn disconnect(&mut self);
 }
 
@@ -88,6 +125,11 @@ impl ChatModel {
                 sender: None,
                 text,
             }),
+            ChatEvent::SafetyAlert { message, .. } => self.push(DisplayedMessage {
+                kind: ChatMessageKind::ServerNotice,
+                sender: None,
+                text: format!("⚠ {message}"),
+            }),
             ChatEvent::Disconnected { reason } => {
                 self.state = ChatConnectionState::Disconnected;
                 self.push(DisplayedMessage {
@@ -130,6 +172,7 @@ impl ChatModel {
 pub struct ChatMode {
     model: ChatModel,
     port: Box<dyn ChatSessionPort>,
+    focus_input: bool,
 }
 
 impl ChatMode {
@@ -138,6 +181,7 @@ impl ChatMode {
         Self {
             model: ChatModel::default(),
             port,
+            focus_input: true,
         }
     }
 
@@ -162,12 +206,26 @@ impl ChatMode {
     }
 
     pub fn show(&mut self, root: &mut egui::Ui) {
+        let _ = self.show_with_play_control(root, false);
+    }
+
+    /// Draws the existing Chat Mode and optionally exposes its prominent mode
+    /// switch. Returns true only when PLAY was activated.
+    pub fn show_with_play_control(&mut self, root: &mut egui::Ui, show_play: bool) -> bool {
+        let mut play_requested = false;
         let connected = self.model.state() == ChatConnectionState::Connected;
         egui::Panel::top("cubic-chat-header").show(root, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.heading("Cubic");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if show_play
+                        && ui
+                            .add(egui::Button::new("PLAY").min_size([72.0, 36.0].into()))
+                            .clicked()
+                    {
+                        play_requested = true;
+                    }
                     let (label, color) = match self.model.state() {
                         ChatConnectionState::Connecting => ("Connecting ●", egui::Color32::YELLOW),
                         ChatConnectionState::Connected => {
@@ -193,6 +251,10 @@ impl ChatMode {
                         .hint_text("Message…")
                         .desired_width(f32::INFINITY),
                 );
+                if self.focus_input {
+                    response.request_focus();
+                    self.focus_input = false;
+                }
                 let enter =
                     response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
                 let send = ui
@@ -237,10 +299,19 @@ impl ChatMode {
                     }
                 });
         });
+        play_requested
     }
 
     pub fn disconnect(&mut self) {
         self.port.disconnect();
+    }
+
+    pub fn set_presentation_mode(&self, mode: SessionPresentationMode) {
+        self.port.set_presentation_mode(mode);
+    }
+
+    pub fn focus_input(&mut self) {
+        self.focus_input = true;
     }
 
     fn send_current(&mut self) {
@@ -335,5 +406,33 @@ mod tests {
             model.history().back().map(|entry| entry.text.as_str()),
             Some(SAMPLE)
         );
+    }
+
+    #[test]
+    fn presentation_transitions_preserve_chat_history_and_are_idempotent() {
+        let mut model = ChatModel::default();
+        model.apply(message("before transition"));
+        let mut mode = PresentationModeController::new(SessionPresentationMode::Play);
+        assert!(mode.enter_chat());
+        assert!(!mode.enter_chat());
+        assert_eq!(mode.mode(), SessionPresentationMode::Chat);
+        assert!(mode.enter_play());
+        assert!(!mode.enter_play());
+        assert_eq!(
+            model.history().front().map(|entry| entry.text.as_str()),
+            Some("before transition")
+        );
+    }
+
+    #[test]
+    fn semantic_safety_alert_is_retained_as_an_obvious_notice() {
+        let mut model = ChatModel::default();
+        model.apply(ChatEvent::SafetyAlert {
+            kind: cubic_core::SafetyAlertKind::LowHealth,
+            message: "Dangerously low health: 4.0".to_owned(),
+        });
+        let alert = model.history().back().expect("alert must be visible");
+        assert_eq!(alert.kind, ChatMessageKind::ServerNotice);
+        assert_eq!(alert.text, "⚠ Dangerously low health: 4.0");
     }
 }

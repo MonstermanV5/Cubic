@@ -9,7 +9,7 @@ use std::{
 };
 
 use cubic_render::{BlockResources, FrameStatus, Renderer, RendererInitError};
-use cubic_ui::{ChatMode, ChatSessionPort};
+use cubic_ui::{ChatMode, ChatSessionPort, PresentationModeController, SessionPresentationMode};
 use cubic_world::{MovementInput, WorldRenderUpdate};
 use winit::{
     application::ApplicationHandler,
@@ -63,6 +63,10 @@ const CHAT_CJK_FONT_KEY: &str = "cubic-system-cjk";
 #[cfg(target_os = "windows")]
 const MAX_SYSTEM_FONT_BYTES: u64 = 64 * 1024 * 1024;
 const MOUSE_SENSITIVITY_DEGREES_PER_PIXEL: f32 = 0.12;
+
+const fn world_presentation_active(mode: SessionPresentationMode) -> bool {
+    matches!(mode, SessionPresentationMode::Play)
+}
 
 fn update_movement_key(input: &mut MovementInput, key: KeyCode, pressed: bool) -> bool {
     let target = match key {
@@ -165,6 +169,7 @@ pub trait WorldSessionPort {
 /// Starts the Phase 15 diagnostic 3D world window.
 pub fn run_world(
     port: Box<dyn WorldSessionPort>,
+    chat_port: Box<dyn ChatSessionPort>,
     resources: BlockResources,
 ) -> Result<(), PlatformError> {
     let event_loop = EventLoop::new().map_err(PlatformError::CreateEventLoop)?;
@@ -174,7 +179,7 @@ pub fn run_world(
     port.set_render_waker(Arc::new(move || {
         let _ = proxy.send_event(());
     }));
-    let mut application = WorldApplication::new(port, resources);
+    let mut application = WorldApplication::new(port, chat_port, resources);
     event_loop
         .run_app(&mut application)
         .map_err(PlatformError::RunEventLoop)?;
@@ -188,7 +193,10 @@ pub fn run_world(
 struct WorldApplication {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    egui: Option<egui_winit::State>,
     port: Box<dyn WorldSessionPort>,
+    chat: ChatMode,
+    mode: PresentationModeController,
     resources: BlockResources,
     startup_error: Option<StartupError>,
     occluded: bool,
@@ -200,11 +208,18 @@ struct WorldApplication {
 }
 
 impl WorldApplication {
-    fn new(port: Box<dyn WorldSessionPort>, resources: BlockResources) -> Self {
+    fn new(
+        port: Box<dyn WorldSessionPort>,
+        chat_port: Box<dyn ChatSessionPort>,
+        resources: BlockResources,
+    ) -> Self {
         Self {
             window: None,
             renderer: None,
+            egui: None,
             port,
+            chat: ChatMode::new(chat_port),
+            mode: PresentationModeController::new(SessionPresentationMode::Play),
             resources,
             startup_error: None,
             occluded: false,
@@ -228,8 +243,22 @@ impl WorldApplication {
         let mut renderer = pollster::block_on(Renderer::new(Arc::clone(&window)))
             .map_err(StartupError::InitializeRenderer)?;
         renderer.enable_world(self.resources.clone());
+        let context = egui::Context::default();
+        context.set_visuals(egui::Visuals::dark());
+        install_chat_font_fallback(&context);
+        let egui = egui_winit::State::new(
+            context,
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            Some(window.scale_factor() as f32),
+            None,
+            Some(4_096),
+        );
         self.window = Some(Arc::clone(&window));
         self.renderer = Some(renderer);
+        self.egui = Some(egui);
+        self.chat
+            .set_presentation_mode(SessionPresentationMode::Play);
         window.request_redraw();
         Ok(())
     }
@@ -316,6 +345,85 @@ impl WorldApplication {
             tracing::warn!(target: "movement::latency", ?elapsed, ?key, pressed, "winit movement input event handling was slow");
         }
     }
+
+    fn enter_chat(&mut self) {
+        if self.mode.enter_chat() {
+            self.clear_input();
+            self.set_cursor_capture(false);
+            self.chat
+                .set_presentation_mode(SessionPresentationMode::Chat);
+            self.chat.focus_input();
+            if let Some(window) = &self.window {
+                window.set_title("Cubic — Chat Mode | session retained");
+            }
+            tracing::info!("Play -> Chat presentation transition; Minecraft session retained");
+            self.request_redraw();
+        }
+    }
+
+    fn enter_play(&mut self) {
+        if self.mode.enter_play() {
+            // Keys held while typing are intentionally not imported into the
+            // gameplay snapshot. A fresh native transition is required.
+            self.clear_input();
+            self.chat
+                .set_presentation_mode(SessionPresentationMode::Play);
+            if let Some(window) = &self.window {
+                window.set_title("Cubic — World Mode");
+            }
+            tracing::info!("Chat -> Play presentation transition; Minecraft session retained");
+            self.request_redraw();
+        }
+    }
+
+    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        let (Some(window), Some(renderer), Some(egui)) =
+            (&self.window, &mut self.renderer, &mut self.egui)
+        else {
+            return;
+        };
+        let mode = self.mode.mode();
+        let input = egui.take_egui_input(window);
+        let context = egui.egui_ctx().clone();
+        let mut play_requested = false;
+        let mut chat_requested = false;
+        let mut output = context.run_ui(input, |ui| match mode {
+            SessionPresentationMode::Chat => {
+                play_requested = self.chat.show_with_play_control(ui, true);
+            }
+            SessionPresentationMode::Play => {
+                egui::Area::new(egui::Id::new("cubic-enter-chat"))
+                    .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
+                    .show(ui.ctx(), |ui| {
+                        chat_requested = ui
+                            .add(egui::Button::new("CHAT").min_size([88.0, 42.0].into()))
+                            .clicked();
+                    });
+            }
+        });
+        egui.handle_platform_output_with_event_loop(window, event_loop, output.platform_output);
+        let pixels_per_point = context.pixels_per_point();
+        let paint_jobs = context.tessellate(output.shapes, pixels_per_point);
+        let textures = std::mem::take(&mut output.textures_delta);
+        let result = match mode {
+            SessionPresentationMode::Play => {
+                renderer.render_world_ui(&paint_jobs, textures, pixels_per_point)
+            }
+            SessionPresentationMode::Chat => {
+                renderer.render_ui(&paint_jobs, textures, pixels_per_point)
+            }
+        };
+        if let Err(error) = result {
+            tracing::error!(%error, "fatal Play/Chat rendering error");
+            event_loop.exit();
+            return;
+        }
+        if play_requested {
+            self.enter_play();
+        } else if chat_requested {
+            self.enter_chat();
+        }
+    }
 }
 
 impl ApplicationHandler for WorldApplication {
@@ -323,7 +431,7 @@ impl ApplicationHandler for WorldApplication {
         // Pose publication wakes this callback directly, avoiding the former
         // idle 50 ms polling delay before a simulated jump/movement update
         // could become visible.
-        if self.integrate_world_updates() {
+        if self.integrate_world_updates() && world_presentation_active(self.mode.mode()) {
             self.request_redraw();
         }
     }
@@ -342,6 +450,7 @@ impl ApplicationHandler for WorldApplication {
         self.clear_input();
         self.set_cursor_capture(false);
         self.renderer = None;
+        self.egui = None;
     }
     fn window_event(
         &mut self,
@@ -355,6 +464,17 @@ impl ApplicationHandler for WorldApplication {
             .is_none_or(|window| window.id() != window_id)
         {
             return;
+        }
+        let egui_response = self
+            .window
+            .as_ref()
+            .zip(self.egui.as_mut())
+            .map(|(window, egui)| egui.on_window_event(window, &event));
+        if egui_response
+            .as_ref()
+            .is_some_and(|response| response.repaint)
+        {
+            self.request_redraw();
         }
         match event {
             WindowEvent::CloseRequested => {
@@ -370,9 +490,15 @@ impl ApplicationHandler for WorldApplication {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => self.set_cursor_capture(true),
+            } if self.mode.mode() == SessionPresentationMode::Play
+                && !egui_response.is_some_and(|response| response.consumed) =>
+            {
+                self.set_cursor_capture(true);
+            }
             WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
+                if self.mode.mode() == SessionPresentationMode::Play
+                    && let PhysicalKey::Code(code) = event.physical_key
+                {
                     if code == KeyCode::Escape && event.state == ElementState::Pressed {
                         self.clear_input();
                         self.set_cursor_capture(false);
@@ -394,13 +520,7 @@ impl ApplicationHandler for WorldApplication {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let Some(renderer) = &mut self.renderer else {
-                    return;
-                };
-                if let Err(error) = renderer.render_world() {
-                    tracing::error!(%error, "fatal World Mode rendering error");
-                    event_loop.exit();
-                }
+                self.redraw(event_loop);
                 if let Some((published_at, observed_at, contains_jump)) =
                     self.pending_pose_presentation.take()
                 {
@@ -411,7 +531,9 @@ impl ApplicationHandler for WorldApplication {
                         tracing::trace!(target: "movement::latency", ?submitted_at, publish_to_frame = ?submitted_at.saturating_duration_since(published_at), observe_to_frame = ?submitted_at.saturating_duration_since(observed_at), "submitted first world frame after simulated local pose publication");
                     }
                 }
-                if let Some(window) = &self.window {
+                if self.mode.mode() == SessionPresentationMode::Play
+                    && let (Some(window), Some(renderer)) = (&self.window, &self.renderer)
+                {
                     let stats = renderer.world_stats();
                     let dimension = stats.dimension.as_deref().unwrap_or("awaiting world");
                     let geometry = stats.geometry.map_or_else(
@@ -442,14 +564,30 @@ impl ApplicationHandler for WorldApplication {
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let changed = self.integrate_world_updates();
-        let pending = self
+        let chat_changed = self.chat.poll();
+        let pending = world_presentation_active(self.mode.mode())
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(Renderer::world_has_pending_work);
+        let ui_textures = self
             .renderer
             .as_ref()
-            .is_some_and(Renderer::world_has_pending_work);
-        if changed || pending {
+            .is_some_and(Renderer::has_pending_ui_textures);
+        if (changed && world_presentation_active(self.mode.mode()))
+            || chat_changed
+            || pending
+            || ui_textures
+        {
             self.request_redraw();
         }
-        let delay = if pending { 16 } else { 50 };
+        let delay = if pending {
+            16
+        } else if self.mode.mode() == SessionPresentationMode::Chat {
+            200
+        } else {
+            50
+        };
         event_loop.set_control_flow(ControlFlow::WaitUntil(
             Instant::now() + Duration::from_millis(delay),
         ));
@@ -460,7 +598,8 @@ impl ApplicationHandler for WorldApplication {
         _device_id: winit::event::DeviceId,
         event: DeviceEvent,
     ) {
-        if self.cursor_captured
+        if self.mode.mode() == SessionPresentationMode::Play
+            && self.cursor_captured
             && let DeviceEvent::MouseMotion { delta: (x, y) } = event
         {
             let arrived = Instant::now();
@@ -481,8 +620,8 @@ impl ApplicationHandler for WorldApplication {
     }
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.clear_input();
-        self.port.disconnect();
-        tracing::info!("Cubic World Mode stopped cleanly");
+        self.chat.disconnect();
+        tracing::info!("Cubic Play/Chat session stopped cleanly");
     }
 }
 
@@ -909,6 +1048,22 @@ mod tests {
         assert!(input.forward && input.sneak && input.sprint);
         assert!(!update_movement_key(&mut input, KeyCode::KeyW, true));
         input = MovementInput::default();
+        assert_eq!(input, MovementInput::default());
+    }
+
+    #[test]
+    fn chat_mode_suspends_world_submission_and_mesh_preparation_policy() {
+        assert!(world_presentation_active(SessionPresentationMode::Play));
+        assert!(!world_presentation_active(SessionPresentationMode::Chat));
+    }
+
+    #[test]
+    fn chat_typing_is_not_routed_into_gameplay_input() {
+        let mut input = MovementInput::default();
+        let mode = SessionPresentationMode::Chat;
+        if world_presentation_active(mode) {
+            update_movement_key(&mut input, KeyCode::KeyW, true);
+        }
         assert_eq!(input, MovementInput::default());
     }
 

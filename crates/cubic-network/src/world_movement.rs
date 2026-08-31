@@ -431,6 +431,10 @@ impl WorldMovementController {
         self.last_look
     }
 
+    pub(crate) fn predicted_pose(&self) -> Option<LocalPlayerPose> {
+        self.simulation.as_ref().map(|state| state.pose)
+    }
+
     pub(crate) fn reconcile(
         &mut self,
         packet: PlayerPosition,

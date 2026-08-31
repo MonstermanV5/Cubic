@@ -133,6 +133,7 @@ const PLAY_PLAYER_ROTATION_ID: i32 = 0x49;
 const PLAY_RESPAWN_ID: i32 = 0x52;
 const PLAY_SECTION_BLOCKS_UPDATE_ID: i32 = 0x54;
 const PLAY_SET_DEFAULT_SPAWN_POSITION_ID: i32 = 0x61;
+const PLAY_SET_ENTITY_DATA_ID: i32 = 0x63;
 const PLAY_SET_HEALTH_ID: i32 = 0x68;
 const PLAY_SET_ENTITY_MOTION_ID: i32 = 0x65;
 const PLAY_SET_TIME_ID: i32 = 0x71;
@@ -424,6 +425,12 @@ pub const fn packet_identity_cross_checks() -> &'static [PacketIdentityCheck] {
             direction: C,
             identity: "minecraft:set_health",
             id: PLAY_SET_HEALTH_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:set_entity_data",
+            id: PLAY_SET_ENTITY_DATA_ID as u32,
         },
         PacketIdentityCheck {
             state: Play,
@@ -868,6 +875,14 @@ pub enum PlayClientbound {
     },
     Health {
         health: f32,
+    },
+    /// Bounded projection of the current entity-metadata packet. Phase 18
+    /// extracts only the base Entity air-supply field (index 1, INT serializer
+    /// 1); all remaining metadata stays opaque and is never retained.
+    EntityData {
+        entity_id: i32,
+        air_supply: Option<i32>,
+        payload_bytes: usize,
     },
     StartConfiguration,
     ResourcePackPush,
@@ -1515,10 +1530,25 @@ pub fn decode_play_clientbound(
         }
         PLAY_SET_HEALTH_ID => {
             let health = reader.read_f32()?;
+            if !health.is_finite() {
+                return Err(BootstrapProtocolError::NonFinite {
+                    context: "Set Health value",
+                });
+            }
             let _food = reader.read_var_int()?;
             let _saturation = reader.read_f32()?;
             require_consumed(&reader, "Set Health")?;
             Ok(PlayClientbound::Health { health })
+        }
+        PLAY_SET_ENTITY_DATA_ID => {
+            let entity_id = reader.read_var_int()?;
+            let metadata = reader.read_remaining();
+            let air_supply = decode_standalone_air_supply(metadata)?;
+            Ok(PlayClientbound::EntityData {
+                entity_id,
+                air_supply,
+                payload_bytes: metadata.len(),
+            })
         }
         PLAY_START_CONFIGURATION_ID => {
             require_consumed(&reader, "Start Configuration")?;
@@ -1531,6 +1561,20 @@ pub fn decode_play_clientbound(
             payload_bytes: packet.payload.len(),
         }),
     }
+}
+
+fn decode_standalone_air_supply(metadata: &[u8]) -> Result<Option<i32>, BootstrapProtocolError> {
+    let mut reader = CodecReader::new(metadata);
+    if reader.remaining() == 0 || reader.read_u8()? != 1 {
+        return Ok(None);
+    }
+    // EntityDataSerializers registers BYTE as 0 and INT as 1. Avoid trying to
+    // skip arbitrary registry-dependent serializers: a packet containing a
+    // different first item remains safely opaque.
+    if reader.read_var_int()? != 1 {
+        return Ok(None);
+    }
+    Ok(Some(reader.read_var_int()?))
 }
 
 /// Decodes 26.1.2's `LpVec3` representation. This replaced the historical

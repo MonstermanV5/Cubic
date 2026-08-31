@@ -42,6 +42,25 @@ pub enum ChatConnectionState {
     Disconnected,
 }
 
+/// Presentation workload selected for one still-live Minecraft session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SessionPresentationMode {
+    Play,
+    #[default]
+    Chat,
+}
+
+/// Safety conditions surfaced while the three-dimensional world is hidden.
+/// Platform code may later map these semantic kinds to native haptics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SafetyAlertKind {
+    Damage,
+    LowHealth,
+    Drowning,
+    Death,
+    LargeDisplacement,
+}
+
 /// Events delivered by a persistent Minecraft session without exposing wire packets.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChatEvent {
@@ -52,6 +71,10 @@ pub enum ChatEvent {
         message: ChatMessage,
     },
     Warning(String),
+    SafetyAlert {
+        kind: SafetyAlertKind,
+        message: String,
+    },
     Disconnected {
         reason: String,
     },

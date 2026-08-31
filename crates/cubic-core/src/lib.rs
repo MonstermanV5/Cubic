@@ -4,7 +4,7 @@ mod chat;
 
 pub use chat::{
     ChatConnectionState, ChatEvent, ChatMessage, ChatMessageKind, ChatMessageTrust,
-    ChatSessionCommand, StructuredText,
+    ChatSessionCommand, SafetyAlertKind, SessionPresentationMode, StructuredText,
 };
 
 /// Returns the message emitted by the Phase 1 application scaffold.
