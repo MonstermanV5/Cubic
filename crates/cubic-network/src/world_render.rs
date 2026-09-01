@@ -16,6 +16,7 @@ struct Mailbox {
     reset: bool,
     dimension: Option<String>,
     geometry: Option<DimensionGeometry>,
+    biomes: Option<Arc<[cubic_world::RuntimeBiome]>>,
     pose: Option<RenderPoseSample>,
     pose_published_at: Option<Instant>,
     pose_contains_jump: bool,
@@ -53,6 +54,7 @@ impl WorldRenderHandle {
         let reset = std::mem::take(&mut mailbox.reset);
         let dimension = mailbox.dimension.clone();
         let geometry = mailbox.geometry;
+        let biomes = mailbox.biomes.clone();
         let pose = mailbox.pose.take();
         let pose_published_at = mailbox.pose_published_at.take();
         let pose_contains_jump = std::mem::take(&mut mailbox.pose_contains_jump);
@@ -63,6 +65,7 @@ impl WorldRenderHandle {
             reset,
             dimension,
             geometry,
+            biomes,
             pose,
             pose_published_at,
             pose_contains_jump,
@@ -81,12 +84,18 @@ impl WorldRenderHandle {
 }
 
 impl WorldRenderRunner {
-    pub fn reset(&self, dimension: String, geometry: DimensionGeometry) {
+    pub fn reset(
+        &self,
+        dimension: String,
+        geometry: DimensionGeometry,
+        biomes: Arc<[cubic_world::RuntimeBiome]>,
+    ) {
         let waker = if let Ok(mut mailbox) = self.0.lock() {
             mailbox.generation = mailbox.generation.wrapping_add(1);
             mailbox.reset = true;
             mailbox.dimension = Some(dimension);
             mailbox.geometry = Some(geometry);
+            mailbox.biomes = Some(biomes);
             mailbox.pose = None;
             mailbox.pose_published_at = None;
             mailbox.pose_contains_jump = false;
@@ -230,6 +239,7 @@ mod tests {
                 min_y: 0,
                 height: 16,
             },
+            Arc::from([]),
         );
         let coordinate = ChunkCoordinate::new(2, -3);
         runner.load(chunk(coordinate, 1));
@@ -267,6 +277,7 @@ mod tests {
                 min_y: -64,
                 height: 384,
             },
+            Arc::from([]),
         );
         let update = handle.take_update().unwrap();
         assert!(update.reset);
@@ -332,6 +343,7 @@ mod tests {
                 min_y: 0,
                 height: 16,
             },
+            Arc::from([]),
         );
         assert_eq!(wakes.load(Ordering::Relaxed), 2);
     }

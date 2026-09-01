@@ -103,6 +103,7 @@ pub(crate) fn has_verified_shape(path: &str) -> bool {
         || path.ends_with("_fence_gate")
         || path.ends_with("_wall")
         || is_pane(path)
+        || matches!(path, "ladder" | "honey_block" | "scaffolding")
         || is_verified_block_entity_shape(path)
         || matches!(
             path,
@@ -129,6 +130,32 @@ pub(crate) fn classify_shape(path: &str, properties: &BTreeMap<String, String>) 
             Some("top") => cuboid(0.0, 0.5, 0.0, 1.0, 1.0, 1.0),
             _ => CollisionShape::FullCube,
         };
+    }
+    if path == "ladder" {
+        // LadderBlock's 26.1.2 shape is a facing-dependent 3/16-thick plane.
+        return match property(properties, "facing") {
+            Some("north") => cuboid(0.0, 0.0, 13.0 / 16.0, 1.0, 1.0, 1.0),
+            Some("south") => cuboid(0.0, 0.0, 0.0, 1.0, 1.0, 3.0 / 16.0),
+            Some("west") => cuboid(13.0 / 16.0, 0.0, 0.0, 1.0, 1.0, 1.0),
+            Some("east") => cuboid(0.0, 0.0, 0.0, 3.0 / 16.0, 1.0, 1.0),
+            _ => CollisionShape::FullCube,
+        };
+    }
+    if path == "honey_block" {
+        // HoneyBlock.column(14, 0, 15).
+        return cuboid(
+            1.0 / 16.0,
+            0.0,
+            1.0 / 16.0,
+            15.0 / 16.0,
+            15.0 / 16.0,
+            15.0 / 16.0,
+        );
+    }
+    if path == "scaffolding" {
+        // Its collision is supplied by the movement collision context: a
+        // stable top while approached from above, or empty while descending.
+        return CollisionShape::Empty;
     }
     if path == "pale_moss_carpet" && property(properties, "bottom") == Some("false") {
         return CollisionShape::Empty;
@@ -961,6 +988,44 @@ mod tests {
         assert_eq!(path[0].max.y, 15.0 / 16.0);
         assert_eq!(
             classify_shape("pale_moss_carpet", &props(&[("bottom", "false")])),
+            CollisionShape::Empty
+        );
+    }
+
+    #[test]
+    fn ladders_honey_and_scaffolding_use_verified_non_full_cube_shapes() {
+        let cases = [
+            (
+                "north",
+                Aabb::new(Vec3d::new(0.0, 0.0, 13.0 / 16.0), Vec3d::new(1.0, 1.0, 1.0)),
+            ),
+            (
+                "south",
+                Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(1.0, 1.0, 3.0 / 16.0)),
+            ),
+            (
+                "west",
+                Aabb::new(Vec3d::new(13.0 / 16.0, 0.0, 0.0), Vec3d::new(1.0, 1.0, 1.0)),
+            ),
+            (
+                "east",
+                Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(3.0 / 16.0, 1.0, 1.0)),
+            ),
+        ];
+        for (facing, expected) in cases {
+            assert_eq!(
+                shape_boxes(classify_shape("ladder", &props(&[("facing", facing)]))).as_ref(),
+                &[expected]
+            );
+        }
+        let honey = shape_boxes(classify_shape("honey_block", &BTreeMap::new()));
+        assert_eq!(honey[0].min, Vec3d::new(1.0 / 16.0, 0.0, 1.0 / 16.0));
+        assert_eq!(
+            honey[0].max,
+            Vec3d::new(15.0 / 16.0, 15.0 / 16.0, 15.0 / 16.0)
+        );
+        assert_eq!(
+            classify_shape("scaffolding", &BTreeMap::new()),
             CollisionShape::Empty
         );
     }

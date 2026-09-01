@@ -2,7 +2,9 @@ use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use cubic_version::{GameData, MinecraftIdentifier, VersionError};
 
-use crate::{Chunk, ChunkCoordinate, DimensionGeometry, LocalPlayerPose, RuntimeBlockStateId};
+use crate::{
+    Chunk, ChunkCoordinate, DimensionGeometry, LocalPlayerPose, RuntimeBiome, RuntimeBlockStateId,
+};
 
 /// Version-selected semantic classification needed by the Phase 15 diagnostic renderer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +74,7 @@ pub struct WorldRenderUpdate {
     pub reset: bool,
     pub dimension: Option<String>,
     pub geometry: Option<DimensionGeometry>,
+    pub biomes: Option<Arc<[RuntimeBiome]>>,
     pub pose: Option<RenderPoseSample>,
     /// Publication time used only for bounded input-to-frame diagnostics.
     pub pose_published_at: Option<Instant>,

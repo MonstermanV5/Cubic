@@ -221,6 +221,7 @@ pub async fn run_development_chat_session(
         runner,
         connected.initial_login,
         connected.dimension_types,
+        connected.biomes,
         None,
         None,
     )
@@ -258,6 +259,7 @@ pub async fn run_authenticated_chat_session<J: MinecraftSessionJoiner>(
         runner,
         connected.initial_login,
         connected.dimension_types,
+        connected.biomes,
         None,
         None,
     )
@@ -281,6 +283,7 @@ pub async fn run_development_world_session(
         runner,
         connected.initial_login,
         connected.dimension_types,
+        connected.biomes,
         Some(render),
         Some((controls, collisions)),
     )
@@ -406,16 +409,19 @@ fn publish_reset(
     render.reset(
         session.spawn_context.dimension.to_string(),
         session.dimension_geometry,
+        Arc::from(world.biomes()),
     );
     publish_authoritative_pose(Some(render), world, pose_authority);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_play_session(
     connection: &mut crate::connection::MinecraftConnection,
     mut security: ChatSecurity,
     mut runner: ChatSessionRunner,
     initial_login: v775::InitialPlayLogin,
     dimension_types: Vec<cubic_world::RuntimeDimensionType>,
+    biomes: Vec<cubic_world::RuntimeBiome>,
     render: Option<WorldRenderRunner>,
     movement: Option<(WorldControlRunner, BlockCollisionProfile)>,
 ) -> Result<(), ChatSessionError> {
@@ -428,6 +434,7 @@ async fn run_play_session(
     let mut world = WorldState::default();
     world.apply(WorldEvent::BeginConfiguration)?;
     world.apply(WorldEvent::RuntimeDimensionTypes(dimension_types))?;
+    world.apply(WorldEvent::RuntimeBiomes(biomes))?;
     world.apply(crate::world_adapter::initial_world_event(initial_login)?)?;
     publish_reset(&render, &world, pose_authority);
     tracing::info!(target: "world", summary = %world.summary(), "entered authoritative world state");
@@ -548,6 +555,11 @@ async fn run_play_session(
                         let sky_layers = light.sky_layer_count;
                         let block_layers = light.block_layer_count;
                         world.apply(WorldEvent::UpdateChunkLight { coordinate, light })?;
+                        if let Some(render) = &render
+                            && let Some(chunk) = world.loaded_chunks().get_shared(coordinate)
+                        {
+                            render.load(chunk);
+                        }
                         tracing::debug!(target: "world::chunk", x = coordinate.x, z = coordinate.z, sky_layers, block_layers, "applied bounded chunk light update");
                         continue;
                     }
@@ -825,6 +837,7 @@ async fn run_play_session(
                         let mut state = ConnectionState::Configuration;
                         let configuration = run_configuration(connection, &mut state).await?;
                         world.apply(WorldEvent::RuntimeDimensionTypes(configuration.dimension_types))?;
+                        world.apply(WorldEvent::RuntimeBiomes(configuration.biomes))?;
                         world.apply(crate::world_adapter::initial_world_event(configuration.initial_login)?)?;
                         publish_reset(&render, &world, pose_authority);
                         if let Some(controller) = &mut movement {
@@ -1346,6 +1359,7 @@ mod tests {
                 runner,
                 initial_login(),
                 dimension_types(),
+                vec![],
                 None,
                 Some((control_runner, BlockCollisionProfile::synthetic([]))),
             )
@@ -1460,6 +1474,7 @@ mod tests {
                 runner,
                 initial_login(),
                 dimension_types(),
+                vec![],
                 None,
                 None,
             )

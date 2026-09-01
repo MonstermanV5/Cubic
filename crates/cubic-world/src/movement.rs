@@ -7,7 +7,8 @@ use cubic_version::GameData;
 use thiserror::Error;
 
 use crate::{
-    DimensionGeometry, LoadedChunks, RuntimeBlockStateId,
+    BlockEnvironment, BlockEnvironmentProfile, DimensionGeometry, FluidKind, LoadedChunks,
+    RuntimeBlockStateId, SpecialSurface,
     collision_vanilla::{CollisionOffset, CollisionRuleSet},
 };
 
@@ -17,6 +18,8 @@ const STANDING_HEIGHT: f64 = 1.8;
 const CROUCHING_HEIGHT: f64 = 1.5;
 const STANDING_EYE_HEIGHT: f64 = 1.62;
 const CROUCHING_EYE_HEIGHT: f64 = 1.27;
+const SWIMMING_HEIGHT: f64 = 0.6;
+const SWIMMING_EYE_HEIGHT: f64 = 0.4;
 const STEP_HEIGHT: f64 = 0.6;
 const COLLISION_EPSILON: f64 = 1.0e-7;
 const GRAVITY: f64 = 0.08;
@@ -34,6 +37,16 @@ const DEFAULT_FLYING_SPEED: f64 = 0.05;
 const FLYING_SPRINT_MULTIPLIER: f64 = 2.0;
 const FLYING_VERTICAL_INPUT_MULTIPLIER: f64 = 3.0;
 const FLYING_VERTICAL_DRAG: f64 = 0.6;
+const WATER_ACCELERATION: f64 = 0.02;
+const WATER_DRAG: f64 = 0.8;
+const WATER_SPRINT_DRAG: f64 = 0.9;
+const WATER_GRAVITY: f64 = GRAVITY / 16.0;
+const LAVA_DRAG: f64 = 0.5;
+const FLUID_VERTICAL_INPUT: f64 = 0.04;
+const CLIMB_HORIZONTAL_LIMIT: f64 = 0.15;
+const CLIMB_FALL_LIMIT: f64 = -0.15;
+const CLIMB_UP_SPEED: f64 = 0.2;
+const HONEY_SLIDE_SPEED: f64 = -0.05;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vec3d {
@@ -131,6 +144,7 @@ pub struct BlockCollisionProfile {
     offsets: BTreeMap<RuntimeBlockStateId, CollisionOffset>,
     slipperiness: BTreeMap<RuntimeBlockStateId, f64>,
     approximate_states: BTreeSet<RuntimeBlockStateId>,
+    environment: BlockEnvironmentProfile,
     source_shape_bounds: Aabb,
 }
 
@@ -138,6 +152,7 @@ impl BlockCollisionProfile {
     #[must_use]
     pub fn from_game_data(data: &GameData) -> Self {
         let rules = CollisionRuleSet::for_version(&data.artifact().minecraft_version);
+        let environment = BlockEnvironmentProfile::from_game_data(data);
         let mut states = BTreeMap::new();
         let mut offsets = BTreeMap::new();
         let mut slipperiness = BTreeMap::new();
@@ -150,9 +165,17 @@ impl BlockCollisionProfile {
                 .map_or(block.identifier.as_str(), |(_, path)| path);
             for state in &block.states {
                 let id = RuntimeBlockStateId(state.state_id);
-                states.insert(id, rules.shape(path, &state.properties));
+                let semantic = environment.state(id);
+                states.insert(
+                    id,
+                    if semantic.scaffolding {
+                        CollisionShape::Empty
+                    } else {
+                        rules.shape(path, &state.properties)
+                    },
+                );
                 offsets.insert(id, rules.offset(path));
-                slipperiness.insert(id, classify_slipperiness(path));
+                slipperiness.insert(id, classify_slipperiness(environment.state(id).surface));
                 if !rules.has_verified_shape(path) {
                     approximate_states.insert(id);
                 }
@@ -171,6 +194,7 @@ impl BlockCollisionProfile {
             offsets,
             slipperiness,
             approximate_states,
+            environment,
             source_shape_bounds,
         }
     }
@@ -184,6 +208,7 @@ impl BlockCollisionProfile {
             offsets: BTreeMap::new(),
             slipperiness: BTreeMap::new(),
             approximate_states: BTreeSet::new(),
+            environment: BlockEnvironmentProfile::default(),
             source_shape_bounds: full_cube_bounds(),
         };
         for (id, shape) in states {
@@ -203,6 +228,24 @@ impl BlockCollisionProfile {
     #[must_use]
     pub fn slipperiness(&self, state: RuntimeBlockStateId) -> f64 {
         self.slipperiness.get(&state).copied().unwrap_or(0.6)
+    }
+
+    #[must_use]
+    pub fn environment(&self, state: RuntimeBlockStateId) -> BlockEnvironment {
+        self.environment.state(state)
+    }
+
+    #[cfg(test)]
+    fn set_environment(&mut self, environment: BlockEnvironmentProfile) {
+        for (state, slipperiness) in &mut self.slipperiness {
+            *slipperiness = classify_slipperiness(environment.state(*state).surface);
+        }
+        for (state, shape) in &mut self.states {
+            if environment.state(*state).scaffolding {
+                *shape = CollisionShape::Empty;
+            }
+        }
+        self.environment = environment;
     }
 
     #[must_use]
@@ -248,15 +291,12 @@ fn collision_shape_envelope<'a>(
     envelope
 }
 
-fn classify_slipperiness(path: &str) -> f64 {
-    if matches!(path, "ice" | "packed_ice" | "frosted_ice") {
-        0.98
-    } else if path == "blue_ice" {
-        0.989
-    } else if path == "slime_block" {
-        0.8
-    } else {
-        0.6
+fn classify_slipperiness(surface: SpecialSurface) -> f64 {
+    match surface {
+        SpecialSurface::Ice | SpecialSurface::PackedIce | SpecialSurface::FrostedIce => 0.98,
+        SpecialSurface::BlueIce => 0.989,
+        SpecialSurface::Slime => 0.8,
+        SpecialSurface::Ordinary | SpecialSurface::Honey => 0.6,
     }
 }
 
@@ -275,6 +315,7 @@ pub struct MovementInput {
 pub enum PlayerPoseKind {
     Standing,
     Sneaking,
+    Swimming,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -297,6 +338,11 @@ impl PlayerPoseKind {
                 width: PLAYER_WIDTH,
                 height: CROUCHING_HEIGHT,
                 eye_height: CROUCHING_EYE_HEIGHT,
+            },
+            Self::Swimming => PlayerDimensions {
+                width: PLAYER_WIDTH,
+                height: SWIMMING_HEIGHT,
+                eye_height: SWIMMING_EYE_HEIGHT,
             },
         }
     }
@@ -347,6 +393,10 @@ pub struct PlayerMovementState {
     pub may_fly: bool,
     pub flying: bool,
     pub flying_speed: f64,
+    pub swimming: bool,
+    pub in_water: bool,
+    pub in_lava: bool,
+    pub climbing: bool,
     // Vanilla keeps sneak-edge protection active during a short descent while
     // support remains within the player's step height. This is movement state,
     // not a block-specific property.
@@ -424,6 +474,10 @@ impl PlayerMovementState {
             may_fly: false,
             flying: false,
             flying_speed: DEFAULT_FLYING_SPEED,
+            swimming: false,
+            in_water: false,
+            in_lava: false,
+            climbing: false,
             fall_distance: 0.0,
         })
     }
@@ -443,6 +497,13 @@ impl PlayerMovementState {
         self.on_ground = false;
         self.horizontal_collision = false;
         self.fall_distance = 0.0;
+        // A position correction is not a world/session reset. Preserve the
+        // active pose state so the next environmental sample can apply the
+        // continuation rule; clearing it here forced a surface swimmer back
+        // through the stricter eye-submerged entry rule.
+        self.in_water = false;
+        self.in_lava = false;
+        self.climbing = false;
         Ok(())
     }
 
@@ -535,7 +596,20 @@ impl PlayerMovementState {
         // the grounded state at the beginning of the tick. jumpFromGround
         // changes velocity but does not clear onGround before travel/move.
         let grounded_at_start = self.on_ground;
-        self.pose_kind = if input.sneak && !self.flying {
+        let environment = movement_environment(self.bounding_box(), chunks, geometry, profile);
+        self.in_water = environment.water_immersion > 0.0;
+        self.in_lava = environment.lava_immersion > 0.0;
+        self.climbing = environment.climbable || environment.scaffolding;
+        self.swimming = !self.flying
+            && (self.sprinting || input.sprint)
+            && if self.swimming {
+                self.in_water
+            } else {
+                environment.water_at_eye && input.forward
+            };
+        self.pose_kind = if self.swimming {
+            PlayerPoseKind::Swimming
+        } else if input.sneak && !self.flying {
             PlayerPoseKind::Sneaking
         } else {
             PlayerPoseKind::Standing
@@ -549,16 +623,28 @@ impl PlayerMovementState {
             strafe /= length;
         }
         let has_forward_impulse = forward > 1.0e-5;
+        let shallow_water = self.in_water && !environment.water_at_eye;
         if self.sprinting {
-            if !has_forward_impulse || self.horizontal_collision {
+            if !has_forward_impulse
+                || (self.horizontal_collision && !self.swimming)
+                || (shallow_water && !self.swimming)
+            {
                 self.sprinting = false;
             }
-        } else if input.sprint && has_forward_impulse && !input.sneak {
+        } else if input.sprint
+            && has_forward_impulse
+            && !input.sneak
+            && (!self.in_water || environment.water_at_eye)
+        {
             self.sprinting = true;
         }
-        if input.sneak && !self.flying {
+        if input.sneak && !self.flying && !self.in_water && !self.in_lava {
             forward *= SNEAK_MULTIPLIER;
             strafe *= SNEAK_MULTIPLIER;
+        }
+        if environment.support_surface == SpecialSurface::Honey && !self.flying {
+            forward *= 0.4;
+            strafe *= 0.4;
         }
         let speed = if self.flying {
             self.flying_speed
@@ -586,6 +672,8 @@ impl PlayerMovementState {
         let ground_drag = slipperiness * GROUND_DRAG_SCALE;
         let acceleration = if self.flying {
             speed
+        } else if self.in_water || self.in_lava {
+            WATER_ACCELERATION
         } else if grounded_at_start {
             // The 0.21600002 scale is divided by the raw block friction,
             // not by the already-scaled post-move drag factor.
@@ -596,13 +684,74 @@ impl PlayerMovementState {
         let yaw = f64::from(self.pose.yaw).to_radians();
         self.velocity.x += (-yaw.sin() * forward - yaw.cos() * strafe) * acceleration;
         self.velocity.z += (yaw.cos() * forward - yaw.sin() * strafe) * acceleration;
-        let jumped = !self.flying && input.jump && grounded_at_start;
+        if self.in_water {
+            let current = player_fluid_current(environment.flow, self.velocity);
+            self.velocity.x += current.x;
+            self.velocity.z += current.z;
+        }
+        if self.swimming {
+            // Player.travel in 26.1.2 steers vertical velocity toward the
+            // look-vector Y component before ordinary fluid travel.
+            let look_y = -f64::from(self.pose.pitch).to_radians().sin();
+            let coefficient = if look_y < -0.2 { 0.085 } else { 0.06 };
+            if look_y <= 0.0 || input.jump || environment.water_at_swim_ascent_probe {
+                self.velocity.y += (look_y - self.velocity.y) * coefficient;
+            }
+        }
+        let jumped = !self.flying
+            && !self.in_water
+            && !self.in_lava
+            && !self.climbing
+            && input.jump
+            && grounded_at_start;
         let mut sprint_jump_impulse = 0.0;
         if self.flying {
             let vertical = f64::from(i8::from(input.jump) - i8::from(input.sneak));
             self.velocity.y += vertical * self.flying_speed * FLYING_VERTICAL_INPUT_MULTIPLIER;
+        } else if self.in_water || self.in_lava {
+            self.velocity.y +=
+                f64::from(i8::from(input.jump) - i8::from(input.sneak)) * FLUID_VERTICAL_INPUT;
+        } else if environment.scaffolding {
+            // Scaffolding is a climbable-tagged volume with its own input
+            // semantics: jump ascends immediately, sneak descends, and an
+            // idle player retains the ordinary bounded downward slide.
+            if input.jump && !input.sneak {
+                self.velocity.y = self.velocity.y.max(CLIMB_UP_SPEED);
+            } else if input.sneak {
+                self.velocity.y = self.velocity.y.min(CLIMB_FALL_LIMIT);
+            } else {
+                self.velocity.y = self.velocity.y.max(CLIMB_FALL_LIMIT);
+            }
+            self.velocity.x = self
+                .velocity
+                .x
+                .clamp(-CLIMB_HORIZONTAL_LIMIT, CLIMB_HORIZONTAL_LIMIT);
+            self.velocity.z = self
+                .velocity
+                .z
+                .clamp(-CLIMB_HORIZONTAL_LIMIT, CLIMB_HORIZONTAL_LIMIT);
+        } else if self.climbing {
+            self.velocity.x = self
+                .velocity
+                .x
+                .clamp(-CLIMB_HORIZONTAL_LIMIT, CLIMB_HORIZONTAL_LIMIT);
+            self.velocity.z = self
+                .velocity
+                .z
+                .clamp(-CLIMB_HORIZONTAL_LIMIT, CLIMB_HORIZONTAL_LIMIT);
+            self.velocity.y = self.velocity.y.max(CLIMB_FALL_LIMIT);
+            if environment.scaffolding && input.sneak {
+                self.velocity.y = self.velocity.y.min(CLIMB_FALL_LIMIT);
+            } else if input.sneak {
+                self.velocity.y = 0.0;
+            }
         } else if jumped {
-            self.velocity.y = self.velocity.y.max(JUMP_VELOCITY);
+            let jump_factor = if environment.support_surface == SpecialSurface::Honey {
+                0.5
+            } else {
+                1.0
+            };
+            self.velocity.y = self.velocity.y.max(JUMP_VELOCITY * jump_factor);
             if self.sprinting {
                 self.velocity.x += -yaw.sin() * SPRINT_JUMP_IMPULSE;
                 self.velocity.z += yaw.cos() * SPRINT_JUMP_IMPULSE;
@@ -620,27 +769,35 @@ impl PlayerMovementState {
             self.velocity.z,
         );
         let bounds = self.bounding_box();
-        let should_back_off = if input.sneak && !self.flying && requested.y <= 0.0 {
-            grounded_at_start
-                || (self.fall_distance < STEP_HEIGHT
-                    && !can_fall_at_least(
-                        bounds,
-                        0.0,
-                        0.0,
-                        STEP_HEIGHT - self.fall_distance,
-                        chunks,
-                        geometry,
-                        profile,
-                    )?)
-        } else {
-            false
-        };
+        let in_scaffolding_context =
+            environment.scaffolding || environment.supported_on_scaffolding_top;
+        let should_back_off =
+            if input.sneak && !self.flying && !in_scaffolding_context && requested.y <= 0.0 {
+                grounded_at_start
+                    || (self.fall_distance < STEP_HEIGHT
+                        && !can_fall_at_least(
+                            bounds,
+                            0.0,
+                            0.0,
+                            STEP_HEIGHT - self.fall_distance,
+                            chunks,
+                            geometry,
+                            profile,
+                        )?)
+            } else {
+                false
+            };
+        let requested_before_edge_backoff = requested;
         let requested = if should_back_off {
             back_off_from_edge(bounds, requested, chunks, geometry, profile)?
         } else {
             requested
         };
-        let (applied, stepped) = collide(
+        let edge_backed_x =
+            (requested_before_edge_backoff.x - requested.x).abs() > COLLISION_EPSILON;
+        let edge_backed_z =
+            (requested_before_edge_backoff.z - requested.z).abs() > COLLISION_EPSILON;
+        let (mut applied, stepped) = collide(
             bounds,
             requested,
             chunks,
@@ -648,14 +805,27 @@ impl PlayerMovementState {
             profile,
             grounded_at_start,
         )?;
+        if !input.sneak
+            && requested.y <= 0.0
+            && let Some(support_y) = scaffolding_support_y(
+                bounds.translated(applied.x, 0.0, applied.z),
+                applied.y,
+                chunks,
+                geometry,
+                profile,
+            )
+        {
+            applied.y = support_y - bounds.min.y;
+        }
         self.pose.x += applied.x;
         self.pose.y += applied.y;
         self.pose.z += applied.z;
         self.horizontal_collision = (requested.x - applied.x).abs() > COLLISION_EPSILON
             || (requested.z - applied.z).abs() > COLLISION_EPSILON;
-        if self.horizontal_collision {
+        if self.horizontal_collision && !self.swimming {
             self.sprinting = false;
         }
+        let should_probe_fluid_exit = (self.in_water || self.in_lava) && self.horizontal_collision;
         // The stationary-ground probe is exactly COLLISION_EPSILON downward.
         // Treat clipping that full probe as contact; a strict greater-than
         // comparison incorrectly made a stationary player airborne every
@@ -669,16 +839,48 @@ impl PlayerMovementState {
         if self.on_ground {
             self.fall_distance = 0.0;
         }
-        if (requested.x - applied.x).abs() > COLLISION_EPSILON {
+        if edge_backed_x || (requested.x - applied.x).abs() > COLLISION_EPSILON {
             self.velocity.x = 0.0;
         }
-        if (requested.z - applied.z).abs() > COLLISION_EPSILON {
+        if edge_backed_z || (requested.z - applied.z).abs() > COLLISION_EPSILON {
             self.velocity.z = 0.0;
         }
+        let (climbable_after_move, scaffolding_after_move) =
+            touches_climbing_cell(self.bounding_box(), chunks, geometry, profile);
+        self.climbing |= climbable_after_move || scaffolding_after_move;
+        let climb_assist = self.climbing
+            && !environment.scaffolding
+            && !scaffolding_after_move
+            && (input.jump || (self.horizontal_collision && input.forward));
+        let support_after_move = support_surface_at(self.bounding_box(), chunks, geometry, profile);
+        let mut slime_bounced = false;
         if (requested.y - applied.y).abs() > COLLISION_EPSILON {
-            self.velocity.y = 0.0;
+            if requested.y < 0.0 && support_after_move == SpecialSurface::Slime && !input.sneak {
+                self.velocity.y = -requested.y;
+                slime_bounced = self.velocity.y >= 0.1;
+                if self.velocity.y < 0.1 {
+                    self.velocity.y = 0.0;
+                }
+            } else {
+                self.velocity.y = 0.0;
+            }
         }
-        let horizontal_drag = if !self.flying && grounded_at_start {
+        if climb_assist {
+            // LivingEntity applies the post-collision climb assist after the
+            // generic move response has cleared blocked vertical velocity.
+            // Doing this earlier let ordinary ground contact overwrite 0.2,
+            // so a player correctly touching a ladder never left the floor.
+            self.velocity.y = CLIMB_UP_SPEED;
+        }
+        let horizontal_drag = if self.in_water {
+            if self.sprinting {
+                WATER_SPRINT_DRAG
+            } else {
+                WATER_DRAG
+            }
+        } else if self.in_lava {
+            LAVA_DRAG
+        } else if !self.flying && grounded_at_start {
             ground_drag
         } else {
             AIR_DRAG
@@ -692,6 +894,39 @@ impl PlayerMovementState {
         } else if self.flying {
             self.velocity.y *= FLYING_VERTICAL_DRAG;
             None
+        } else if self.in_water {
+            self.velocity.y *= WATER_DRAG;
+            if !self.sprinting {
+                self.velocity.y -= WATER_GRAVITY;
+            }
+            None
+        } else if self.in_lava {
+            let vertical_drag = if environment.lava_immersion <= 0.4 {
+                WATER_DRAG
+            } else {
+                LAVA_DRAG
+            };
+            self.velocity.y = self.velocity.y * vertical_drag - WATER_GRAVITY;
+            None
+        } else if self.climbing {
+            // Vanilla clamps climbable motion before the move, then still runs
+            // ordinary air gravity/drag afterward. Keeping the pre-move value
+            // unchanged made every assisted climb tick travel the full 0.2 m.
+            self.velocity.y = ((self.velocity.y - GRAVITY) * VERTICAL_DRAG).max(CLIMB_FALL_LIMIT);
+            None
+        } else if environment.honey_side_contact && self.velocity.y < HONEY_SLIDE_SPEED {
+            self.velocity.y = HONEY_SLIDE_SPEED;
+            None
+        } else if slime_bounced {
+            self.fall_distance = 0.0;
+            // SlimeBlock reflects a living entity's impact velocity exactly;
+            // the enclosing air-travel step then applies normal gravity and
+            // drag, which is the source of vanilla's bounce decay. Entity.move
+            // has already established the landing state; bounceUp changes the
+            // velocity without clearing that one-tick on-ground value, so
+            // held Jump can select jumpFromGround on the following tick.
+            self.velocity.y = (self.velocity.y - GRAVITY) * VERTICAL_DRAG;
+            None
         } else if self.on_ground {
             self.velocity.y = 0.0;
             None
@@ -699,6 +934,18 @@ impl PlayerMovementState {
             self.velocity.y = (self.velocity.y - GRAVITY) * VERTICAL_DRAG;
             None
         };
+        if should_probe_fluid_exit
+            && fluid_exit_clearance(
+                self.bounding_box(),
+                self.velocity,
+                applied.y,
+                chunks,
+                geometry,
+                profile,
+            )?
+        {
+            self.velocity.y = 0.300_000_011_920_928_96;
+        }
         if !self.pose.is_finite() || !self.velocity.is_finite() || !self.fall_distance.is_finite() {
             return Err(SimulationError::NonFinite {
                 field: "simulation result",
@@ -737,6 +984,405 @@ impl PlayerMovementState {
     ) -> CollisionDiagnostics {
         collision_diagnostics(self.bounding_box(), chunks, geometry, profile)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MovementEnvironment {
+    water_immersion: f64,
+    water_at_eye: bool,
+    water_at_swim_ascent_probe: bool,
+    lava_immersion: f64,
+    flow: Vec3d,
+    climbable: bool,
+    /// The player volume overlaps a scaffolding cell, as opposed to merely
+    /// being supported by its one-way top face.
+    scaffolding: bool,
+    supported_on_scaffolding_top: bool,
+    support_surface: SpecialSurface,
+    honey_side_contact: bool,
+}
+
+fn movement_environment(
+    bounds: Aabb,
+    chunks: &LoadedChunks,
+    geometry: DimensionGeometry,
+    profile: &BlockCollisionProfile,
+) -> MovementEnvironment {
+    let mut result = MovementEnvironment::default();
+    let mut water_currents = Vec::new();
+    let min_x = (bounds.min.x + COLLISION_EPSILON).floor() as i32;
+    let max_x = (bounds.max.x - COLLISION_EPSILON).floor() as i32;
+    let min_y = (bounds.min.y + COLLISION_EPSILON).floor() as i32;
+    let max_y = (bounds.max.y - COLLISION_EPSILON).floor() as i32;
+    let min_z = (bounds.min.z + COLLISION_EPSILON).floor() as i32;
+    let max_z = (bounds.max.z - COLLISION_EPSILON).floor() as i32;
+    for y in min_y..=max_y {
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                let Some(state) = block_state_at(chunks, geometry, x, y, z) else {
+                    continue;
+                };
+                let semantic = profile.environment(state);
+                if let Some(fluid) = semantic.fluid {
+                    let surface = f64::from(y) + fluid.own_height();
+                    if surface > bounds.min.y + COLLISION_EPSILON {
+                        let immersion = ((surface - bounds.min.y)
+                            / (bounds.max.y - bounds.min.y).max(COLLISION_EPSILON))
+                        .clamp(0.0, 1.0);
+                        match fluid.kind {
+                            FluidKind::Water => {
+                                result.water_immersion = result.water_immersion.max(immersion);
+                                water_currents.push(fluid_flow(chunks, geometry, profile, x, y, z));
+                            }
+                            FluidKind::Lava => {
+                                result.lava_immersion = result.lava_immersion.max(immersion)
+                            }
+                        }
+                        if fluid.kind == FluidKind::Water
+                            && surface > bounds.min.y + STANDING_EYE_HEIGHT
+                        {
+                            result.water_at_eye = true;
+                        }
+                    }
+                }
+                result.scaffolding |= semantic.scaffolding;
+            }
+        }
+    }
+    result.flow = averaged_player_fluid_flow(&water_currents, result.water_immersion);
+    let center_x = ((bounds.min.x + bounds.max.x) * 0.5).floor() as i32;
+    let center_z = ((bounds.min.z + bounds.max.z) * 0.5).floor() as i32;
+    let swim_probe_y = (bounds.min.y + 0.9).floor() as i32;
+    result.water_at_swim_ascent_probe =
+        block_state_at(chunks, geometry, center_x, swim_probe_y, center_z)
+            .and_then(|state| profile.environment(state).fluid)
+            .is_some_and(|fluid| fluid.kind == FluidKind::Water);
+    // Climbing is semantic occupancy/contact with a tagged block cell. It is
+    // independent of the thin physical ladder shape used by Cubic's solver.
+    let (semantic_climbable, semantic_scaffolding) =
+        touches_climbing_cell(bounds, chunks, geometry, profile);
+    result.climbable |= semantic_climbable;
+    result.scaffolding |= semantic_scaffolding;
+    result.supported_on_scaffolding_top =
+        scaffolding_support_y(bounds, -COLLISION_EPSILON, chunks, geometry, profile).is_some();
+    let below_y = (bounds.min.y - 0.01).floor() as i32;
+    if let Some(state) = block_state_at(chunks, geometry, center_x, below_y, center_z) {
+        let below = profile.environment(state);
+        result.support_surface = below.surface;
+    }
+    result.support_surface = support_surface_at(bounds, chunks, geometry, profile);
+    result.honey_side_contact = honey_side_contact(bounds, chunks, geometry, profile);
+    result
+}
+
+fn touches_climbing_cell(
+    bounds: Aabb,
+    chunks: &LoadedChunks,
+    geometry: DimensionGeometry,
+    profile: &BlockCollisionProfile,
+) -> (bool, bool) {
+    // LivingEntity.onClimbable reads the tagged block at the entity's own
+    // BlockPos (horizontal centre and feet Y). Using every cell touched by the
+    // 0.6-wide AABB made lateral contact with the edge of a ladder cell count
+    // as climbing even while the player's centre remained in the adjacent
+    // cell. Ladder facing still determines where its thin physical plane is;
+    // this semantic query deliberately follows the entity position instead.
+    let center_x = ((bounds.min.x + bounds.max.x) * 0.5).floor() as i32;
+    let feet_y = bounds.min.y.floor() as i32;
+    let center_z = ((bounds.min.z + bounds.max.z) * 0.5).floor() as i32;
+    let climbable = block_state_at(chunks, geometry, center_x, feet_y, center_z)
+        .is_some_and(|state| profile.environment(state).climbable);
+
+    // Scaffolding's already-accepted volume semantics remain AABB-based and
+    // independent from the ladder-centre correction above.
+    let min_x = (bounds.min.x - COLLISION_EPSILON).floor() as i32;
+    let max_x = (bounds.max.x + COLLISION_EPSILON).floor() as i32;
+    let min_y = bounds.min.y.floor() as i32;
+    let max_y = (bounds.max.y - COLLISION_EPSILON).floor() as i32;
+    let min_z = (bounds.min.z - COLLISION_EPSILON).floor() as i32;
+    let max_z = (bounds.max.z + COLLISION_EPSILON).floor() as i32;
+    let mut scaffolding = false;
+    for y in min_y..=max_y {
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                let Some(state) = block_state_at(chunks, geometry, x, y, z) else {
+                    continue;
+                };
+                let semantic = profile.environment(state);
+                if !semantic.scaffolding {
+                    continue;
+                }
+                let cell = Aabb::new(
+                    Vec3d::new(f64::from(x), f64::from(y), f64::from(z)),
+                    Vec3d::new(f64::from(x) + 1.0, f64::from(y) + 1.0, f64::from(z) + 1.0),
+                );
+                if aabbs_overlap(bounds, cell) {
+                    scaffolding |= semantic.scaffolding;
+                }
+            }
+        }
+    }
+    (climbable, scaffolding)
+}
+
+fn scaffolding_support_y(
+    horizontally_moved_bounds: Aabb,
+    vertical_movement: f64,
+    chunks: &LoadedChunks,
+    geometry: DimensionGeometry,
+    profile: &BlockCollisionProfile,
+) -> Option<f64> {
+    let final_feet = horizontally_moved_bounds.min.y + vertical_movement;
+    let min_x = (horizontally_moved_bounds.min.x + COLLISION_EPSILON).floor() as i32;
+    let max_x = (horizontally_moved_bounds.max.x - COLLISION_EPSILON).floor() as i32;
+    let min_z = (horizontally_moved_bounds.min.z + COLLISION_EPSILON).floor() as i32;
+    let max_z = (horizontally_moved_bounds.max.z - COLLISION_EPSILON).floor() as i32;
+    let min_y = final_feet.floor() as i32 - 1;
+    let max_y = horizontally_moved_bounds.min.y.floor() as i32;
+    let mut support: Option<f64> = None;
+    for y in min_y..=max_y {
+        let top = f64::from(y + 1);
+        if horizontally_moved_bounds.min.y < top - COLLISION_EPSILON
+            || final_feet > top - COLLISION_EPSILON
+        {
+            continue;
+        }
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                let is_scaffolding = block_state_at(chunks, geometry, x, y, z)
+                    .is_some_and(|state| profile.environment(state).scaffolding);
+                if is_scaffolding {
+                    support = Some(support.map_or(top, |current| current.max(top)));
+                }
+            }
+        }
+    }
+    support
+}
+
+fn aabbs_overlap(left: Aabb, right: Aabb) -> bool {
+    overlaps(left.min.x, left.max.x, right.min.x, right.max.x)
+        && overlaps(left.min.y, left.max.y, right.min.y, right.max.y)
+        && overlaps(left.min.z, left.max.z, right.min.z, right.max.z)
+}
+
+fn averaged_player_fluid_flow(currents: &[Vec3d], immersion: f64) -> Vec3d {
+    if currents.is_empty() {
+        return Vec3d::default();
+    }
+    let mut total = currents
+        .iter()
+        .copied()
+        .fold(Vec3d::default(), |sum, value| {
+            Vec3d::new(sum.x + value.x, sum.y + value.y, sum.z + value.z)
+        });
+    // EntityFluidInteraction ignores a cancelling/near-zero aggregate before
+    // applying its player-specific average. This avoids normalizing floating
+    // residue from opposing currents into a full-strength direction.
+    if total.x.mul_add(total.x, total.z * total.z) < 1.0e-5 {
+        return Vec3d::default();
+    }
+    let scale = immersion.min(0.4) / 0.4;
+    total.x = total.x / currents.len() as f64 * scale;
+    total.z = total.z / currents.len() as f64 * scale;
+    total
+}
+
+fn player_fluid_current(flow: Vec3d, velocity: Vec3d) -> Vec3d {
+    let mut current = Vec3d::new(flow.x * 0.014, 0.0, flow.z * 0.014);
+    let length = current.x.hypot(current.z);
+    if velocity.x.abs() < 0.003
+        && velocity.z.abs() < 0.003
+        && length > f64::EPSILON
+        && length < 0.0045
+    {
+        current.x = current.x / length * 0.0045;
+        current.z = current.z / length * 0.0045;
+    }
+    current
+}
+
+fn support_surface_at(
+    bounds: Aabb,
+    chunks: &LoadedChunks,
+    geometry: DimensionGeometry,
+    profile: &BlockCollisionProfile,
+) -> SpecialSurface {
+    let y = (bounds.min.y - 0.01).floor() as i32;
+    let min_x = (bounds.min.x + COLLISION_EPSILON).floor() as i32;
+    let max_x = (bounds.max.x - COLLISION_EPSILON).floor() as i32;
+    let min_z = (bounds.min.z + COLLISION_EPSILON).floor() as i32;
+    let max_z = (bounds.max.z - COLLISION_EPSILON).floor() as i32;
+    let mut surface = SpecialSurface::Ordinary;
+    for z in min_z..=max_z {
+        for x in min_x..=max_x {
+            let Some(state) = block_state_at(chunks, geometry, x, y, z) else {
+                continue;
+            };
+            let candidate = profile.environment(state).surface;
+            if candidate == SpecialSurface::Honey {
+                return candidate;
+            }
+            if candidate != SpecialSurface::Ordinary {
+                surface = candidate;
+            }
+        }
+    }
+    surface
+}
+
+fn honey_side_contact(
+    bounds: Aabb,
+    chunks: &LoadedChunks,
+    geometry: DimensionGeometry,
+    profile: &BlockCollisionProfile,
+) -> bool {
+    let probe = Aabb::new(
+        Vec3d::new(
+            bounds.min.x - 1.0 / 16.0,
+            bounds.min.y,
+            bounds.min.z - 1.0 / 16.0,
+        ),
+        Vec3d::new(
+            bounds.max.x + 1.0 / 16.0,
+            bounds.max.y,
+            bounds.max.z + 1.0 / 16.0,
+        ),
+    );
+    let center_x = (bounds.min.x + bounds.max.x) * 0.5;
+    let center_z = (bounds.min.z + bounds.max.z) * 0.5;
+    let half_width = (bounds.max.x - bounds.min.x) * 0.5;
+    environment_cells(probe).any(|(x, y, z)| {
+        let is_honey = block_state_at(chunks, geometry, x, y, z)
+            .is_some_and(|state| profile.environment(state).surface == SpecialSurface::Honey);
+        is_honey
+            && bounds.min.y <= f64::from(y) + 15.0 / 16.0 - COLLISION_EPSILON
+            && ((center_x - (f64::from(x) + 0.5)).abs() + COLLISION_EPSILON
+                > 7.0 / 16.0 + half_width
+                || (center_z - (f64::from(z) + 0.5)).abs() + COLLISION_EPSILON
+                    > 7.0 / 16.0 + half_width)
+    })
+}
+
+fn environment_cells(bounds: Aabb) -> impl Iterator<Item = (i32, i32, i32)> {
+    let min_x = bounds.min.x.floor() as i32;
+    let max_x = bounds.max.x.floor() as i32;
+    let min_y = bounds.min.y.floor() as i32;
+    let max_y = bounds.max.y.floor() as i32;
+    let min_z = bounds.min.z.floor() as i32;
+    let max_z = bounds.max.z.floor() as i32;
+    (min_y..=max_y).flat_map(move |y| {
+        (min_z..=max_z).flat_map(move |z| (min_x..=max_x).map(move |x| (x, y, z)))
+    })
+}
+
+fn fluid_flow(
+    chunks: &LoadedChunks,
+    geometry: DimensionGeometry,
+    profile: &BlockCollisionProfile,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Vec3d {
+    let Some(center) = fluid_semantic_at(chunks, geometry, profile, x, y, z) else {
+        return Vec3d::default();
+    };
+    let center_height = center.own_height();
+    let mut flow = Vec3d::default();
+    for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        let neighbor = fluid_semantic_at(chunks, geometry, profile, x + dx, y, z + dz);
+        let difference = if let Some(neighbor) = neighbor.filter(|fluid| fluid.kind == center.kind)
+        {
+            center_height - neighbor.own_height()
+        } else {
+            let neighbor_state = block_state_at(chunks, geometry, x + dx, y, z + dz);
+            let open = neighbor_state
+                .is_some_and(|state| matches!(profile.shape(state), CollisionShape::Empty));
+            if !open {
+                continue;
+            }
+            let Some(below) = fluid_semantic_at(chunks, geometry, profile, x + dx, y - 1, z + dz)
+                .filter(|fluid| fluid.kind == center.kind)
+            else {
+                continue;
+            };
+            center_height - (below.own_height() - 8.0 / 9.0)
+        };
+        flow.x += f64::from(dx) * difference;
+        flow.z += f64::from(dz) * difference;
+    }
+    let length = flow.x.hypot(flow.z);
+    if length > COLLISION_EPSILON {
+        flow.x /= length;
+        flow.z /= length;
+    }
+    flow
+}
+
+fn fluid_exit_clearance(
+    bounds: Aabb,
+    adjusted_velocity: Vec3d,
+    applied_y: f64,
+    chunks: &LoadedChunks,
+    geometry: DimensionGeometry,
+    profile: &BlockCollisionProfile,
+) -> Result<bool, SimulationError> {
+    // LivingEntity.jumpOutOfFluid runs after water drag/gravity and checks the
+    // current AABB at adjusted velocity Y + 0.6 - the Y already applied by
+    // move(). This preserves actual partial-shape clearance (slabs/stairs)
+    // instead of probing with the pre-drag requested displacement.
+    let probe = Vec3d::new(
+        adjusted_velocity.x,
+        adjusted_velocity.y + 0.600_000_023_841_857_9 - applied_y,
+        adjusted_velocity.z,
+    );
+    let (applied, _) = collide(bounds, probe, chunks, geometry, profile, false)?;
+    let translated = bounds.translated(probe.x, probe.y, probe.z);
+    Ok(!contains_any_fluid(translated, chunks, geometry, profile)
+        && (applied.x - probe.x).abs() <= COLLISION_EPSILON
+        && (applied.y - probe.y).abs() <= COLLISION_EPSILON
+        && (applied.z - probe.z).abs() <= COLLISION_EPSILON)
+}
+
+fn contains_any_fluid(
+    bounds: Aabb,
+    chunks: &LoadedChunks,
+    geometry: DimensionGeometry,
+    profile: &BlockCollisionProfile,
+) -> bool {
+    // LevelReader.containsAnyLiquid scans every block cell touched by the
+    // translated AABB and rejects any non-empty FluidState in that cell. It
+    // deliberately does not clip the test to the rendered fluid surface.
+    let min_x = bounds.min.x.floor() as i32;
+    let max_x = (bounds.max.x.ceil() as i32).saturating_sub(1);
+    let min_y = bounds.min.y.floor() as i32;
+    let max_y = (bounds.max.y.ceil() as i32).saturating_sub(1);
+    let min_z = bounds.min.z.floor() as i32;
+    let max_z = (bounds.max.z.ceil() as i32).saturating_sub(1);
+    for y in min_y..=max_y {
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                let has_fluid = block_state_at(chunks, geometry, x, y, z)
+                    .and_then(|state| profile.environment(state).fluid)
+                    .is_some();
+                if has_fluid {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn fluid_semantic_at(
+    chunks: &LoadedChunks,
+    geometry: DimensionGeometry,
+    profile: &BlockCollisionProfile,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Option<crate::FluidState> {
+    block_state_at(chunks, geometry, x, y, z).and_then(|state| profile.environment(state).fluid)
 }
 
 const MAX_DIAGNOSTIC_CANDIDATES: usize = 24;
@@ -1158,6 +1804,53 @@ mod tests {
         )
     }
 
+    fn special_world(
+        floor: BlockEnvironment,
+        occupant: Option<BlockEnvironment>,
+    ) -> (LoadedChunks, BlockCollisionProfile) {
+        let mut values = vec![RuntimeBlockStateId(0); 4096];
+        for z in 0..16 {
+            for x in 0..16 {
+                values[z * 16 + x] = RuntimeBlockStateId(1);
+            }
+        }
+        if occupant.is_some() {
+            values[256 + 8 * 16 + 8] = RuntimeBlockStateId(2);
+        }
+        let mut chunks = LoadedChunks::default();
+        chunks
+            .insert(Chunk {
+                coordinate: ChunkCoordinate::new(0, 0),
+                sections: vec![
+                    ChunkSection {
+                        non_empty_block_count: 257,
+                        fluid_count: u16::from(occupant.is_some()),
+                        blocks: PalettedContainer::Direct { values },
+                        biomes: PalettedContainer::Single {
+                            value: RuntimeBiomeId(0),
+                            entries: 64,
+                        },
+                    },
+                    section(RuntimeBlockStateId(0)),
+                ],
+                heightmaps: vec![],
+                block_entities: vec![],
+                light: ChunkLightSummary::default(),
+            })
+            .unwrap();
+        let mut profile = BlockCollisionProfile::synthetic([
+            (RuntimeBlockStateId(0), CollisionShape::Empty),
+            (RuntimeBlockStateId(1), CollisionShape::FullCube),
+            (RuntimeBlockStateId(2), CollisionShape::Empty),
+        ]);
+        let mut environments = vec![(RuntimeBlockStateId(1), floor)];
+        if let Some(occupant) = occupant {
+            environments.push((RuntimeBlockStateId(2), occupant));
+        }
+        profile.set_environment(BlockEnvironmentProfile::synthetic(environments));
+        (chunks, profile)
+    }
+
     fn obstacle_world(
         obstacle: RuntimeBlockStateId,
         ceiling: bool,
@@ -1255,6 +1948,35 @@ mod tests {
                 (state, shape),
             ]),
         )
+    }
+
+    fn fluid_ledge_world(shape: CollisionShape) -> (LoadedChunks, BlockCollisionProfile) {
+        let water = BlockEnvironment {
+            fluid: Some(crate::FluidState {
+                kind: FluidKind::Water,
+                level: 0,
+                falling: false,
+            }),
+            ..BlockEnvironment::default()
+        };
+        let (mut chunks, mut profile) = special_world(BlockEnvironment::default(), Some(water));
+        let ledge = RuntimeBlockStateId(3);
+        assert!(chunks.update_block(ChunkCoordinate::new(0, 0), 0, 8, 1, 9, ledge,));
+        profile.states.insert(ledge, shape);
+        profile.offsets.insert(ledge, CollisionOffset::None);
+        profile.slipperiness.insert(ledge, 0.6);
+        profile.source_shape_bounds = collision_shape_envelope(profile.states.values(), 0.0);
+        (chunks, profile)
+    }
+
+    fn upright_water_player_before_ledge() -> PlayerMovementState {
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.69, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state.on_ground = true;
+        state
     }
 
     fn partial_height_edge_world(shape: CollisionShape) -> (LoadedChunks, BlockCollisionProfile) {
@@ -2298,6 +3020,1385 @@ mod tests {
     }
 
     #[test]
+    fn water_and_lava_use_bounded_medium_specific_travel() {
+        for (kind, expected_drag) in [(FluidKind::Water, WATER_DRAG), (FluidKind::Lava, LAVA_DRAG)]
+        {
+            let (chunks, profile) = special_world(
+                BlockEnvironment::default(),
+                Some(BlockEnvironment {
+                    fluid: Some(crate::FluidState {
+                        kind,
+                        level: 0,
+                        falling: true,
+                    }),
+                    ..BlockEnvironment::default()
+                }),
+            );
+            let mut state = PlayerMovementState::from_authoritative(
+                LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+                Vec3d::default(),
+            )
+            .unwrap();
+            let result = state
+                .tick(
+                    MovementInput {
+                        forward: true,
+                        jump: true,
+                        ..MovementInput::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+            assert_eq!(state.in_water, kind == FluidKind::Water);
+            assert_eq!(state.in_lava, kind == FluidKind::Lava);
+            assert_close(result.horizontal_acceleration, WATER_ACCELERATION);
+            assert_close(result.horizontal_drag, expected_drag);
+            if kind == FluidKind::Water {
+                assert!(state.velocity.y > 0.0);
+            } else {
+                assert!(state.velocity.y >= 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn sprint_swimming_uses_current_client_horizontal_drag_and_pose() {
+        let (mut chunks, profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                fluid: Some(crate::FluidState {
+                    kind: FluidKind::Water,
+                    level: 0,
+                    falling: true,
+                }),
+                ..BlockEnvironment::default()
+            }),
+        );
+        assert!(chunks.update_block(
+            ChunkCoordinate::new(0, 0),
+            0,
+            8,
+            2,
+            8,
+            RuntimeBlockStateId(2),
+        ));
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        let result = state
+            .tick(
+                MovementInput {
+                    forward: true,
+                    sprint: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(state.sprinting && state.swimming);
+        assert_eq!(state.pose_kind, PlayerPoseKind::Swimming);
+        assert_close(result.horizontal_drag, WATER_SPRINT_DRAG);
+    }
+
+    #[test]
+    fn shallow_water_does_not_enter_swimming_pose() {
+        let (chunks, profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                fluid: Some(crate::FluidState {
+                    kind: FluidKind::Water,
+                    level: 0,
+                    falling: false,
+                }),
+                ..BlockEnvironment::default()
+            }),
+        );
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state
+            .tick(
+                MovementInput {
+                    forward: true,
+                    sprint: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(state.in_water);
+        assert!(!state.swimming);
+        assert_eq!(state.pose_kind, PlayerPoseKind::Standing);
+        assert_eq!(
+            fluid_flow(&chunks, geometry(), &profile, 8, 1, 8),
+            Vec3d::default(),
+            "an isolated source bounded by solid floor must not invent horizontal current"
+        );
+    }
+
+    #[test]
+    fn active_swimming_continues_through_shallow_water_and_at_the_surface() {
+        let (mut chunks, profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                fluid: Some(crate::FluidState {
+                    kind: FluidKind::Water,
+                    level: 0,
+                    falling: true,
+                }),
+                ..BlockEnvironment::default()
+            }),
+        );
+        assert!(chunks.update_block(
+            ChunkCoordinate::new(0, 0),
+            0,
+            8,
+            2,
+            8,
+            RuntimeBlockStateId(2),
+        ));
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state
+            .tick(
+                MovementInput {
+                    forward: true,
+                    sprint: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(state.swimming);
+
+        assert!(chunks.update_block(
+            ChunkCoordinate::new(0, 0),
+            0,
+            8,
+            2,
+            8,
+            RuntimeBlockStateId(0),
+        ));
+        state
+            .tick(
+                MovementInput {
+                    forward: true,
+                    sprint: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(state.in_water);
+        assert!(
+            state.swimming,
+            "eye emergence is not a stop-swimming condition"
+        );
+
+        assert!(chunks.update_block(
+            ChunkCoordinate::new(0, 0),
+            0,
+            8,
+            2,
+            8,
+            RuntimeBlockStateId(2),
+        ));
+        state
+            .tick(
+                MovementInput {
+                    forward: true,
+                    sprint: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(
+            state.swimming,
+            "deep -> shallow -> deep keeps the active pose"
+        );
+
+        assert!(chunks.update_block(
+            ChunkCoordinate::new(0, 0),
+            0,
+            8,
+            2,
+            8,
+            RuntimeBlockStateId(0),
+        ));
+
+        assert!(chunks.update_block(
+            ChunkCoordinate::new(0, 0),
+            0,
+            8,
+            1,
+            8,
+            RuntimeBlockStateId(0),
+        ));
+        state
+            .tick(
+                MovementInput {
+                    forward: true,
+                    sprint: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(!state.in_water);
+        assert!(!state.swimming);
+    }
+
+    #[test]
+    fn upward_look_at_surface_does_not_force_swim_exit_without_jump() {
+        let (mut chunks, profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                fluid: Some(crate::FluidState {
+                    kind: FluidKind::Water,
+                    level: 0,
+                    falling: false,
+                }),
+                ..BlockEnvironment::default()
+            }),
+        );
+        for z in 9..16 {
+            assert!(chunks.update_block(
+                ChunkCoordinate::new(0, 0),
+                0,
+                8,
+                1,
+                z,
+                RuntimeBlockStateId(2),
+            ));
+        }
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, -90.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state.swimming = true;
+        state.sprinting = true;
+        for _ in 0..20 {
+            state
+                .tick(
+                    MovementInput {
+                        forward: true,
+                        sprint: true,
+                        ..MovementInput::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+            assert!(state.in_water);
+            assert!(state.swimming);
+        }
+
+        let mut intentional_exit = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, -90.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        intentional_exit.swimming = true;
+        intentional_exit.sprinting = true;
+        for _ in 0..20 {
+            intentional_exit
+                .tick(
+                    MovementInput {
+                        forward: true,
+                        sprint: true,
+                        jump: true,
+                        ..MovementInput::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+            if !intentional_exit.in_water {
+                break;
+            }
+        }
+        assert!(!intentional_exit.in_water);
+        assert!(!intentional_exit.swimming);
+    }
+
+    #[test]
+    fn authoritative_position_correction_preserves_surface_swim_continuation() {
+        let (chunks, profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                fluid: Some(crate::FluidState {
+                    kind: FluidKind::Water,
+                    level: 0,
+                    falling: false,
+                }),
+                ..BlockEnvironment::default()
+            }),
+        );
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state.swimming = true;
+        state.sprinting = true;
+        state.pose_kind = PlayerPoseKind::Swimming;
+        state
+            .reconcile(
+                LocalPlayerPose::new(8.5, 1.1, 8.5, 0.0, 0.0),
+                Vec3d::default(),
+            )
+            .unwrap();
+        state
+            .tick(
+                MovementInput {
+                    forward: true,
+                    sprint: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(state.in_water);
+        assert!(state.swimming);
+    }
+
+    #[test]
+    fn level_sprint_swimming_has_no_artificial_downward_drift() {
+        let (chunks, profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                fluid: Some(crate::FluidState {
+                    kind: FluidKind::Water,
+                    level: 0,
+                    falling: true,
+                }),
+                ..BlockEnvironment::default()
+            }),
+        );
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.1, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state.swimming = true;
+        state.sprinting = true;
+        let result = state
+            .tick(
+                MovementInput {
+                    forward: true,
+                    sprint: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(result.applied.y.abs() <= COLLISION_EPSILON);
+        assert_close(state.velocity.y, 0.0);
+    }
+
+    #[test]
+    fn upright_water_sprint_uses_fluid_acceleration_not_land_sprint_acceleration() {
+        let (chunks, profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                fluid: Some(crate::FluidState {
+                    kind: FluidKind::Water,
+                    level: 0,
+                    falling: false,
+                }),
+                ..BlockEnvironment::default()
+            }),
+        );
+        let sample = |sprint| {
+            let mut state = PlayerMovementState::from_authoritative(
+                LocalPlayerPose::new(8.5, 1.1, 8.5, 0.0, 0.0),
+                Vec3d::default(),
+            )
+            .unwrap();
+            state
+                .tick(
+                    MovementInput {
+                        forward: true,
+                        sprint,
+                        ..MovementInput::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap()
+        };
+        let walking = sample(false);
+        let sprinting = sample(true);
+        assert_close(walking.horizontal_acceleration, WATER_ACCELERATION);
+        assert_close(sprinting.horizontal_acceleration, WATER_ACCELERATION);
+        assert_close(walking.applied.z, sprinting.applied.z);
+        assert_eq!(sprinting.horizontal_drag, WATER_DRAG);
+    }
+
+    #[test]
+    fn player_currents_average_and_opposing_flows_cancel_independently_of_order() {
+        let east = Vec3d::new(1.0, 0.0, 0.0);
+        let west = Vec3d::new(-1.0, 0.0, 0.0);
+        let north = Vec3d::new(0.0, 0.0, -1.0);
+        assert_eq!(
+            averaged_player_fluid_flow(&[east, west], 1.0),
+            Vec3d::default()
+        );
+        assert_eq!(
+            averaged_player_fluid_flow(&[west, east], 1.0),
+            Vec3d::default()
+        );
+        assert_eq!(
+            averaged_player_fluid_flow(&[east, west, north, Vec3d::new(0.0, 0.0, 1.0)], 1.0),
+            Vec3d::default()
+        );
+        let biased = averaged_player_fluid_flow(&[east, east, west], 1.0);
+        assert_close(biased.x, 1.0 / 3.0);
+        assert_close(biased.z, 0.0);
+        let shallow = averaged_player_fluid_flow(&[east], 0.2);
+        assert_close(shallow.x, 0.5);
+        let delta = player_fluid_current(shallow, Vec3d::default());
+        assert_close(delta.x, 0.007);
+    }
+
+    #[test]
+    fn slime_reflection_receives_same_tick_air_gravity_and_drag() {
+        let reflected = 0.42_f64;
+        let after_travel = (reflected - GRAVITY) * VERTICAL_DRAG;
+        assert_close(after_travel, 0.3332);
+        assert!(after_travel < reflected);
+        let second = (after_travel - GRAVITY) * VERTICAL_DRAG;
+        assert!(second < after_travel);
+    }
+
+    #[test]
+    fn climb_assist_receives_air_gravity_and_drag_after_motion() {
+        let post_tick = (CLIMB_UP_SPEED - GRAVITY) * VERTICAL_DRAG;
+        assert_close(post_tick, 0.1176);
+        assert!(post_tick < CLIMB_UP_SPEED);
+        assert!(post_tick > 0.0);
+    }
+
+    #[test]
+    fn climbable_contact_clamps_fall_and_allows_ascent() {
+        let (mut chunks, profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                climbable: true,
+                ..BlockEnvironment::default()
+            }),
+        );
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::new(0.4, -0.8, 0.4),
+        )
+        .unwrap();
+        state
+            .tick(MovementInput::default(), &chunks, geometry(), &profile)
+            .unwrap();
+        assert!(state.climbing);
+        assert!(state.velocity.y >= CLIMB_FALL_LIMIT);
+        assert!(chunks.update_block(
+            ChunkCoordinate::new(0, 0),
+            0,
+            8,
+            1,
+            9,
+            RuntimeBlockStateId(1),
+        ));
+        state.pose.z = 8.69;
+        state.velocity = Vec3d::default();
+        state
+            .tick(
+                MovementInput {
+                    forward: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(state.velocity.y > 0.0);
+    }
+
+    #[test]
+    fn touching_a_thin_ladder_plane_restores_collision_assisted_climb() {
+        let (chunks, mut profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                climbable: true,
+                ..BlockEnvironment::default()
+            }),
+        );
+        profile.states.insert(
+            RuntimeBlockStateId(2),
+            boxes(&[Aabb::new(
+                Vec3d::new(0.0, 0.0, 13.0 / 16.0),
+                Vec3d::new(1.0, 1.0, 1.0),
+            )]),
+        );
+        profile.source_shape_bounds = collision_shape_envelope(profile.states.values(), 0.0);
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 7.7, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state.on_ground = true;
+        for _ in 0..20 {
+            state
+                .tick(
+                    MovementInput {
+                        forward: true,
+                        ..MovementInput::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+            if state.climbing && state.horizontal_collision {
+                break;
+            }
+        }
+        assert!(state.climbing);
+        assert!(state.horizontal_collision);
+        assert_close(state.velocity.y, (CLIMB_UP_SPEED - GRAVITY) * VERTICAL_DRAG);
+    }
+
+    #[test]
+    fn ladder_semantic_contact_climbs_multiple_blocks_for_every_facing() {
+        let cases = [
+            (
+                LocalPlayerPose::new(8.5, 1.0, 7.3, 0.0, 0.0),
+                Aabb::new(Vec3d::new(0.0, 0.0, 13.0 / 16.0), Vec3d::new(1.0, 1.0, 1.0)),
+                (8, 9),
+            ),
+            (
+                LocalPlayerPose::new(8.5, 1.0, 9.7, 180.0, 0.0),
+                Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(1.0, 1.0, 3.0 / 16.0)),
+                (8, 7),
+            ),
+            (
+                LocalPlayerPose::new(7.3, 1.0, 8.5, -90.0, 0.0),
+                Aabb::new(Vec3d::new(13.0 / 16.0, 0.0, 0.0), Vec3d::new(1.0, 1.0, 1.0)),
+                (9, 8),
+            ),
+            (
+                LocalPlayerPose::new(9.7, 1.0, 8.5, 90.0, 0.0),
+                Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(3.0 / 16.0, 1.0, 1.0)),
+                (7, 8),
+            ),
+        ];
+        for (pose, shape, wall) in cases {
+            let (mut chunks, mut profile) = special_world(
+                BlockEnvironment::default(),
+                Some(BlockEnvironment {
+                    climbable: true,
+                    ..BlockEnvironment::default()
+                }),
+            );
+            for y in 2..6 {
+                assert!(chunks.update_block(
+                    ChunkCoordinate::new(0, 0),
+                    0,
+                    8,
+                    y,
+                    8,
+                    RuntimeBlockStateId(2),
+                ));
+            }
+            for y in 1..6 {
+                assert!(chunks.update_block(
+                    ChunkCoordinate::new(0, 0),
+                    0,
+                    wall.0,
+                    y,
+                    wall.1,
+                    RuntimeBlockStateId(1),
+                ));
+            }
+            profile
+                .states
+                .insert(RuntimeBlockStateId(2), boxes(&[shape]));
+            profile.source_shape_bounds = collision_shape_envelope(profile.states.values(), 0.0);
+            for jump in [false, true] {
+                let mut state =
+                    PlayerMovementState::from_authoritative(pose, Vec3d::default()).unwrap();
+                let start_y = state.pose.y;
+                assert!(
+                    !touches_climbing_cell(state.bounding_box(), &chunks, geometry(), &profile,).0
+                );
+                for _ in 0..30 {
+                    state
+                        .tick(
+                            MovementInput {
+                                forward: true,
+                                jump,
+                                ..MovementInput::default()
+                            },
+                            &chunks,
+                            geometry(),
+                            &profile,
+                        )
+                        .unwrap();
+                }
+                assert!(
+                    state.pose.y > start_y + 1.0,
+                    "start={pose:?}, final={:?}, velocity={:?}, horizontal_collision={}, climbing={}, jump={jump}",
+                    state.pose,
+                    state.velocity,
+                    state.horizontal_collision,
+                    state.climbing,
+                );
+                assert!(state.climbing);
+            }
+        }
+    }
+
+    #[test]
+    fn ladder_side_contact_does_not_activate_semantic_climbing() {
+        let cases = [
+            (
+                Aabb::new(Vec3d::new(0.0, 0.0, 13.0 / 16.0), Vec3d::new(1.0, 1.0, 1.0)),
+                LocalPlayerPose::new(7.7, 1.0, 8.9, 0.0, 0.0),
+                (8, 9),
+            ),
+            (
+                Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(1.0, 1.0, 3.0 / 16.0)),
+                LocalPlayerPose::new(7.7, 1.0, 8.1, 180.0, 0.0),
+                (8, 7),
+            ),
+            (
+                Aabb::new(Vec3d::new(13.0 / 16.0, 0.0, 0.0), Vec3d::new(1.0, 1.0, 1.0)),
+                LocalPlayerPose::new(8.9, 1.0, 7.7, -90.0, 0.0),
+                (9, 8),
+            ),
+            (
+                Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(3.0 / 16.0, 1.0, 1.0)),
+                LocalPlayerPose::new(8.1, 1.0, 7.7, 90.0, 0.0),
+                (7, 8),
+            ),
+        ];
+        for (shape, pose, wall) in cases {
+            let (mut chunks, mut profile) = special_world(
+                BlockEnvironment::default(),
+                Some(BlockEnvironment {
+                    climbable: true,
+                    ..BlockEnvironment::default()
+                }),
+            );
+            for y in 1..4 {
+                let _ = chunks.update_block(
+                    ChunkCoordinate::new(0, 0),
+                    0,
+                    8,
+                    y,
+                    8,
+                    RuntimeBlockStateId(2),
+                );
+                let _ = chunks.update_block(
+                    ChunkCoordinate::new(0, 0),
+                    0,
+                    wall.0,
+                    y,
+                    wall.1,
+                    RuntimeBlockStateId(1),
+                );
+            }
+            profile
+                .states
+                .insert(RuntimeBlockStateId(2), boxes(&[shape]));
+            profile.source_shape_bounds = collision_shape_envelope(profile.states.values(), 0.0);
+            let mut state =
+                PlayerMovementState::from_authoritative(pose, Vec3d::default()).unwrap();
+            state.on_ground = true;
+            assert!(!touches_climbing_cell(state.bounding_box(), &chunks, geometry(), &profile).0);
+            for _ in 0..5 {
+                state
+                    .tick(
+                        MovementInput {
+                            forward: true,
+                            ..Default::default()
+                        },
+                        &chunks,
+                        geometry(),
+                        &profile,
+                    )
+                    .unwrap();
+                assert!(!state.climbing);
+                assert!(state.velocity.y <= 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn scaffolding_top_catches_falls_and_is_bypassed_only_while_descending() {
+        let (mut chunks, profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                scaffolding: true,
+                ..BlockEnvironment::default()
+            }),
+        );
+        let bounds = Aabb::new(Vec3d::new(8.2, 2.4, 8.2), Vec3d::new(8.8, 4.2, 8.8));
+        assert_eq!(
+            scaffolding_support_y(bounds, -0.8, &chunks, geometry(), &profile),
+            Some(2.0)
+        );
+
+        let mut falling = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 2.4, 8.5, 0.0, 0.0),
+            Vec3d::new(0.0, -0.8, 0.0),
+        )
+        .unwrap();
+        falling.on_ground = false;
+        falling
+            .tick(MovementInput::default(), &chunks, geometry(), &profile)
+            .unwrap();
+        assert!((falling.pose.y - 2.0).abs() <= COLLISION_EPSILON);
+        assert!(falling.on_ground);
+
+        let mut descending = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 2.0, 8.5, 0.0, 0.0),
+            Vec3d::new(0.0, -0.2, 0.0),
+        )
+        .unwrap();
+        let result = descending
+            .tick(
+                MovementInput {
+                    sneak: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(result.applied.y < 0.0);
+
+        // A neighbouring ordinary support block lets the player approach the
+        // scaffolding at the same top height. Horizontal motion must discover
+        // support after X/Z collision resolution rather than only at the
+        // tick's original footprint.
+        assert!(chunks.update_block(
+            ChunkCoordinate::new(0, 0),
+            0,
+            7,
+            1,
+            8,
+            RuntimeBlockStateId(1),
+        ));
+        let mut walking = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(7.5, 2.0, 8.5, -90.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        walking.on_ground = true;
+        for _ in 0..6 {
+            walking
+                .tick(
+                    MovementInput {
+                        forward: true,
+                        ..MovementInput::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+        }
+        assert!(walking.pose.x > 8.0, "pose={:?}", walking.pose);
+        assert!(
+            (walking.pose.y - 2.0).abs() <= COLLISION_EPSILON * 2.0,
+            "pose={:?}",
+            walking.pose
+        );
+        assert!(walking.on_ground);
+    }
+
+    #[test]
+    fn scaffolding_support_is_context_sensitive_for_stand_ascend_and_descend() {
+        let (chunks, profile) = special_world(
+            BlockEnvironment {
+                scaffolding: true,
+                ..BlockEnvironment::default()
+            },
+            None,
+        );
+        let mut standing = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::new(0.0, -0.2, 0.0),
+        )
+        .unwrap();
+        let stopped = standing
+            .tick(MovementInput::default(), &chunks, geometry(), &profile)
+            .unwrap();
+        assert_eq!(stopped.applied.y, 0.0);
+        assert!(standing.on_ground);
+        let idle = standing
+            .tick(MovementInput::default(), &chunks, geometry(), &profile)
+            .unwrap();
+        assert_eq!(idle.applied.y, 0.0);
+        assert!(idle.grounded_at_start);
+        assert!(standing.on_ground);
+
+        let mut descending = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::new(0.0, -0.2, 0.0),
+        )
+        .unwrap();
+        let passed = descending
+            .tick(
+                MovementInput {
+                    jump: true,
+                    sneak: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(passed.applied.y < 0.0);
+
+        assert!(standing.on_ground);
+        let top_environment =
+            movement_environment(standing.bounding_box(), &chunks, geometry(), &profile);
+        assert!(top_environment.supported_on_scaffolding_top);
+        assert!(!top_environment.scaffolding);
+        let top_jump = standing
+            .tick(
+                MovementInput {
+                    jump: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(top_jump.jumped);
+        assert_close(top_jump.applied.y, JUMP_VELOCITY);
+        assert_close(
+            standing.velocity.y,
+            (JUMP_VELOCITY - GRAVITY) * VERTICAL_DRAG,
+        );
+        assert!(!standing.climbing);
+
+        let mut landed = false;
+        for _ in 0..80 {
+            standing
+                .tick(MovementInput::default(), &chunks, geometry(), &profile)
+                .unwrap();
+            if standing.on_ground {
+                landed = true;
+                break;
+            }
+        }
+        assert!(landed, "ordinary top jump must land back on scaffolding");
+        assert_close(standing.pose.y, 1.0);
+    }
+
+    #[test]
+    fn scaffolding_stack_has_independent_multitick_ascent_and_descent() {
+        let (mut chunks, profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                scaffolding: true,
+                ..BlockEnvironment::default()
+            }),
+        );
+        for y in 2..6 {
+            assert!(chunks.update_block(
+                ChunkCoordinate::new(0, 0),
+                0,
+                8,
+                y,
+                8,
+                RuntimeBlockStateId(2),
+            ));
+        }
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        for _ in 0..10 {
+            state
+                .tick(
+                    MovementInput {
+                        jump: true,
+                        ..MovementInput::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+        }
+        assert!(state.pose.y > 2.0);
+        let high = state.pose.y;
+        for _ in 0..5 {
+            state
+                .tick(
+                    MovementInput {
+                        sneak: true,
+                        ..MovementInput::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+        }
+        assert!(state.pose.y < high);
+        assert!(state.climbing);
+    }
+
+    #[test]
+    fn scaffolding_stack_transitions_to_top_support_and_ordinary_jump() {
+        let (mut chunks, profile) = special_world(
+            BlockEnvironment {
+                scaffolding: true,
+                ..BlockEnvironment::default()
+            },
+            Some(BlockEnvironment {
+                scaffolding: true,
+                ..BlockEnvironment::default()
+            }),
+        );
+        assert!(chunks.update_block(
+            ChunkCoordinate::new(0, 0),
+            0,
+            8,
+            2,
+            8,
+            RuntimeBlockStateId(2),
+        ));
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+
+        let internal_ascent = state
+            .tick(
+                MovementInput {
+                    jump: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(!internal_ascent.jumped);
+        assert_close(internal_ascent.applied.y, CLIMB_UP_SPEED);
+        for _ in 0..11 {
+            state
+                .tick(
+                    MovementInput {
+                        jump: true,
+                        ..MovementInput::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+        }
+
+        let mut landed_on_top = false;
+        for _ in 0..80 {
+            state
+                .tick(MovementInput::default(), &chunks, geometry(), &profile)
+                .unwrap();
+            if state.on_ground {
+                landed_on_top = true;
+                break;
+            }
+        }
+        assert!(landed_on_top);
+        assert_close(state.pose.y, 3.0);
+        let environment = movement_environment(state.bounding_box(), &chunks, geometry(), &profile);
+        assert!(environment.supported_on_scaffolding_top);
+        assert!(!environment.scaffolding);
+
+        let top_jump = state
+            .tick(
+                MovementInput {
+                    jump: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(top_jump.jumped);
+        assert_close(top_jump.applied.y, JUMP_VELOCITY);
+    }
+
+    #[test]
+    fn special_support_surfaces_preserve_ice_and_slime_semantics() {
+        let (chunks, profile) = special_world(
+            BlockEnvironment {
+                surface: SpecialSurface::BlueIce,
+                ..BlockEnvironment::default()
+            },
+            None,
+        );
+        assert_close(profile.slipperiness(RuntimeBlockStateId(1)), 0.989);
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::new(0.0, -0.5, 0.0),
+        )
+        .unwrap();
+        state.on_ground = false;
+        let mut slime_profile = profile.clone();
+        slime_profile.set_environment(BlockEnvironmentProfile::synthetic([(
+            RuntimeBlockStateId(1),
+            BlockEnvironment {
+                surface: SpecialSurface::Slime,
+                ..BlockEnvironment::default()
+            },
+        )]));
+        state
+            .tick(
+                MovementInput::default(),
+                &chunks,
+                geometry(),
+                &slime_profile,
+            )
+            .unwrap();
+        assert!(state.velocity.y > 0.0);
+        assert!(state.on_ground);
+
+        let mut sneaking = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::new(0.0, -0.5, 0.0),
+        )
+        .unwrap();
+        sneaking.on_ground = false;
+        sneaking
+            .tick(
+                MovementInput {
+                    jump: true,
+                    sneak: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &slime_profile,
+            )
+            .unwrap();
+        assert_eq!(sneaking.velocity.y, 0.0);
+        assert!(sneaking.on_ground);
+    }
+
+    #[test]
+    fn slime_bounce_sequence_decays_and_eventually_rests() {
+        let (chunks, mut profile) = special_world(BlockEnvironment::default(), None);
+        profile.set_environment(BlockEnvironmentProfile::synthetic([(
+            RuntimeBlockStateId(1),
+            BlockEnvironment {
+                surface: SpecialSurface::Slime,
+                ..BlockEnvironment::default()
+            },
+        )]));
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 5.0, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state.on_ground = false;
+        let mut launches = Vec::new();
+        for _ in 0..500 {
+            let before = state.velocity.y;
+            state
+                .tick(MovementInput::default(), &chunks, geometry(), &profile)
+                .unwrap();
+            if before < 0.0 && state.velocity.y > 0.0 {
+                launches.push(state.velocity.y);
+            }
+            if state.on_ground && state.velocity.y == 0.0 && launches.len() >= 3 {
+                break;
+            }
+        }
+        assert!(launches.len() >= 3, "expected several observable bounces");
+        assert!(launches.windows(2).all(|pair| pair[1] < pair[0]));
+        assert!(state.on_ground);
+        assert_eq!(state.velocity.y, 0.0);
+    }
+
+    #[test]
+    fn held_jump_is_sampled_after_slime_contact_without_replacing_the_bounce() {
+        let (chunks, mut profile) = special_world(BlockEnvironment::default(), None);
+        profile.set_environment(BlockEnvironmentProfile::synthetic([(
+            RuntimeBlockStateId(1),
+            BlockEnvironment {
+                surface: SpecialSurface::Slime,
+                ..BlockEnvironment::default()
+            },
+        )]));
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 5.0, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state.on_ground = false;
+
+        let mut contact = None;
+        for _ in 0..100 {
+            let before = state.velocity.y;
+            let result = state
+                .tick(
+                    MovementInput {
+                        jump: true,
+                        ..MovementInput::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+            if before < 0.0 && state.velocity.y > 0.0 {
+                contact = Some((result, state.velocity.y));
+                break;
+            }
+        }
+        let (contact, reflected_after_travel) = contact.expect("player must contact slime");
+        assert!(!contact.grounded_at_start);
+        assert!(
+            !contact.jumped,
+            "airborne input must not jump before landing"
+        );
+        assert!(
+            state.on_ground,
+            "slime callback preserves the landing state"
+        );
+
+        let manual = state
+            .tick(
+                MovementInput {
+                    jump: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(manual.grounded_at_start);
+        assert!(manual.jumped);
+        assert_close(manual.applied.y, reflected_after_travel.max(JUMP_VELOCITY));
+        assert!(!state.on_ground);
+
+        let airborne = state
+            .tick(
+                MovementInput {
+                    jump: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(!airborne.grounded_at_start);
+        assert!(
+            !airborne.jumped,
+            "held input must not reapply a jump in mid-air"
+        );
+    }
+
+    #[test]
+    fn late_slime_bounce_can_be_raised_to_an_ordinary_jump() {
+        let (chunks, mut profile) = special_world(BlockEnvironment::default(), None);
+        profile.set_environment(BlockEnvironmentProfile::synthetic([(
+            RuntimeBlockStateId(1),
+            BlockEnvironment {
+                surface: SpecialSurface::Slime,
+                ..BlockEnvironment::default()
+            },
+        )]));
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 5.0, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state.on_ground = false;
+
+        let mut late_contact = false;
+        for _ in 0..500 {
+            let before = state.velocity.y;
+            state
+                .tick(MovementInput::default(), &chunks, geometry(), &profile)
+                .unwrap();
+            if before < 0.0 && state.velocity.y > 0.0 && state.velocity.y < JUMP_VELOCITY {
+                late_contact = true;
+                break;
+            }
+        }
+        assert!(
+            late_contact,
+            "automatic bounce must decay below jump velocity"
+        );
+        assert!(state.on_ground);
+
+        let result = state
+            .tick(
+                MovementInput {
+                    jump: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(result.jumped);
+        assert_close(result.applied.y, JUMP_VELOCITY);
+        assert_close(state.velocity.y, (JUMP_VELOCITY - GRAVITY) * VERTICAL_DRAG);
+    }
+
+    #[test]
+    fn jump_pressed_only_on_slime_impact_is_not_buffered_after_release() {
+        let (chunks, mut profile) = special_world(BlockEnvironment::default(), None);
+        profile.set_environment(BlockEnvironmentProfile::synthetic([(
+            RuntimeBlockStateId(1),
+            BlockEnvironment {
+                surface: SpecialSurface::Slime,
+                ..BlockEnvironment::default()
+            },
+        )]));
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.2, 8.5, 0.0, 0.0),
+            Vec3d::new(0.0, -0.5, 0.0),
+        )
+        .unwrap();
+        state.on_ground = false;
+
+        let contact = state
+            .tick(
+                MovementInput {
+                    jump: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(!contact.grounded_at_start);
+        assert!(!contact.jumped);
+        assert!(state.on_ground);
+        assert!(state.velocity.y > 0.0);
+        let reflected = state.velocity.y;
+        let released = state
+            .tick(MovementInput::default(), &chunks, geometry(), &profile)
+            .unwrap();
+        assert!(released.grounded_at_start);
+        assert!(!released.jumped);
+        assert_close(released.applied.y, reflected);
+    }
+
+    #[test]
+    fn standing_on_slime_uses_the_ordinary_grounded_jump() {
+        let (chunks, mut profile) = special_world(BlockEnvironment::default(), None);
+        profile.set_environment(BlockEnvironmentProfile::synthetic([(
+            RuntimeBlockStateId(1),
+            BlockEnvironment {
+                surface: SpecialSurface::Slime,
+                ..BlockEnvironment::default()
+            },
+        )]));
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state.on_ground = true;
+        let result = state
+            .tick(
+                MovementInput {
+                    jump: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(result.jumped);
+        assert_close(result.applied.y, JUMP_VELOCITY);
+    }
+
+    #[test]
+    fn honey_support_reduces_input_and_reduces_jump() {
+        let (chunks, profile) = special_world(
+            BlockEnvironment {
+                surface: SpecialSurface::Honey,
+                ..BlockEnvironment::default()
+            },
+            None,
+        );
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state.on_ground = true;
+        let result = state
+            .tick(
+                MovementInput {
+                    forward: true,
+                    jump: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert!(result.jumped);
+        assert_close(result.applied.y, JUMP_VELOCITY * 0.5);
+        assert!(state.velocity.z > 0.0);
+        assert!(state.velocity.z < BASE_MOVEMENT_SPEED);
+    }
+
+    #[test]
     fn creative_flight_ascends_descends_and_normalizes_horizontal_input() {
         let (chunks, profile) = flat_world();
         let mut ascending = player();
@@ -2805,6 +4906,190 @@ mod tests {
     }
 
     #[test]
+    fn fluid_exit_probe_uses_partial_shape_clearance_after_adjusted_travel() {
+        let lower = classify_shape(
+            "stone_slab",
+            &BTreeMap::from([("type".to_owned(), "bottom".to_owned())]),
+        );
+        let upper = classify_shape(
+            "stone_slab",
+            &BTreeMap::from([("type".to_owned(), "top".to_owned())]),
+        );
+        let bounds = Aabb::new(Vec3d::new(8.4, 0.0, 8.2), Vec3d::new(9.0, 1.8, 8.8));
+        let velocity = Vec3d::new(0.1, -0.005, 0.0);
+        for (name, shape, expected) in [
+            ("lower slab", lower, true),
+            ("upper slab", upper, false),
+            ("full cube", CollisionShape::FullCube, false),
+        ] {
+            let (chunks, profile) = single_shape_world(9, 0, 8, RuntimeBlockStateId(9), shape);
+            assert_eq!(
+                fluid_exit_clearance(bounds, velocity, 0.0, &chunks, geometry(), &profile,)
+                    .unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+        let stair = classify_shape(
+            "oak_stairs",
+            &BTreeMap::from([
+                ("facing".to_owned(), "east".to_owned()),
+                ("half".to_owned(), "bottom".to_owned()),
+                ("shape".to_owned(), "straight".to_owned()),
+            ]),
+        );
+        let (chunks, profile) = single_shape_world(9, 0, 8, RuntimeBlockStateId(9), stair);
+        assert!(
+            fluid_exit_clearance(bounds, velocity, 0.0, &chunks, geometry(), &profile,).unwrap(),
+            "the raised probe clears the lower half at the approached stair edge"
+        );
+    }
+
+    #[test]
+    fn fluid_exit_probe_requires_the_translated_player_volume_to_leave_liquid_cells() {
+        let (chunks, profile) = special_world(
+            BlockEnvironment::default(),
+            Some(BlockEnvironment {
+                fluid: Some(crate::FluidState {
+                    kind: FluidKind::Water,
+                    level: 0,
+                    falling: false,
+                }),
+                ..BlockEnvironment::default()
+            }),
+        );
+        let bounds = Aabb::new(Vec3d::new(8.2, 1.0, 8.2), Vec3d::new(8.8, 2.8, 8.8));
+        assert!(
+            !fluid_exit_clearance(
+                bounds,
+                Vec3d::new(0.0, -WATER_GRAVITY, 0.0),
+                0.0,
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap(),
+            "block-clear vertical space is not free while its translated AABB still covers water"
+        );
+        assert!(
+            fluid_exit_clearance(
+                bounds,
+                Vec3d::new(0.0, 0.41, 0.0),
+                0.0,
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap(),
+            "deliberate upward motion can move the translated AABB beyond the water cell"
+        );
+    }
+
+    #[test]
+    fn fluid_exit_upright_water_ledge_preserves_forward_intent_without_inventing_jump() {
+        let lower_slab = classify_shape(
+            "stone_slab",
+            &BTreeMap::from([("type".to_owned(), "bottom".to_owned())]),
+        );
+        let stair = classify_shape(
+            "oak_stairs",
+            &BTreeMap::from([
+                ("facing".to_owned(), "east".to_owned()),
+                ("half".to_owned(), "bottom".to_owned()),
+                ("shape".to_owned(), "straight".to_owned()),
+            ]),
+        );
+
+        for (name, shape, expected_impulse_tick, expected_left_water_tick) in [
+            ("full block", CollisionShape::FullCube, Some(5), Some(7)),
+            ("lower slab", lower_slab, None, Some(6)),
+            ("stair", stair, Some(5), Some(7)),
+        ] {
+            let (chunks, profile) = fluid_ledge_world(shape.clone());
+            let mut forward_only = upright_water_player_before_ledge();
+            let mut forward_trace = Vec::new();
+            for _ in 0..12 {
+                let result = forward_only
+                    .tick(
+                        MovementInput {
+                            forward: true,
+                            ..MovementInput::default()
+                        },
+                        &chunks,
+                        geometry(),
+                        &profile,
+                    )
+                    .unwrap();
+                forward_trace.push((
+                    result.applied,
+                    forward_only.pose,
+                    forward_only.velocity,
+                    forward_only.horizontal_collision,
+                ));
+                assert!(
+                    (forward_only.velocity.y - 0.300_000_011_920_928_96).abs() > COLLISION_EPSILON,
+                    "{name} applied an unsolicited fluid-exit impulse: {forward_trace:?}"
+                );
+            }
+
+            let stopped_at_z = forward_only.pose.z;
+            for _ in 0..4 {
+                forward_only
+                    .tick(MovementInput::default(), &chunks, geometry(), &profile)
+                    .unwrap();
+                assert!(
+                    (forward_only.velocity.y - 0.300_000_011_920_928_96).abs() > COLLISION_EPSILON,
+                    "{name} hopped after forward input stopped"
+                );
+            }
+            if name == "full block" {
+                assert_close(forward_only.pose.z, stopped_at_z);
+            }
+
+            let (chunks, profile) = fluid_ledge_world(shape);
+            let mut deliberate_exit = upright_water_player_before_ledge();
+            let mut exit_impulse_tick = None;
+            let mut left_water_tick = None;
+            let mut maximum_y = deliberate_exit.pose.y;
+            for tick in 0..24 {
+                deliberate_exit
+                    .tick(
+                        MovementInput {
+                            forward: true,
+                            jump: true,
+                            ..MovementInput::default()
+                        },
+                        &chunks,
+                        geometry(),
+                        &profile,
+                    )
+                    .unwrap();
+                maximum_y = maximum_y.max(deliberate_exit.pose.y);
+                if (deliberate_exit.velocity.y - 0.300_000_011_920_928_96).abs()
+                    <= COLLISION_EPSILON
+                {
+                    exit_impulse_tick.get_or_insert(tick);
+                }
+                if !deliberate_exit.in_water {
+                    left_water_tick.get_or_insert(tick);
+                }
+            }
+            assert!(
+                exit_impulse_tick.is_some() || left_water_tick.is_some(),
+                "{name} did not permit a deliberate forward-plus-jump exit: pose={:?} velocity={:?} maximum_y={maximum_y}",
+                deliberate_exit.pose,
+                deliberate_exit.velocity
+            );
+            assert_eq!(exit_impulse_tick, expected_impulse_tick, "{name}");
+            assert_eq!(left_water_tick, expected_left_water_tick, "{name}");
+            assert!(
+                maximum_y > 1.25,
+                "{name} deliberate exit made no vertical progress: maximum_y={maximum_y}"
+            );
+        }
+    }
+
+    #[test]
     fn source_cell_shapes_extending_above_one_block_are_collected_generically() {
         let tall_narrow = boxes(&[Aabb::new(
             Vec3d::new(6.0 / 16.0, 0.0, 6.0 / 16.0),
@@ -3056,5 +5341,120 @@ mod tests {
             .unwrap();
         assert!(protected.applied.x <= 0.05 + COLLISION_EPSILON);
         assert!(ordinary.applied.x > protected.applied.x + 0.1);
+    }
+
+    #[test]
+    fn stationary_sneak_release_at_a_full_block_edge_retains_support() {
+        let (mut chunks, profile) = flat_world();
+        for z in 0..16 {
+            for x in 9..16 {
+                let _ = chunks.update_block(
+                    ChunkCoordinate::new(0, 0),
+                    0,
+                    x,
+                    0,
+                    z,
+                    RuntimeBlockStateId(0),
+                );
+            }
+        }
+        let mut state = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.0, -90.0, 0.0),
+            Vec3d::default(),
+        )
+        .unwrap();
+        state.on_ground = true;
+        for _ in 0..40 {
+            state
+                .tick(
+                    MovementInput {
+                        forward: true,
+                        sneak: true,
+                        ..Default::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+        }
+        state
+            .tick(
+                MovementInput {
+                    sneak: true,
+                    ..Default::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        let edge_pose = state.pose;
+        let released = state
+            .tick(MovementInput::default(), &chunks, geometry(), &profile)
+            .unwrap();
+        assert_close(released.applied.x, 0.0);
+        assert_close(released.applied.z, 0.0);
+        assert_close(state.pose.x, edge_pose.x);
+        assert_close(state.pose.z, edge_pose.z);
+        assert_close(state.pose.y, edge_pose.y);
+        assert!(state.on_ground);
+
+        for _ in 0..12 {
+            state
+                .tick(
+                    MovementInput {
+                        forward: true,
+                        ..Default::default()
+                    },
+                    &chunks,
+                    geometry(),
+                    &profile,
+                )
+                .unwrap();
+        }
+        assert!(
+            state.pose.y < edge_pose.y,
+            "ordinary outward input should permit falling"
+        );
+    }
+
+    #[test]
+    fn zero_motion_ground_probe_preserves_corner_partial_and_negative_support() {
+        let cases = [
+            (
+                8,
+                8,
+                CollisionShape::FullCube,
+                LocalPlayerPose::new(9.299_999_8, 1.0, 9.299_999_8, 0.0, 0.0),
+            ),
+            (
+                8,
+                8,
+                boxes(&[Aabb::new(
+                    Vec3d::new(0.0, 0.0, 0.0),
+                    Vec3d::new(1.0, 0.5, 1.0),
+                )]),
+                LocalPlayerPose::new(9.299_999_8, 0.5, 8.5, 0.0, 0.0),
+            ),
+            (
+                -8,
+                -8,
+                CollisionShape::FullCube,
+                LocalPlayerPose::new(-6.700_000_2, 1.0, -7.5, 0.0, 0.0),
+            ),
+        ];
+        for (x, z, shape, pose) in cases {
+            let (chunks, profile) = single_shape_world(x, 0, z, RuntimeBlockStateId(9), shape);
+            let mut state =
+                PlayerMovementState::from_authoritative(pose, Vec3d::default()).unwrap();
+            state.on_ground = true;
+            let before = state.pose;
+            state
+                .tick(MovementInput::default(), &chunks, geometry(), &profile)
+                .unwrap();
+            assert_eq!(state.pose, before);
+            assert!(state.on_ground, "pose={pose:?}");
+        }
     }
 }

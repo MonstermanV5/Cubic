@@ -53,6 +53,26 @@ pub struct RuntimeDimensionType {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrassColorModifier {
+    None,
+    DarkForest,
+    Swamp,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeBiome {
+    pub raw_id: u32,
+    pub identifier: MinecraftIdentifier,
+    pub temperature: f32,
+    pub downfall: f32,
+    pub water_color: u32,
+    pub foliage_color: Option<u32>,
+    pub dry_foliage_color: Option<u32>,
+    pub grass_color: Option<u32>,
+    pub grass_color_modifier: GrassColorModifier,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockCoordinates {
     pub x: i32,
     pub y: i32,
@@ -249,6 +269,7 @@ pub enum WorldEvent {
     BeginConfiguration,
     RuntimeRegistries(RuntimeRegistrySnapshot),
     RuntimeDimensionTypes(Vec<RuntimeDimensionType>),
+    RuntimeBiomes(Vec<RuntimeBiome>),
     EnterWorld(EnterWorld),
     Respawn(Respawn),
     SynchronizePlayerPosition(PlayerPositionUpdate),

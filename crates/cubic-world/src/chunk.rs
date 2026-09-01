@@ -167,6 +167,48 @@ pub struct ChunkLightSummary {
     pub empty_block_mask: Vec<u64>,
     pub sky_layer_count: usize,
     pub block_layer_count: usize,
+    pub sky_layers: Vec<LightLayerData>,
+    pub block_layers: Vec<LightLayerData>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LightLayerData {
+    pub mask_index: usize,
+    pub data: Vec<u8>,
+}
+
+impl ChunkLightSummary {
+    #[must_use]
+    pub fn sky(&self, section: usize, x: u8, y: u8, z: u8) -> Option<u8> {
+        light_value(&self.sky_layers, section.checked_add(1)?, x, y, z)
+            .or_else(|| mask_contains(&self.empty_sky_mask, section + 1).then_some(0))
+    }
+
+    #[must_use]
+    pub fn block(&self, section: usize, x: u8, y: u8, z: u8) -> Option<u8> {
+        light_value(&self.block_layers, section.checked_add(1)?, x, y, z)
+            .or_else(|| mask_contains(&self.empty_block_mask, section + 1).then_some(0))
+    }
+}
+
+fn light_value(layers: &[LightLayerData], mask_index: usize, x: u8, y: u8, z: u8) -> Option<u8> {
+    if x >= 16 || y >= 16 || z >= 16 {
+        return None;
+    }
+    let layer = layers.iter().find(|layer| layer.mask_index == mask_index)?;
+    let index = usize::from(y) * 256 + usize::from(z) * 16 + usize::from(x);
+    let byte = *layer.data.get(index / 2)?;
+    Some(if index & 1 == 0 {
+        byte & 0x0f
+    } else {
+        byte >> 4
+    })
+}
+
+fn mask_contains(words: &[u64], index: usize) -> bool {
+    words
+        .get(index / 64)
+        .is_some_and(|word| word & (1_u64 << (index % 64)) != 0)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -306,4 +348,36 @@ impl LoadedChunks {
 pub enum ChunkStoreError {
     #[error("loaded chunk count would exceed safety limit {max}")]
     LoadedChunkLimit { max: usize },
+}
+
+#[cfg(test)]
+mod light_tests {
+    use super::*;
+
+    #[test]
+    fn authoritative_light_nibbles_use_section_guard_offset_and_xyz_indexing() {
+        let mut data = vec![0_u8; 2048];
+        let index = 2 * 256 + 3 * 16 + 4;
+        data[index / 2] = if index & 1 == 0 { 0x0b } else { 0xb0 };
+        let light = ChunkLightSummary {
+            sky_layers: vec![LightLayerData {
+                mask_index: 1,
+                data,
+            }],
+            ..ChunkLightSummary::default()
+        };
+        assert_eq!(light.sky(0, 4, 2, 3), Some(11));
+        assert_eq!(light.sky(1, 4, 2, 3), None);
+        assert_eq!(light.sky(0, 16, 2, 3), None);
+    }
+
+    #[test]
+    fn explicitly_empty_light_sections_resolve_to_zero() {
+        let light = ChunkLightSummary {
+            empty_block_mask: vec![1_u64 << 2],
+            ..ChunkLightSummary::default()
+        };
+        assert_eq!(light.block(1, 0, 0, 0), Some(0));
+        assert_eq!(light.block(0, 0, 0, 0), None);
+    }
 }

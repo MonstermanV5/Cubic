@@ -7,7 +7,10 @@ use cubic_resources::{
     MAX_VANILLA_RESOURCE_BYTES, ResourceError, VanillaResourcePath, VanillaResourceSource,
 };
 use cubic_version::{GameData, MinecraftIdentifier};
-use cubic_world::RuntimeBlockStateId;
+use cubic_world::{
+    BlockCollisionProfile, BlockEnvironmentProfile, CollisionShape, FluidKind, FluidState,
+    RuntimeBlockStateId,
+};
 use png::{ColorType, Transformations};
 use serde::Deserialize;
 use serde_json::Value;
@@ -16,6 +19,7 @@ use thiserror::Error;
 const MAX_JSON_BYTES: u64 = 1024 * 1024;
 const MAX_MODEL_DEPTH: usize = 32;
 const MAX_ELEMENTS: usize = 256;
+const MAX_FLUID_OCCLUSION_BOXES: usize = 32;
 const MAX_ATLAS_SIDE: u32 = 4096;
 const ATLAS_GUTTER: u32 = 1;
 
@@ -31,6 +35,15 @@ pub enum BlockResourceError {
         identifier: String,
         reason: String,
     },
+    #[error(
+        "malformed texture metadata section `{section}` for `{texture}` at `{metadata_path}`: {reason}"
+    )]
+    TextureMetadata {
+        texture: String,
+        metadata_path: String,
+        section: &'static str,
+        reason: String,
+    },
     #[error("texture atlas exceeds the {maximum}-pixel side limit")]
     AtlasTooLarge { maximum: u32 },
 }
@@ -39,6 +52,25 @@ pub enum BlockResourceError {
 pub(crate) enum RenderLayer {
     Opaque,
     Cutout,
+    Translucent,
+    /// Layered translucent model geometry that needs every layer blended.
+    ///
+    /// Vanilla's translucent chunk layer sorts individual quads before using
+    /// its depth-writing terrain pipeline. Cubic deliberately defers general
+    /// per-quad translucent sorting, so exact-version resources with nested
+    /// translucent shells use a non-depth-writing compatibility policy rather
+    /// than losing all geometry behind the first shell.
+    LayeredTranslucent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TintKind {
+    None,
+    Grass,
+    Foliage,
+    DryFoliage,
+    Water,
+    Fixed(u32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -93,15 +125,23 @@ pub(crate) struct ModelFace {
     pub atlas_region: AtlasRegion,
     pub cullface: Option<Direction>,
     pub tint_index: Option<u32>,
+    pub tint_kind: TintKind,
+    pub render_layer: RenderLayer,
+    pub directional_shade: bool,
     pub shade: f32,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ModelApplication {
     pub faces: Vec<ModelFace>,
+    /// Axis-aligned solid element bounds used only to suppress contained
+    /// fluid surfaces. Rotated model elements are deliberately omitted rather
+    /// than approximated with an over-large box.
+    pub solid_boxes: Vec<[[f32; 3]; 2]>,
     pub x_rotation: u16,
     pub y_rotation: u16,
     pub uvlock: bool,
+    pub ambient_occlusion: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +154,20 @@ pub(crate) struct WeightedApplications {
 pub(crate) struct StateModels {
     pub parts: Vec<WeightedApplications>,
     pub full_opaque_cube: bool,
+    /// Exact-version projection of `BlockState.isSolid()` for fluid surface
+    /// sampling. This is deliberately distinct from visual occlusion.
+    pub fluid_surface_solid: bool,
+    pub fluid: Option<FluidState>,
+    pub emissive: bool,
+    pub model_offset: ModelOffset,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ModelOffset {
+    #[default]
+    None,
+    Xz,
+    Xyz,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -129,6 +183,23 @@ pub struct TextureAtlasData {
     pub height: u32,
     pub rgba: Vec<u8>,
     regions: BTreeMap<String, AtlasRegion>,
+    pub(crate) animations: Vec<TextureAnimationData>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TextureAnimationData {
+    pub origin: [u32; 2],
+    pub width: u32,
+    pub height: u32,
+    pub frames: Vec<Vec<u8>>,
+    pub sequence: Vec<AnimationStep>,
+    pub interpolate: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AnimationStep {
+    pub frame: usize,
+    pub ticks: u32,
 }
 
 impl TextureAtlasData {
@@ -154,6 +225,9 @@ pub struct BlockResources {
     pub model_count: usize,
     pub texture_count: usize,
     pub fallback_count: usize,
+    pub(crate) grass_colormap: Vec<u32>,
+    pub(crate) foliage_colormap: Vec<u32>,
+    pub(crate) dry_foliage_colormap: Vec<u32>,
 }
 
 impl BlockResources {
@@ -162,6 +236,8 @@ impl BlockResources {
         source: &mut impl VanillaResourceSource,
     ) -> Result<Self, BlockResourceError> {
         let mut loader = Loader::new(source);
+        let environment = BlockEnvironmentProfile::from_game_data(data);
+        let collision = BlockCollisionProfile::from_game_data(data);
         let mut states = BTreeMap::new();
         let mut fallback_count = 0;
         for block in &data.artifact().blocks {
@@ -177,7 +253,7 @@ impl BlockResources {
                 }
             };
             for state in &block.states {
-                let models = if is_air {
+                let mut models = if is_air {
                     StateModels::default()
                 } else {
                     match definition
@@ -196,10 +272,20 @@ impl BlockResources {
                         }
                     }
                 };
+                apply_state_semantics(
+                    &mut models,
+                    block.identifier.as_str(),
+                    &state.properties,
+                    environment.state(RuntimeBlockStateId(state.state_id)),
+                    collision.shape(RuntimeBlockStateId(state.state_id)),
+                );
                 states.insert(RuntimeBlockStateId(state.state_id), models);
             }
         }
         let atlas = loader.build_atlas(&states)?;
+        let grass_colormap = loader.load_colormap("minecraft:colormap/grass")?;
+        let foliage_colormap = loader.load_colormap("minecraft:colormap/foliage")?;
+        let dry_foliage_colormap = loader.load_colormap("minecraft:colormap/dry_foliage")?;
         for models in states.values_mut() {
             prepare_runtime_state(models, &atlas);
         }
@@ -235,6 +321,9 @@ impl BlockResources {
             model_count: loader.models.len(),
             texture_count,
             fallback_count,
+            grass_colormap,
+            foliage_colormap,
+            dry_foliage_colormap,
         })
     }
 
@@ -273,6 +362,9 @@ impl BlockResources {
             model_count: 0,
             texture_count: 1,
             fallback_count: 0,
+            grass_colormap: vec![0x7fb238; 256 * 256],
+            foliage_colormap: vec![0x48b518; 256 * 256],
+            dry_foliage_colormap: vec![0x9e814d; 256 * 256],
         }
     }
 
@@ -293,26 +385,132 @@ impl BlockResources {
         resources.states[index] = Some(models);
         resources
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_synthetic_non_full(mut self, state: RuntimeBlockStateId) -> Self {
+        let Ok(index) = usize::try_from(state.0) else {
+            return self;
+        };
+        if self.states.len() <= index {
+            self.states.resize_with(index + 1, || None);
+        }
+        let mut models = fallback_state();
+        models.full_opaque_cube = false;
+        for part in &mut models.parts {
+            for (_, model) in &mut part.entries {
+                for face in &mut model.faces {
+                    face.render_layer = RenderLayer::Translucent;
+                }
+            }
+        }
+        self.states[index] = Some(models);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_synthetic_render_layer(
+        mut self,
+        state: RuntimeBlockStateId,
+        layer: RenderLayer,
+    ) -> Self {
+        let Ok(index) = usize::try_from(state.0) else {
+            return self;
+        };
+        if self.states.len() <= index {
+            self.states.resize_with(index + 1, || None);
+        }
+        let mut models = fallback_state();
+        for part in &mut models.parts {
+            for (_, model) in &mut part.entries {
+                for face in &mut model.faces {
+                    face.render_layer = layer;
+                }
+            }
+        }
+        models.full_opaque_cube = layer == RenderLayer::Opaque;
+        self.states[index] = Some(models);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_synthetic_opaque_boxes(
+        mut self,
+        state: RuntimeBlockStateId,
+        boxes: Vec<[[f32; 3]; 2]>,
+    ) -> Self {
+        let Ok(index) = usize::try_from(state.0) else {
+            return self;
+        };
+        if self.states.len() <= index {
+            self.states.resize_with(index + 1, || None);
+        }
+        let mut models = fallback_state();
+        models.full_opaque_cube = false;
+        for part in &mut models.parts {
+            for (_, model) in &mut part.entries {
+                model.solid_boxes.clone_from(&boxes);
+            }
+        }
+        self.states[index] = Some(models);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_fluid(state: RuntimeBlockStateId, fluid: FluidState) -> Self {
+        Self::synthetic_fluids([(state, fluid)])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_fluids(
+        fluids: impl IntoIterator<Item = (RuntimeBlockStateId, FluidState)>,
+    ) -> Self {
+        let mut resources = Self::synthetic([RuntimeBlockStateId(0)]);
+        for (state, fluid) in fluids {
+            let index = usize::try_from(state.0).expect("synthetic state index");
+            resources.states.resize_with(index + 1, || None);
+            resources.states[index] = Some(StateModels {
+                fluid: Some(fluid),
+                ..StateModels::default()
+            });
+        }
+        resources
+    }
 }
 
 fn prepare_runtime_state(models: &mut StateModels, atlas: &TextureAtlasData) {
     for part in &mut models.parts {
         for (_, model) in &mut part.entries {
+            for bounds in &mut model.solid_boxes {
+                let corners = box_corners(*bounds).map(|corner| {
+                    rotate_blockstate_corner(corner, model.x_rotation, model.y_rotation)
+                });
+                *bounds = bounds_of_corners(corners);
+            }
             for face in &mut model.faces {
                 if model.uvlock {
-                    face.uv.rotate_left(uvlock_quarter_turns(
-                        face.direction,
-                        model.x_rotation,
-                        model.y_rotation,
-                    ));
+                    face.uv =
+                        uvlock_uvs(face.uv, face.direction, model.x_rotation, model.y_rotation);
                 }
                 face.corners = face.corners.map(|corner| {
                     rotate_blockstate_corner(corner, model.x_rotation, model.y_rotation)
                 });
+                face.direction =
+                    rotate_blockstate_direction(face.direction, model.x_rotation, model.y_rotation);
+                recalculate_axis_aligned_winding(face);
+                face.shade = if face.directional_shade {
+                    direction_shade(face.direction)
+                } else {
+                    1.0
+                };
                 face.cullface = face.cullface.map(|direction| {
                     rotate_blockstate_direction(direction, model.x_rotation, model.y_rotation)
                 });
                 face.atlas_region = atlas.region(&face.texture);
+                if face.render_layer == RenderLayer::Opaque
+                    && face.atlas_region.layer == RenderLayer::Cutout
+                {
+                    face.render_layer = RenderLayer::Cutout;
+                }
             }
             model.x_rotation = 0;
             model.y_rotation = 0;
@@ -325,8 +523,236 @@ fn prepare_runtime_state(models: &mut StateModels, atlas: &TextureAtlasData) {
                 && model
                     .faces
                     .iter()
-                    .all(|face| face.atlas_region.layer == RenderLayer::Opaque)
+                    .all(|face| face.render_layer == RenderLayer::Opaque)
         });
+}
+
+fn recalculate_axis_aligned_winding(face: &mut ModelFace) {
+    let mut from = [f32::INFINITY; 3];
+    let mut to = [f32::NEG_INFINITY; 3];
+    for corner in face.corners {
+        for axis in 0..3 {
+            from[axis] = from[axis].min(corner[axis]);
+            to[axis] = to[axis].max(corner[axis]);
+        }
+    }
+    let expected = face_corners(from, to, face.direction);
+    let mut mapped = [None; 4];
+    for (target_index, target) in expected.iter().enumerate() {
+        mapped[target_index] = face
+            .corners
+            .iter()
+            .position(|corner| (0..3).all(|axis| (corner[axis] - target[axis]).abs() <= 1.0e-6));
+    }
+    let Some(indices) = mapped
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .and_then(|values| <[usize; 4]>::try_from(values).ok())
+    else {
+        // Arbitrarily rotated model elements are not axis-aligned cuboids and
+        // vanilla deliberately retains their original winding.
+        return;
+    };
+    let old_corners = face.corners;
+    let old_uv = face.uv;
+    face.corners = indices.map(|index| old_corners[index]);
+    face.uv = indices.map(|index| old_uv[index]);
+}
+
+fn apply_state_semantics(
+    models: &mut StateModels,
+    identifier: &str,
+    properties: &BTreeMap<String, String>,
+    environment: cubic_world::BlockEnvironment,
+    collision: &CollisionShape,
+) {
+    let path = identifier
+        .split_once(':')
+        .map_or(identifier, |(_, path)| path);
+    let layer = render_layer_26_1_2(path);
+    for part in &mut models.parts {
+        for (_, model) in &mut part.entries {
+            for face in &mut model.faces {
+                face.render_layer = layer;
+                face.tint_kind = face.tint_index.map_or(TintKind::None, |index| {
+                    tint_kind_26_1_2(path, properties, index)
+                });
+            }
+        }
+    }
+    models.fluid = environment.fluid;
+    models.fluid_surface_solid = environment.fluid.is_none() && legacy_solid_shape(collision);
+    models.emissive = environment.emissive;
+    models.model_offset = model_offset_26_1_2(path);
+}
+
+fn legacy_solid_shape(shape: &CollisionShape) -> bool {
+    let bounds = match shape {
+        CollisionShape::Empty => return false,
+        CollisionShape::FullCube => return true,
+        CollisionShape::Boxes(boxes) => {
+            boxes
+                .iter()
+                .fold(None::<cubic_world::Aabb>, |bounds, part| {
+                    Some(match bounds {
+                        None => *part,
+                        Some(bounds) => cubic_world::Aabb::new(
+                            cubic_world::Vec3d::new(
+                                bounds.min.x.min(part.min.x),
+                                bounds.min.y.min(part.min.y),
+                                bounds.min.z.min(part.min.z),
+                            ),
+                            cubic_world::Vec3d::new(
+                                bounds.max.x.max(part.max.x),
+                                bounds.max.y.max(part.max.y),
+                                bounds.max.z.max(part.max.z),
+                            ),
+                        ),
+                    })
+                })
+        }
+    };
+    bounds.is_some_and(|bounds| {
+        let x = bounds.max.x - bounds.min.x;
+        let y = bounds.max.y - bounds.min.y;
+        let z = bounds.max.z - bounds.min.z;
+        (x + y + z) / 3.0 >= 0.729_166_666_666_666_6 || y >= 1.0
+    })
+}
+
+fn model_offset_26_1_2(path: &str) -> ModelOffset {
+    // Exact-version adapter: these registrations were verified against the
+    // 26.1.2 Blocks bootstrap. Keep this table out of generic meshing logic.
+    match path {
+        "short_grass" | "fern" => ModelOffset::Xyz,
+        "tall_grass" | "large_fern" => ModelOffset::Xz,
+        _ => ModelOffset::None,
+    }
+}
+
+fn render_layer_26_1_2(path: &str) -> RenderLayer {
+    if path == "honey_block" {
+        // The official model has a full outer shell around a second inset
+        // translucent cube. Vanilla sorts those quads before drawing them;
+        // preserve both layers until Cubic gains the deferred general sorter.
+        RenderLayer::LayeredTranslucent
+    } else if path == "water"
+        || path == "glass"
+        || path == "glass_pane"
+        || path.ends_with("_stained_glass")
+        || path.ends_with("_stained_glass_pane")
+        || matches!(path, "ice" | "frosted_ice" | "slime_block")
+    {
+        RenderLayer::Translucent
+    } else if path.ends_with("_leaves")
+        || path.ends_with("_sapling")
+        || path.ends_with("_door")
+        || path.ends_with("_trapdoor")
+        || path.ends_with("_tulip")
+        || path.ends_with("_coral")
+        || path.ends_with("_coral_fan")
+        || matches!(
+            path,
+            "short_grass"
+                | "tall_grass"
+                | "fern"
+                | "large_fern"
+                | "dead_bush"
+                | "dandelion"
+                | "poppy"
+                | "blue_orchid"
+                | "allium"
+                | "azure_bluet"
+                | "oxeye_daisy"
+                | "cornflower"
+                | "lily_of_the_valley"
+                | "wither_rose"
+                | "sugar_cane"
+                | "vine"
+                | "ladder"
+                | "fire"
+                | "soul_fire"
+                | "cobweb"
+                | "wheat"
+                | "carrots"
+                | "potatoes"
+                | "beetroots"
+                | "nether_wart"
+                | "leaf_litter"
+                | "melon_stem"
+                | "pumpkin_stem"
+                | "attached_melon_stem"
+                | "attached_pumpkin_stem"
+                | "seagrass"
+                | "tall_seagrass"
+                | "kelp"
+                | "kelp_plant"
+                | "scaffolding"
+        )
+    {
+        RenderLayer::Cutout
+    } else {
+        RenderLayer::Opaque
+    }
+}
+
+/// Exact 26.1.2 BlockColors registration projected into renderer-neutral tint
+/// semantics. Block names intentionally live only at this version/resource
+/// boundary; the mesher never switches on Minecraft identifiers.
+fn tint_kind_26_1_2(
+    path: &str,
+    properties: &BTreeMap<String, String>,
+    tint_index: u32,
+) -> TintKind {
+    if tint_index > 1 {
+        return TintKind::None;
+    }
+    if matches!(
+        path,
+        "grass_block"
+            | "short_grass"
+            | "tall_grass"
+            | "fern"
+            | "large_fern"
+            | "potted_fern"
+            | "bush"
+            | "sugar_cane"
+    ) {
+        TintKind::Grass
+    } else if path == "spruce_leaves" {
+        TintKind::Fixed(0x619961)
+    } else if path == "birch_leaves" {
+        TintKind::Fixed(0x80a755)
+    } else if matches!(
+        path,
+        "oak_leaves"
+            | "jungle_leaves"
+            | "acacia_leaves"
+            | "dark_oak_leaves"
+            | "mangrove_leaves"
+            | "vine"
+    ) {
+        TintKind::Foliage
+    } else if path == "leaf_litter" {
+        TintKind::DryFoliage
+    } else if matches!(path, "water" | "bubble_column" | "water_cauldron") {
+        TintKind::Water
+    } else if matches!(path, "attached_melon_stem" | "attached_pumpkin_stem") {
+        TintKind::Fixed(0xe0c71c)
+    } else if matches!(path, "melon_stem" | "pumpkin_stem") {
+        let age = properties
+            .get("age")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(7);
+        TintKind::Fixed((age * 32) << 16 | (255 - age * 8) << 8 | (age * 4))
+    } else if matches!(path, "pink_petals" | "wildflowers") && tint_index == 1 {
+        TintKind::Grass
+    } else if path == "lily_pad" {
+        TintKind::Fixed(if tint_index == 0 { 0x71c35c } else { 0x207f38 })
+    } else {
+        TintKind::None
+    }
 }
 
 pub(crate) fn rotate_blockstate_corner(
@@ -375,24 +801,82 @@ pub(crate) fn rotate_blockstate_direction(
     direction
 }
 
+#[cfg(test)]
 pub(crate) fn uvlock_quarter_turns(
     direction: Direction,
     x_rotation: u16,
     y_rotation: u16,
 ) -> usize {
-    let source = face_corners([0.0; 3], [1.0; 3], direction);
-    let transformed_first = rotate_blockstate_corner(source[0], x_rotation, y_rotation);
-    let target_direction = rotate_blockstate_direction(direction, x_rotation, y_rotation);
-    let target = face_corners([0.0; 3], [1.0; 3], target_direction);
-    target
+    let [f00, f01, f10, f11] = uvlock_inverse_coefficients(direction, x_rotation, y_rotation);
+    let source_zero = [-1_i8, -1_i8];
+    let transformed_zero = [
+        f00 * source_zero[0] + f10 * source_zero[1],
+        f01 * source_zero[0] + f11 * source_zero[1],
+    ];
+    [[-1, -1], [-1, 1], [1, 1], [1, -1]]
         .iter()
-        .position(|corner| {
-            corner
-                .iter()
-                .zip(transformed_first)
-                .all(|(left, right)| (*left - right).abs() < 1.0e-5)
-        })
+        .position(|corner| *corner == transformed_zero)
         .unwrap_or(0)
+}
+
+pub(crate) fn uvlock_uvs(
+    uvs: [[f32; 2]; 4],
+    direction: Direction,
+    x_rotation: u16,
+    y_rotation: u16,
+) -> [[f32; 2]; 4] {
+    let [f00, f01, f10, f11] = uvlock_inverse_coefficients(direction, x_rotation, y_rotation);
+    uvs.map(|[u, v]| {
+        let centered_u = u - 0.5;
+        let centered_v = v - 0.5;
+        [
+            f32::from(f00) * centered_u + f32::from(f10) * centered_v + 0.5,
+            f32::from(f01) * centered_u + f32::from(f11) * centered_v + 0.5,
+        ]
+    })
+}
+
+fn uvlock_inverse_coefficients(direction: Direction, x_rotation: u16, y_rotation: u16) -> [i8; 4] {
+    let target_direction = rotate_blockstate_direction(direction, x_rotation, y_rotation);
+    let (source_u, source_v) = face_uv_axes(direction);
+    let (target_u, target_v) = face_uv_axes(target_direction);
+    let transformed_u = rotate_blockstate_vector(source_u, x_rotation, y_rotation);
+    let transformed_v = rotate_blockstate_vector(source_v, x_rotation, y_rotation);
+
+    // BlockMath.getFaceTransformation builds target-local * model *
+    // source-local. FaceBakery applies its affine inverse to each UV around
+    // the sprite centre. The orthogonal transform is therefore the transpose
+    // below, not a permutation inferred from transformed geometry corners.
+    let f00 = dot_axis(transformed_u, target_u);
+    let f01 = dot_axis(transformed_v, target_u);
+    let f10 = dot_axis(transformed_u, target_v);
+    let f11 = dot_axis(transformed_v, target_v);
+    [f00, f01, f10, f11]
+}
+
+fn face_uv_axes(direction: Direction) -> ([i8; 3], [i8; 3]) {
+    match direction {
+        Direction::South => ([1, 0, 0], [0, 1, 0]),
+        Direction::East => ([0, 0, -1], [0, 1, 0]),
+        Direction::West => ([0, 0, 1], [0, 1, 0]),
+        Direction::North => ([-1, 0, 0], [0, 1, 0]),
+        Direction::Up => ([1, 0, 0], [0, 0, -1]),
+        Direction::Down => ([1, 0, 0], [0, 0, 1]),
+    }
+}
+
+fn rotate_blockstate_vector(mut vector: [i8; 3], x_rotation: u16, y_rotation: u16) -> [i8; 3] {
+    for _ in 0..(x_rotation / 90) {
+        vector = [vector[0], -vector[2], vector[1]];
+    }
+    for _ in 0..(y_rotation / 90) {
+        vector = [-vector[2], vector[1], vector[0]];
+    }
+    vector
+}
+
+fn dot_axis(left: [i8; 3], right: [i8; 3]) -> i8 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
 }
 
 #[derive(Clone, Debug)]
@@ -447,6 +931,7 @@ struct ModelWire {
     #[serde(default)]
     textures: BTreeMap<String, TextureWire>,
     elements: Option<Vec<ElementWire>>,
+    ambientocclusion: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -502,6 +987,7 @@ struct FaceWire {
 struct ResolvedModel {
     textures: BTreeMap<String, String>,
     elements: Vec<ElementWire>,
+    ambient_occlusion: bool,
 }
 
 struct Loader<'a, S> {
@@ -645,9 +1131,11 @@ impl<'a, S: VanillaResourceSource> Loader<'a, S> {
                     reference.weight,
                     ModelApplication {
                         faces,
+                        solid_boxes: model_solid_boxes(&model),
                         x_rotation: reference.x,
                         y_rotation: reference.y,
                         uvlock: reference.uvlock,
+                        ambient_occlusion: model.ambient_occlusion,
                     },
                 ));
             }
@@ -666,6 +1154,10 @@ impl<'a, S: VanillaResourceSource> Loader<'a, S> {
         Ok(StateModels {
             parts,
             full_opaque_cube,
+            fluid: None,
+            fluid_surface_solid: false,
+            emissive: false,
+            model_offset: ModelOffset::None,
         })
     }
 
@@ -699,8 +1191,12 @@ impl<'a, S: VanillaResourceSource> Loader<'a, S> {
             ResolvedModel {
                 textures: BTreeMap::new(),
                 elements: Vec::new(),
+                ambient_occlusion: true,
             }
         };
+        if let Some(ambient_occlusion) = wire.ambientocclusion {
+            resolved.ambient_occlusion = ambient_occlusion;
+        }
         resolved.textures.extend(
             wire.textures
                 .into_iter()
@@ -723,6 +1219,14 @@ impl<'a, S: VanillaResourceSource> Loader<'a, S> {
     ) -> Result<TextureAtlasData, BlockResourceError> {
         let mut names = BTreeSet::from(["cubic:missing".to_owned()]);
         for state in states.values() {
+            if let Some(fluid) = state.fluid {
+                let prefix = match fluid.kind {
+                    FluidKind::Water => "water",
+                    FluidKind::Lava => "lava",
+                };
+                names.insert(format!("minecraft:block/{prefix}_still"));
+                names.insert(format!("minecraft:block/{prefix}_flow"));
+            }
             for part in &state.parts {
                 for (_, model) in &part.entries {
                     for face in &model.faces {
@@ -734,16 +1238,52 @@ impl<'a, S: VanillaResourceSource> Loader<'a, S> {
         let mut images = BTreeMap::new();
         images.insert("cubic:missing".to_owned(), missing_texture());
         for name in names.iter().filter(|name| name.as_str() != "cubic:missing") {
-            let identifier = parse_identifier(name)?;
-            let path = resource_path(&identifier, "textures", "png")?;
-            let image = self
-                .source
-                .read_resource(&path, MAX_VANILLA_RESOURCE_BYTES)?
-                .and_then(|bytes| decode_png(&bytes).ok())
-                .unwrap_or_else(missing_texture);
-            images.insert(name.clone(), image);
+            images.insert(name.clone(), self.load_texture(name)?);
         }
         pack_atlas(images)
+    }
+
+    fn load_texture(&mut self, name: &str) -> Result<DecodedImage, BlockResourceError> {
+        let identifier = parse_identifier(name)?;
+        let path = resource_path(&identifier, "textures", "png")?;
+        let mut image = self
+            .source
+            .read_resource(&path, MAX_VANILLA_RESOURCE_BYTES)?
+            .and_then(|bytes| decode_png(&bytes).ok())
+            .unwrap_or_else(missing_texture);
+        let metadata_path = resource_path(&identifier, "textures", "png.mcmeta")?;
+        let metadata = self
+            .source
+            .read_resource(&metadata_path, MAX_VANILLA_RESOURCE_BYTES)?;
+        image.animation = decode_texture_metadata(
+            metadata.as_deref(),
+            image.frames.len(),
+            name,
+            metadata_path.as_str(),
+        )?;
+        Ok(image)
+    }
+
+    fn load_colormap(&mut self, name: &str) -> Result<Vec<u32>, BlockResourceError> {
+        let identifier = parse_identifier(name)?;
+        let path = resource_path(&identifier, "textures", "png")?;
+        let bytes = self
+            .source
+            .read_resource(&path, MAX_VANILLA_RESOURCE_BYTES)?
+            .ok_or_else(|| malformed("colormap", name, "resource is missing"))?;
+        let image = decode_png(&bytes)?;
+        if image.width != 256 || image.height != 256 {
+            return Err(malformed("colormap", name, "expected a 256 by 256 image"));
+        }
+        Ok(image
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| {
+                (u32::from(pixel[0]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[2])
+            })
+            .collect())
     }
 }
 
@@ -961,6 +1501,9 @@ fn bake_model(model: &ResolvedModel) -> Result<Vec<ModelFace>, BlockResourceErro
                 },
                 cullface: face.cullface.as_deref().and_then(parse_direction),
                 tint_index: face.tintindex,
+                tint_kind: TintKind::None,
+                render_layer: RenderLayer::Opaque,
+                directional_shade: element.shade,
                 shade: if element.shade {
                     direction_shade(direction)
                 } else {
@@ -970,6 +1513,47 @@ fn bake_model(model: &ResolvedModel) -> Result<Vec<ModelFace>, BlockResourceErro
         }
     }
     Ok(faces)
+}
+
+fn model_solid_boxes(model: &ResolvedModel) -> Vec<[[f32; 3]; 2]> {
+    model
+        .elements
+        .iter()
+        .filter(|element| element.rotation.is_none())
+        .take(MAX_FLUID_OCCLUSION_BOXES)
+        .map(|element| {
+            [
+                element.from.map(|value| value / 16.0),
+                element.to.map(|value| value / 16.0),
+            ]
+        })
+        .collect()
+}
+
+fn box_corners(bounds: [[f32; 3]; 2]) -> [[f32; 3]; 8] {
+    let [min, max] = bounds;
+    [
+        [min[0], min[1], min[2]],
+        [min[0], min[1], max[2]],
+        [min[0], max[1], min[2]],
+        [min[0], max[1], max[2]],
+        [max[0], min[1], min[2]],
+        [max[0], min[1], max[2]],
+        [max[0], max[1], min[2]],
+        [max[0], max[1], max[2]],
+    ]
+}
+
+fn bounds_of_corners(corners: [[f32; 3]; 8]) -> [[f32; 3]; 2] {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for corner in corners {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(corner[axis]);
+            max[axis] = max[axis].max(corner[axis]);
+        }
+    }
+    [min, max]
 }
 
 fn resolve_texture(
@@ -1048,9 +1632,12 @@ fn face_corners(from: [f32; 3], to: [f32; 3], direction: Direction) -> [[f32; 3]
 
 fn generated_uv(from: [f32; 3], to: [f32; 3], direction: Direction) -> [f32; 4] {
     match direction {
-        Direction::Down | Direction::Up => [from[0], from[2], to[0], to[2]],
-        Direction::North | Direction::South => [from[0], 16.0 - to[1], to[0], 16.0 - from[1]],
-        Direction::West | Direction::East => [from[2], 16.0 - to[1], to[2], 16.0 - from[1]],
+        Direction::Down => [from[0], 16.0 - to[2], to[0], 16.0 - from[2]],
+        Direction::Up => [from[0], from[2], to[0], to[2]],
+        Direction::North => [16.0 - to[0], 16.0 - to[1], 16.0 - from[0], 16.0 - from[1]],
+        Direction::South => [from[0], 16.0 - to[1], to[0], 16.0 - from[1]],
+        Direction::West => [from[2], 16.0 - to[1], to[2], 16.0 - from[1]],
+        Direction::East => [16.0 - to[2], 16.0 - to[1], 16.0 - from[2], 16.0 - from[1]],
     }
 }
 
@@ -1098,13 +1685,14 @@ fn rotate_element(
 }
 
 fn direction_shade(direction: Direction) -> f32 {
+    // Java 26.1.2 CardinalLighting defaults. These factors are deliberately
+    // symmetric by axis; the previous asymmetric values made an otherwise
+    // exposed north face substantially darker than its south counterpart.
     match direction {
         Direction::Up => 1.0,
-        Direction::Down => 0.55,
-        Direction::East => 0.85,
-        Direction::West => 0.7,
-        Direction::South => 0.8,
-        Direction::North => 0.65,
+        Direction::Down => 0.5,
+        Direction::North | Direction::South => 0.8,
+        Direction::East | Direction::West => 0.6,
     }
 }
 
@@ -1169,6 +1757,7 @@ fn fallback_state() -> StateModels {
     let model = ResolvedModel {
         textures: BTreeMap::new(),
         elements: vec![element],
+        ambient_occlusion: true,
     };
     let faces = bake_model(&model).unwrap_or_default();
     StateModels {
@@ -1177,14 +1766,20 @@ fn fallback_state() -> StateModels {
                 1,
                 ModelApplication {
                     faces,
+                    solid_boxes: model_solid_boxes(&model),
                     x_rotation: 0,
                     y_rotation: 0,
                     uvlock: false,
+                    ambient_occlusion: true,
                 },
             )],
             total_weight: 1,
         }],
         full_opaque_cube: true,
+        fluid_surface_solid: true,
+        fluid: None,
+        emissive: false,
+        model_offset: ModelOffset::None,
     }
 }
 
@@ -1194,6 +1789,47 @@ struct DecodedImage {
     height: u32,
     rgba: Vec<u8>,
     cutout: bool,
+    frames: Vec<Vec<u8>>,
+    animation: Option<DecodedAnimation>,
+}
+
+impl DecodedImage {
+    fn static_frame(width: u32, height: u32, rgba: Vec<u8>, cutout: bool) -> Self {
+        Self {
+            width,
+            height,
+            frames: vec![rgba.clone()],
+            rgba,
+            cutout,
+            animation: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DecodedAnimation {
+    sequence: Vec<AnimationStep>,
+    interpolate: bool,
+}
+
+#[derive(Deserialize)]
+struct AnimationWire {
+    #[serde(default = "default_frame_time")]
+    frametime: u32,
+    #[serde(default)]
+    interpolate: bool,
+    frames: Option<Vec<AnimationFrameWire>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AnimationFrameWire {
+    Index(u32),
+    Detailed { index: u32, time: Option<u32> },
+}
+
+const fn default_frame_time() -> u32 {
+    1
 }
 
 fn decode_png(bytes: &[u8]) -> Result<DecodedImage, BlockResourceError> {
@@ -1217,10 +1853,14 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, BlockResourceError> {
         .next_frame(&mut output)
         .map_err(|error| malformed("texture", "png", error.to_string()))?;
     let raw = &output[..frame.buffer_size()];
-    let mut rgba = Vec::with_capacity(
-        usize::try_from(frame.width.saturating_mul(frame.width).saturating_mul(4)).unwrap_or(0),
-    );
-    let first_height = frame.width.min(frame.height);
+    let frame_height = frame.width.min(frame.height);
+    if frame.height % frame_height != 0 {
+        return Err(malformed(
+            "texture",
+            "png",
+            "animated texture height is not a multiple of its frame height",
+        ));
+    }
     let channels = match frame.color_type {
         ColorType::Rgba => 4,
         ColorType::Rgb => 3,
@@ -1228,25 +1868,140 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, BlockResourceError> {
         ColorType::Grayscale => 1,
         _ => return Err(malformed("texture", "png", "unsupported color format")),
     };
-    for pixel in raw
-        .chunks_exact(channels)
-        .take(usize::try_from(frame.width * first_height).unwrap_or(0))
-    {
+    let mut decoded = Vec::with_capacity(
+        usize::try_from(frame.width.saturating_mul(frame.height).saturating_mul(4)).unwrap_or(0),
+    );
+    for pixel in raw.chunks_exact(channels) {
         match channels {
-            4 => rgba.extend_from_slice(pixel),
-            3 => rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]),
-            2 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]),
-            1 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], 255]),
+            4 => decoded.extend_from_slice(pixel),
+            3 => decoded.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]),
+            2 => decoded.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]),
+            1 => decoded.extend_from_slice(&[pixel[0], pixel[0], pixel[0], 255]),
             _ => {}
         }
     }
+    let frame_bytes = usize::try_from(frame.width.saturating_mul(frame_height).saturating_mul(4))
+        .map_err(|_| malformed("texture", "png", "frame size overflow"))?;
+    let frames = decoded
+        .chunks_exact(frame_bytes)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let rgba = frames
+        .first()
+        .cloned()
+        .ok_or_else(|| malformed("texture", "png", "texture contains no frames"))?;
     let cutout = rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] < 255);
     Ok(DecodedImage {
         width: frame.width,
-        height: first_height,
+        height: frame_height,
         rgba,
         cutout,
+        frames,
+        animation: None,
     })
+}
+
+fn texture_metadata_error(
+    texture: &str,
+    metadata_path: &str,
+    section: &'static str,
+    reason: impl Into<String>,
+) -> BlockResourceError {
+    BlockResourceError::TextureMetadata {
+        texture: texture.to_owned(),
+        metadata_path: metadata_path.to_owned(),
+        section,
+        reason: reason.into(),
+    }
+}
+
+fn decode_texture_metadata(
+    bytes: Option<&[u8]>,
+    frame_count: usize,
+    texture: &str,
+    metadata_path: &str,
+) -> Result<Option<DecodedAnimation>, BlockResourceError> {
+    const MAX_ANIMATION_STEPS: usize = 1024;
+    const MAX_FRAME_TICKS: u32 = 72_000;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let metadata: serde_json::Map<String, Value> =
+        serde_json::from_slice(bytes).map_err(|error| {
+            texture_metadata_error(texture, metadata_path, "root", error.to_string())
+        })?;
+    let Some(animation) = metadata.get("animation") else {
+        return Ok(None);
+    };
+    let animation: AnimationWire = serde_json::from_value(animation.clone()).map_err(|error| {
+        texture_metadata_error(texture, metadata_path, "animation", error.to_string())
+    })?;
+    let default_ticks = animation.frametime;
+    if default_ticks == 0 || default_ticks > MAX_FRAME_TICKS {
+        return Err(texture_metadata_error(
+            texture,
+            metadata_path,
+            "animation",
+            "frame time is outside the supported bound",
+        ));
+    }
+    let sequence = if let Some(frames) = animation.frames {
+        if frames.is_empty() || frames.len() > MAX_ANIMATION_STEPS {
+            return Err(texture_metadata_error(
+                texture,
+                metadata_path,
+                "animation",
+                "frame sequence is empty or exceeds the supported bound",
+            ));
+        }
+        frames
+            .into_iter()
+            .map(|entry| {
+                let (frame, ticks) = match entry {
+                    AnimationFrameWire::Index(index) => (index, default_ticks),
+                    AnimationFrameWire::Detailed { index, time } => {
+                        (index, time.unwrap_or(default_ticks))
+                    }
+                };
+                let frame = usize::try_from(frame).map_err(|_| {
+                    texture_metadata_error(
+                        texture,
+                        metadata_path,
+                        "animation",
+                        "frame index overflow",
+                    )
+                })?;
+                if frame >= frame_count || ticks == 0 || ticks > MAX_FRAME_TICKS {
+                    return Err(texture_metadata_error(
+                        texture,
+                        metadata_path,
+                        "animation",
+                        "frame index or duration is outside the supported bound",
+                    ));
+                }
+                Ok(AnimationStep { frame, ticks })
+            })
+            .collect::<Result<Vec<_>, BlockResourceError>>()?
+    } else {
+        if frame_count == 0 || frame_count > MAX_ANIMATION_STEPS {
+            return Err(texture_metadata_error(
+                texture,
+                metadata_path,
+                "animation",
+                "implicit frame sequence exceeds the supported bound",
+            ));
+        }
+        (0..frame_count)
+            .map(|frame| AnimationStep {
+                frame,
+                ticks: default_ticks,
+            })
+            .collect()
+    };
+    Ok(Some(DecodedAnimation {
+        sequence,
+        interpolate: animation.interpolate,
+    }))
 }
 
 fn missing_texture() -> DecodedImage {
@@ -1261,12 +2016,7 @@ fn missing_texture() -> DecodedImage {
             rgba.extend_from_slice(&c);
         }
     }
-    DecodedImage {
-        width: 16,
-        height: 16,
-        rgba,
-        cutout: false,
-    }
+    DecodedImage::static_frame(16, 16, rgba, false)
 }
 
 fn pack_atlas(
@@ -1311,6 +2061,7 @@ fn pack_atlas(
         })?;
     let mut rgba = vec![0; len];
     let mut regions = BTreeMap::new();
+    let mut animations = Vec::new();
     for (name, image) in images {
         let (px, py) = placements[&name];
         for atlas_y in (py - ATLAS_GUTTER)..(py + image.height + ATLAS_GUTTER) {
@@ -1335,6 +2086,21 @@ fn pack_atlas(
                 destination.copy_from_slice(source);
             }
         }
+        let layer = if image.cutout {
+            RenderLayer::Cutout
+        } else {
+            RenderLayer::Opaque
+        };
+        if let Some(animation) = image.animation {
+            animations.push(TextureAnimationData {
+                origin: [px, py],
+                width: image.width,
+                height: image.height,
+                frames: image.frames,
+                sequence: animation.sequence,
+                interpolate: animation.interpolate,
+            });
+        }
         regions.insert(
             name,
             AtlasRegion {
@@ -1343,11 +2109,7 @@ fn pack_atlas(
                     (px + image.width) as f32 / width as f32,
                     (py + image.height) as f32 / height as f32,
                 ],
-                layer: if image.cutout {
-                    RenderLayer::Cutout
-                } else {
-                    RenderLayer::Opaque
-                },
+                layer,
             },
         );
     }
@@ -1356,6 +2118,7 @@ fn pack_atlas(
         height,
         rgba,
         regions,
+        animations,
     })
 }
 
@@ -1376,6 +2139,10 @@ mod tests {
     impl MemorySource {
         fn insert(&mut self, path: &str, value: &str) {
             self.0.insert(path.to_owned(), value.as_bytes().to_vec());
+        }
+
+        fn insert_bytes(&mut self, path: &str, value: Vec<u8>) {
+            self.0.insert(path.to_owned(), value);
         }
     }
 
@@ -1401,6 +2168,18 @@ mod tests {
 
     fn identifier(value: &str) -> MinecraftIdentifier {
         parse_identifier(value).unwrap()
+    }
+
+    fn rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut output, width, height);
+            encoder.set_color(ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("PNG header");
+            writer.write_image_data(rgba).expect("PNG pixels");
+        }
+        output
     }
 
     #[test]
@@ -1571,7 +2350,7 @@ mod tests {
         let mut source = MemorySource::default();
         source.insert(
             "assets/minecraft/models/block/test_cross.json",
-            r##"{"textures":{"cross":"minecraft:block/test"},"elements":[{"from":[0.8,0,8],"to":[15.2,16,8],"faces":{"north":{"texture":"#cross"},"south":{"texture":"#cross"}}}]}"##,
+            r##"{"ambientocclusion":false,"textures":{"cross":"minecraft:block/test"},"elements":[{"from":[0.8,0,8],"to":[15.2,16,8],"shade":false,"faces":{"north":{"texture":"#cross"},"south":{"texture":"#cross"}}}]}"##,
         );
         let mut loader = Loader::new(&mut source);
         let resolved = loader
@@ -1579,6 +2358,12 @@ mod tests {
             .unwrap();
         let faces = bake_model(&resolved).unwrap();
         assert_eq!(faces.len(), 2);
+        assert!(!resolved.ambient_occlusion);
+        assert!(
+            faces
+                .iter()
+                .all(|face| !face.directional_shade && face.shade == 1.0)
+        );
 
         let sorted = |mut corners: [[f32; 3]; 4]| {
             corners.sort_by(|left, right| {
@@ -1683,6 +2468,7 @@ mod tests {
                 .map(|(name, value)| (name, value.into_sprite()))
                 .collect(),
             elements: model.elements.unwrap(),
+            ambient_occlusion: true,
         };
         let faces = bake_model(&resolved).unwrap();
         assert_eq!(faces.len(), 1);
@@ -1715,6 +2501,7 @@ mod tests {
                     .map(|(name, value)| (name, value.into_sprite()))
                     .collect(),
                 elements: model.elements.unwrap(),
+                ambient_occlusion: true,
             })
             .unwrap()
             .remove(0)
@@ -1747,12 +2534,7 @@ mod tests {
         }
         let atlas = pack_atlas(BTreeMap::from([(
             "minecraft:block/asymmetric_left_right".to_owned(),
-            DecodedImage {
-                width: 16,
-                height: 16,
-                rgba,
-                cutout: false,
-            },
+            DecodedImage::static_frame(16, 16, rgba, false),
         )]))
         .unwrap();
         let region = atlas.region("minecraft:block/asymmetric_left_right");
@@ -1856,6 +2638,7 @@ mod tests {
                         .map(|(name, value)| (name, value.into_sprite()))
                         .collect(),
                     elements: model.elements.unwrap(),
+                    ambient_occlusion: true,
                 })
                 .unwrap()
                 .remove(0);
@@ -1899,6 +2682,7 @@ mod tests {
                     .map(|(name, value)| (name, value.into_sprite()))
                     .collect(),
                 elements: model.elements.unwrap(),
+                ambient_occlusion: true,
             })
             .unwrap()
             .remove(0);
@@ -1910,16 +2694,16 @@ mod tests {
 
     #[test]
     fn atlas_preserves_asymmetric_top_and_bottom_rows() {
-        let asymmetric = DecodedImage {
-            width: 2,
-            height: 2,
-            rgba: [
+        let asymmetric = DecodedImage::static_frame(
+            2,
+            2,
+            [
                 255, 0, 0, 255, 255, 0, 0, 255, // top row
                 0, 0, 255, 255, 0, 0, 255, 255, // bottom row
             ]
             .to_vec(),
-            cutout: false,
-        };
+            false,
+        );
         let atlas = pack_atlas(BTreeMap::from([
             ("cubic:missing".to_owned(), missing_texture()),
             ("minecraft:block/asymmetric".to_owned(), asymmetric),
@@ -1949,12 +2733,7 @@ mod tests {
             ("cubic:missing".to_owned(), missing_texture()),
             (
                 "minecraft:block/pixel_grid".to_owned(),
-                DecodedImage {
-                    width: 16,
-                    height: 16,
-                    rgba: pixels,
-                    cutout: false,
-                },
+                DecodedImage::static_frame(16, 16, pixels, false),
             ),
         ]))
         .unwrap();
@@ -2028,8 +2807,8 @@ mod tests {
         let model = &mut state.parts[0].entries[0].1;
         model.y_rotation = 90;
         model.uvlock = true;
-        let original_corner = model.faces[0].corners[0];
         let original_uv = model.faces[0].uv;
+        let original_direction = model.faces[0].direction;
         let original_cull = model.faces[0].cullface.unwrap();
 
         prepare_runtime_state(&mut state, &atlas);
@@ -2040,16 +2819,18 @@ mod tests {
             (0, 0, false)
         );
         assert_eq!(
-            model.faces[0].corners[0],
-            rotate_blockstate_corner(original_corner, 0, 90)
+            model.faces[0].corners,
+            face_corners([0.0; 3], [1.0; 3], model.faces[0].direction)
         );
         assert_eq!(
             model.faces[0].cullface,
             Some(rotate_blockstate_direction(original_cull, 0, 90))
         );
-        let mut expected_uv = original_uv;
-        expected_uv.rotate_left(uvlock_quarter_turns(model.faces[0].direction, 0, 90));
-        assert_eq!(model.faces[0].uv, expected_uv);
+        assert_eq!(
+            model.faces[0].direction,
+            rotate_blockstate_direction(original_direction, 0, 90)
+        );
+        assert_eq!(model.faces[0].uv, original_uv);
         assert_eq!(model.faces[0].atlas_region, atlas.region("cubic:missing"));
         assert!(state.full_opaque_cube);
 
@@ -2057,22 +2838,63 @@ mod tests {
         let x_model = &mut x_rotated.parts[0].entries[0].1;
         x_model.x_rotation = 90;
         x_model.uvlock = true;
-        let original_corner = x_model.faces[0].corners[0];
         let original_uv = x_model.faces[0].uv;
+        let original_direction = x_model.faces[0].direction;
         let original_cull = x_model.faces[0].cullface.unwrap();
         prepare_runtime_state(&mut x_rotated, &atlas);
         let x_model = &x_rotated.parts[0].entries[0].1;
-        let mut expected_uv = original_uv;
-        expected_uv.rotate_left(uvlock_quarter_turns(model.faces[0].direction, 90, 0));
-        assert_eq!(x_model.faces[0].uv, expected_uv);
+        assert_eq!(x_model.faces[0].uv, original_uv);
         assert_eq!(
-            x_model.faces[0].corners[0],
-            rotate_blockstate_corner(original_corner, 90, 0)
+            x_model.faces[0].direction,
+            rotate_blockstate_direction(original_direction, 90, 0)
+        );
+        assert_eq!(
+            x_model.faces[0].shade,
+            direction_shade(x_model.faces[0].direction)
+        );
+        assert_eq!(
+            x_model.faces[0].corners,
+            face_corners([0.0; 3], [1.0; 3], x_model.faces[0].direction)
         );
         assert_eq!(
             x_model.faces[0].cullface,
             Some(rotate_blockstate_direction(original_cull, 90, 0))
         );
+    }
+
+    #[test]
+    fn vanilla_directional_shading_is_symmetric_by_horizontal_axis() {
+        assert_eq!(direction_shade(Direction::Up), 1.0);
+        assert_eq!(direction_shade(Direction::Down), 0.5);
+        assert_eq!(direction_shade(Direction::North), 0.8);
+        assert_eq!(direction_shade(Direction::South), 0.8);
+        assert_eq!(direction_shade(Direction::East), 0.6);
+        assert_eq!(direction_shade(Direction::West), 0.6);
+    }
+
+    #[test]
+    fn exact_version_model_offsets_distinguish_short_and_double_height_grass() {
+        assert_eq!(model_offset_26_1_2("short_grass"), ModelOffset::Xyz);
+        assert_eq!(model_offset_26_1_2("fern"), ModelOffset::Xyz);
+        assert_eq!(model_offset_26_1_2("tall_grass"), ModelOffset::Xz);
+        assert_eq!(model_offset_26_1_2("large_fern"), ModelOffset::Xz);
+        assert_eq!(model_offset_26_1_2("stone"), ModelOffset::None);
+    }
+
+    #[test]
+    fn axis_aligned_model_elements_expose_exact_fluid_occlusion_boxes() {
+        let model = ResolvedModel {
+            textures: BTreeMap::new(),
+            elements: vec![ElementWire {
+                from: [0.0, 0.0, 0.0],
+                to: [16.0, 8.0, 16.0],
+                rotation: None,
+                shade: true,
+                faces: BTreeMap::new(),
+            }],
+            ambient_occlusion: true,
+        };
+        assert_eq!(model_solid_boxes(&model), vec![[[0.0; 3], [1.0, 0.5, 1.0]]]);
     }
 
     #[test]
@@ -2140,6 +2962,332 @@ mod tests {
     }
 
     #[test]
+    fn top_half_north_south_stair_surface_uses_affine_inverse_uvlock() {
+        let wire: ModelWire = serde_json::from_value(serde_json::json!({
+            "textures": {"all": "cubic:missing"},
+            "elements": [{
+                "from": [0, 0, 0],
+                "to": [16, 8, 16],
+                "faces": {"down": {"texture": "#all", "uv": [1, 2, 13, 14]}}
+            }]
+        }))
+        .unwrap();
+        let resolved = ResolvedModel {
+            textures: wire
+                .textures
+                .into_iter()
+                .map(|(name, value)| (name, value.into_sprite()))
+                .collect(),
+            elements: wire.elements.unwrap(),
+            ambient_occlusion: true,
+        };
+        let atlas = pack_atlas(BTreeMap::from([(
+            "cubic:missing".to_owned(),
+            missing_texture(),
+        )]))
+        .unwrap();
+        for (facing, y_rotation, expected) in [
+            (
+                "south",
+                90,
+                [
+                    [2.0 / 16.0, 1.0 / 16.0],
+                    [2.0 / 16.0, 13.0 / 16.0],
+                    [14.0 / 16.0, 13.0 / 16.0],
+                    [14.0 / 16.0, 1.0 / 16.0],
+                ],
+            ),
+            (
+                "north",
+                270,
+                [
+                    [2.0 / 16.0, 3.0 / 16.0],
+                    [2.0 / 16.0, 15.0 / 16.0],
+                    [14.0 / 16.0, 15.0 / 16.0],
+                    [14.0 / 16.0, 3.0 / 16.0],
+                ],
+            ),
+        ] {
+            let mut state = StateModels {
+                parts: vec![WeightedApplications {
+                    entries: vec![(
+                        1,
+                        ModelApplication {
+                            faces: bake_model(&resolved).unwrap(),
+                            solid_boxes: model_solid_boxes(&resolved),
+                            x_rotation: 180,
+                            y_rotation,
+                            uvlock: true,
+                            ambient_occlusion: true,
+                        },
+                    )],
+                    total_weight: 1,
+                }],
+                ..StateModels::default()
+            };
+            prepare_runtime_state(&mut state, &atlas);
+            let face = &state.parts[0].entries[0].1.faces[0];
+            assert_eq!(face.direction, Direction::Up, "{facing}");
+            assert!(face.corners.iter().all(|corner| corner[1] == 1.0));
+            assert_eq!(face.uv, expected, "{facing}");
+        }
+    }
+
+    #[test]
+    fn resource_backed_top_stair_uses_inverse_face_transform_for_every_facing() {
+        let mut source = MemorySource::default();
+        // Minimal independently authored fixture with the same relevant shape
+        // as the 26.1.2 straight-stair resource: top-half states rotate a
+        // source Down face through X=180 and a facing-specific Y transform.
+        source.insert(
+            "assets/minecraft/blockstates/test_stairs.json",
+            r#"{"variants":{"facing=east,half=top,shape=straight":{"model":"block/test_stairs","x":180,"uvlock":true},"facing=south,half=top,shape=straight":{"model":"block/test_stairs","x":180,"y":90,"uvlock":true},"facing=west,half=top,shape=straight":{"model":"block/test_stairs","x":180,"y":180,"uvlock":true},"facing=north,half=top,shape=straight":{"model":"block/test_stairs","x":180,"y":270,"uvlock":true}}}"#,
+        );
+        source.insert(
+            "assets/minecraft/models/block/test_stairs.json",
+            r##"{"textures":{"top":"minecraft:block/test"},"elements":[{"from":[0,0,0],"to":[16,8,16],"faces":{"down":{"texture":"#top","uv":[1,2,13,14]}}}]}"##,
+        );
+        let atlas = pack_atlas(BTreeMap::from([(
+            "minecraft:block/test".to_owned(),
+            missing_texture(),
+        )]))
+        .unwrap();
+        let mut loader = Loader::new(&mut source);
+        let definition = loader
+            .load_blockstate(&identifier("minecraft:test_stairs"))
+            .unwrap();
+
+        for (facing, expected) in [
+            (
+                "east",
+                [
+                    [1.0 / 16.0, 2.0 / 16.0],
+                    [1.0 / 16.0, 14.0 / 16.0],
+                    [13.0 / 16.0, 14.0 / 16.0],
+                    [13.0 / 16.0, 2.0 / 16.0],
+                ],
+            ),
+            (
+                "south",
+                [
+                    [2.0 / 16.0, 1.0 / 16.0],
+                    [2.0 / 16.0, 13.0 / 16.0],
+                    [14.0 / 16.0, 13.0 / 16.0],
+                    [14.0 / 16.0, 1.0 / 16.0],
+                ],
+            ),
+            (
+                "west",
+                [
+                    [3.0 / 16.0, 2.0 / 16.0],
+                    [3.0 / 16.0, 14.0 / 16.0],
+                    [15.0 / 16.0, 14.0 / 16.0],
+                    [15.0 / 16.0, 2.0 / 16.0],
+                ],
+            ),
+            (
+                "north",
+                [
+                    [2.0 / 16.0, 3.0 / 16.0],
+                    [2.0 / 16.0, 15.0 / 16.0],
+                    [14.0 / 16.0, 15.0 / 16.0],
+                    [14.0 / 16.0, 3.0 / 16.0],
+                ],
+            ),
+        ] {
+            let mut state = loader
+                .resolve_state(
+                    &definition,
+                    &BTreeMap::from([
+                        ("facing".to_owned(), facing.to_owned()),
+                        ("half".to_owned(), "top".to_owned()),
+                        ("shape".to_owned(), "straight".to_owned()),
+                    ]),
+                )
+                .unwrap();
+            prepare_runtime_state(&mut state, &atlas);
+            let face = &state.parts[0].entries[0].1.faces[0];
+            assert_eq!(face.direction, Direction::Up, "{facing}");
+            assert_eq!(face.uv, expected, "{facing}");
+        }
+    }
+
+    #[test]
+    fn resource_backed_inner_stair_fluid_keeps_its_exposed_internal_sides() {
+        use std::sync::Arc;
+
+        use cubic_world::{
+            Chunk, ChunkCoordinate, ChunkLightSummary, ChunkSection, DimensionGeometry,
+            PalettedContainer, RuntimeBiomeId,
+        };
+
+        // Independently authored minimal resource fixture for the geometry and
+        // exact property selection used by 26.1.2 runtime state 3981:
+        // oak_stairs[facing=east,half=bottom,shape=inner_right,waterlogged=true].
+        // The lower slab plus two upper arms leave only the upper north-west
+        // quarter available to the contained source fluid.
+        let mut source = MemorySource::default();
+        source.insert(
+            "assets/minecraft/blockstates/test_inner_stairs.json",
+            r#"{"variants":{"facing=east,half=bottom,shape=inner_right,waterlogged=true":{"model":"block/test_inner_stairs"},"facing=west,half=bottom,shape=inner_right,waterlogged=true":{"model":"block/test_inner_stairs","y":180,"uvlock":true}}}"#,
+        );
+        source.insert(
+            "assets/minecraft/models/block/test_inner_stairs.json",
+            r##"{"textures":{"all":"block/test"},"elements":[{"from":[0,0,0],"to":[16,8,16],"faces":{"up":{"texture":"#all"}}},{"from":[8,8,0],"to":[16,16,16],"faces":{"west":{"texture":"#all"}}},{"from":[0,8,8],"to":[8,16,16],"faces":{"north":{"texture":"#all"}}}]}"##,
+        );
+        let mut loader = Loader::new(&mut source);
+        let definition = loader
+            .load_blockstate(&identifier("minecraft:test_inner_stairs"))
+            .unwrap();
+        let mut inner_stair = loader
+            .resolve_state(
+                &definition,
+                &BTreeMap::from([
+                    ("facing".to_owned(), "east".to_owned()),
+                    ("half".to_owned(), "bottom".to_owned()),
+                    ("shape".to_owned(), "inner_right".to_owned()),
+                    ("waterlogged".to_owned(), "true".to_owned()),
+                ]),
+            )
+            .unwrap();
+        inner_stair.fluid = Some(FluidState {
+            kind: FluidKind::Water,
+            level: 0,
+            falling: false,
+        });
+        let mut mirrored_stair = loader
+            .resolve_state(
+                &definition,
+                &BTreeMap::from([
+                    ("facing".to_owned(), "west".to_owned()),
+                    ("half".to_owned(), "bottom".to_owned()),
+                    ("shape".to_owned(), "inner_right".to_owned()),
+                    ("waterlogged".to_owned(), "true".to_owned()),
+                ]),
+            )
+            .unwrap();
+        mirrored_stair.fluid = inner_stair.fluid;
+
+        let mut resources = BlockResources::synthetic([RuntimeBlockStateId(0)]);
+        prepare_runtime_state(&mut inner_stair, &resources.atlas);
+        prepare_runtime_state(&mut mirrored_stair, &resources.atlas);
+        let selected = &inner_stair.parts[0].entries[0].1;
+        assert_eq!(
+            selected.solid_boxes,
+            vec![
+                [[0.0, 0.0, 0.0], [1.0, 0.5, 1.0]],
+                [[0.5, 0.5, 0.0], [1.0, 1.0, 1.0]],
+                [[0.0, 0.5, 0.5], [0.5, 1.0, 1.0]],
+            ]
+        );
+        resources.states.resize_with(3982, || None);
+        resources.states[3981] = Some(inner_stair);
+        resources.states[3980] = Some(mirrored_stair);
+        resources.states[86] = Some(StateModels {
+            fluid: Some(FluidState {
+                kind: FluidKind::Water,
+                level: 0,
+                falling: false,
+            }),
+            ..StateModels::default()
+        });
+
+        let mut states = vec![RuntimeBlockStateId(0); 4096];
+        let index = |x: usize, y: usize, z: usize| y * 256 + z * 16 + x;
+        states[index(1, 1, 1)] = RuntimeBlockStateId(3981);
+        // Match the live control: shared fluid suppresses the outer north and
+        // west faces, while the clipped cavity still owns south/east internal
+        // boundaries against the stair arms.
+        states[index(1, 1, 0)] = RuntimeBlockStateId(86);
+        states[index(0, 1, 1)] = RuntimeBlockStateId(86);
+        states[index(4, 1, 4)] = RuntimeBlockStateId(3980);
+        states[index(4, 1, 5)] = RuntimeBlockStateId(86);
+        states[index(5, 1, 4)] = RuntimeBlockStateId(86);
+        let coordinate = ChunkCoordinate::new(0, 0);
+        let chunks = BTreeMap::from([(
+            coordinate,
+            Arc::new(Chunk {
+                coordinate,
+                sections: vec![ChunkSection {
+                    non_empty_block_count: 6,
+                    fluid_count: 6,
+                    blocks: PalettedContainer::Direct { values: states },
+                    biomes: PalettedContainer::Single {
+                        value: RuntimeBiomeId(0),
+                        entries: 64,
+                    },
+                }],
+                heightmaps: Vec::new(),
+                block_entities: Vec::new(),
+                light: ChunkLightSummary::default(),
+            }),
+        )]);
+        let mesh = crate::mesher::mesh_chunk(
+            coordinate,
+            &chunks,
+            DimensionGeometry {
+                min_y: 0,
+                height: 16,
+            },
+            &resources,
+        )
+        .unwrap();
+        let (vertex_quads, remainder) = mesh.vertices.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        let fluid_quads = vertex_quads
+            .iter()
+            .filter(|quad| quad.iter().all(|vertex| vertex.layer & 0xff == 2))
+            .collect::<Vec<_>>();
+        let approximately = |left: f32, right: f32| (left - right).abs() < 1.0e-5;
+        let south = fluid_quads.iter().find(|quad| {
+            quad.iter()
+                .all(|vertex| approximately(vertex.position[2], 1.5 - 0.001))
+                && quad.iter().all(|vertex| vertex.position[0] <= 1.5 + 1.0e-6)
+                && quad.iter().all(|vertex| vertex.position[1] >= 1.5 - 1.0e-6)
+        });
+        let east = fluid_quads.iter().find(|quad| {
+            quad.iter()
+                .all(|vertex| approximately(vertex.position[0], 1.5 - 0.001))
+                && quad.iter().all(|vertex| vertex.position[2] <= 1.5 + 1.0e-6)
+                && quad.iter().all(|vertex| vertex.position[1] >= 1.5 - 1.0e-6)
+        });
+        assert!(
+            south.is_some(),
+            "the retained fluid quarter needs its south wall"
+        );
+        assert!(
+            east.is_some(),
+            "the retained fluid quarter needs its east wall"
+        );
+        assert!(!fluid_quads.iter().any(|quad| {
+            quad.iter()
+                .all(|vertex| approximately(vertex.position[2], 2.0 - 0.001))
+                && quad.iter().all(|vertex| vertex.position[0] <= 1.5 + 1.0e-6)
+                && quad.iter().all(|vertex| vertex.position[1] >= 1.5 - 1.0e-6)
+        }));
+        assert!(!fluid_quads.iter().any(|quad| {
+            quad.iter()
+                .all(|vertex| approximately(vertex.position[0], 2.0 - 0.001))
+                && quad.iter().all(|vertex| vertex.position[2] <= 1.5 + 1.0e-6)
+                && quad.iter().all(|vertex| vertex.position[1] >= 1.5 - 1.0e-6)
+        }));
+        let mirrored_north = fluid_quads.iter().find(|quad| {
+            quad.iter()
+                .all(|vertex| approximately(vertex.position[2], 4.5 + 0.001))
+                && quad.iter().all(|vertex| vertex.position[0] >= 4.5 - 1.0e-6)
+                && quad.iter().all(|vertex| vertex.position[1] >= 1.5 - 1.0e-6)
+        });
+        let mirrored_west = fluid_quads.iter().find(|quad| {
+            quad.iter()
+                .all(|vertex| approximately(vertex.position[0], 4.5 + 0.001))
+                && quad.iter().all(|vertex| vertex.position[2] >= 4.5 - 1.0e-6)
+                && quad.iter().all(|vertex| vertex.position[1] >= 1.5 - 1.0e-6)
+        });
+        assert!(mirrored_north.is_some());
+        assert!(mirrored_west.is_some());
+    }
+
+    #[test]
     fn official_door_blockstate_rotations_keep_thin_model_inside_the_cell() {
         let base_corners = [
             [0.0, 0.0, 0.0],
@@ -2184,12 +3332,7 @@ mod tests {
 
     #[test]
     fn atlas_packing_is_deterministic_guttered_and_classifies_alpha() {
-        let opaque = DecodedImage {
-            width: 2,
-            height: 2,
-            rgba: vec![255; 16],
-            cutout: false,
-        };
+        let opaque = DecodedImage::static_frame(2, 2, vec![255; 16], false);
         let mut alpha = opaque.clone();
         alpha.cutout = true;
         alpha.rgba[3] = 0;
@@ -2214,12 +3357,7 @@ mod tests {
     #[test]
     fn malformed_and_oversized_pngs_are_rejected() {
         assert!(decode_png(b"not png").is_err());
-        let oversized = DecodedImage {
-            width: MAX_ATLAS_SIDE,
-            height: MAX_ATLAS_SIDE,
-            rgba: vec![],
-            cutout: false,
-        };
+        let oversized = DecodedImage::static_frame(MAX_ATLAS_SIDE, MAX_ATLAS_SIDE, vec![], false);
         assert!(
             pack_atlas(BTreeMap::from([
                 ("cubic:missing".to_owned(), missing_texture()),
@@ -2227,5 +3365,224 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn animation_metadata_supports_default_and_explicit_bounded_sequences() {
+        let default = decode_texture_metadata(
+            Some(br#"{"animation":{"frametime":2}}"#),
+            3,
+            "minecraft:block/test",
+            "assets/minecraft/textures/block/test.png.mcmeta",
+        )
+        .expect("default animation")
+        .expect("animation section");
+        assert_eq!(
+            default.sequence,
+            vec![
+                AnimationStep { frame: 0, ticks: 2 },
+                AnimationStep { frame: 1, ticks: 2 },
+                AnimationStep { frame: 2, ticks: 2 },
+            ]
+        );
+        assert!(!default.interpolate);
+
+        let explicit = decode_texture_metadata(
+            Some(br#"{"animation":{"frametime":4,"interpolate":true,"frames":[2,{"index":0,"time":7},1]}}"#),
+            3,
+            "minecraft:block/test",
+            "assets/minecraft/textures/block/test.png.mcmeta",
+        )
+        .expect("explicit animation")
+        .expect("animation section");
+        assert_eq!(
+            explicit.sequence,
+            vec![
+                AnimationStep { frame: 2, ticks: 4 },
+                AnimationStep { frame: 0, ticks: 7 },
+                AnimationStep { frame: 1, ticks: 4 },
+            ]
+        );
+        assert!(explicit.interpolate);
+    }
+
+    #[test]
+    fn texture_metadata_distinguishes_absent_unrelated_and_animation_sections() {
+        let texture = "minecraft:block/test";
+        let path = "assets/minecraft/textures/block/test.png.mcmeta";
+        assert!(
+            decode_texture_metadata(None, 2, texture, path)
+                .expect("no metadata")
+                .is_none()
+        );
+        assert!(
+            decode_texture_metadata(
+                Some(br#"{"texture":{"mipmap_strategy":"dark_cutout"}}"#),
+                2,
+                texture,
+                path,
+            )
+            .expect("texture-only metadata")
+            .is_none()
+        );
+        assert!(
+            decode_texture_metadata(
+                Some(br#"{"future_section":{"enabled":true}}"#),
+                2,
+                texture,
+                path,
+            )
+            .expect("unknown unrelated metadata")
+            .is_none()
+        );
+
+        let combined = decode_texture_metadata(
+            Some(br#"{"animation":{"frametime":3},"texture":{"mipmap_strategy":"dark_cutout"}}"#),
+            2,
+            texture,
+            path,
+        )
+        .expect("combined metadata")
+        .expect("animation section");
+        assert_eq!(combined.sequence[0], AnimationStep { frame: 0, ticks: 3 });
+    }
+
+    #[test]
+    fn vanilla_dark_cutout_texture_metadata_is_static_not_malformed() {
+        let metadata = br#"{
+  "texture": {
+    "mipmap_strategy": "dark_cutout"
+  }
+}"#;
+        assert!(
+            decode_texture_metadata(
+                Some(metadata),
+                1,
+                "minecraft:block/acacia_leaves",
+                "assets/minecraft/textures/block/acacia_leaves.png.mcmeta",
+            )
+            .expect("official texture-only metadata shape")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resource_texture_loading_accepts_missing_and_non_animation_metadata() {
+        let texture_path = "assets/minecraft/textures/block/test.png";
+        let metadata_path = "assets/minecraft/textures/block/test.png.mcmeta";
+        let png = rgba_png(1, 1, &[10, 20, 30, 255]);
+
+        let mut without_metadata = MemorySource::default();
+        without_metadata.insert_bytes(texture_path, png.clone());
+        let image = Loader::new(&mut without_metadata)
+            .load_texture("minecraft:block/test")
+            .expect("texture without metadata");
+        assert!(image.animation.is_none());
+
+        let mut texture_only = MemorySource::default();
+        texture_only.insert_bytes(texture_path, png);
+        texture_only.insert(
+            metadata_path,
+            r#"{"texture":{"mipmap_strategy":"dark_cutout"}}"#,
+        );
+        let image = Loader::new(&mut texture_only)
+            .load_texture("minecraft:block/test")
+            .expect("texture with unrelated metadata");
+        assert!(image.animation.is_none());
+    }
+
+    #[test]
+    fn exact_resource_adapter_classifies_opaque_cutout_and_translucent_materials() {
+        assert_eq!(render_layer_26_1_2("stone"), RenderLayer::Opaque);
+        assert_eq!(render_layer_26_1_2("short_grass"), RenderLayer::Cutout);
+        assert_eq!(render_layer_26_1_2("glass"), RenderLayer::Translucent);
+        assert_eq!(render_layer_26_1_2("water"), RenderLayer::Translucent);
+        assert_eq!(
+            render_layer_26_1_2("honey_block"),
+            RenderLayer::LayeredTranslucent
+        );
+        assert_eq!(render_layer_26_1_2("scaffolding"), RenderLayer::Cutout);
+        let empty = BTreeMap::new();
+        assert_eq!(tint_kind_26_1_2("grass_block", &empty, 0), TintKind::Grass);
+        assert_eq!(tint_kind_26_1_2("oak_leaves", &empty, 0), TintKind::Foliage);
+        assert_eq!(tint_kind_26_1_2("water", &empty, 0), TintKind::Water);
+        assert_eq!(
+            tint_kind_26_1_2("leaf_litter", &empty, 0),
+            TintKind::DryFoliage
+        );
+        let age = BTreeMap::from([("age".to_owned(), "7".to_owned())]);
+        assert_eq!(
+            tint_kind_26_1_2("melon_stem", &age, 0),
+            TintKind::Fixed(0xe0c71c)
+        );
+        assert_eq!(
+            tint_kind_26_1_2("attached_pumpkin_stem", &empty, 0),
+            TintKind::Fixed(0xe0c71c)
+        );
+        assert_eq!(render_layer_26_1_2("seagrass"), RenderLayer::Cutout);
+    }
+
+    #[test]
+    fn honey_model_faces_keep_the_exact_version_layered_translucent_policy() {
+        let mut models = fallback_state();
+        apply_state_semantics(
+            &mut models,
+            "minecraft:honey_block",
+            &BTreeMap::new(),
+            cubic_world::BlockEnvironment::default(),
+            &CollisionShape::FullCube,
+        );
+        let atlas = pack_atlas(BTreeMap::from([(
+            "cubic:missing".to_owned(),
+            missing_texture(),
+        )]))
+        .unwrap();
+        prepare_runtime_state(&mut models, &atlas);
+        assert!(models.parts.iter().all(|part| {
+            part.entries.iter().all(|(_, model)| {
+                model
+                    .faces
+                    .iter()
+                    .all(|face| face.render_layer == RenderLayer::LayeredTranslucent)
+            })
+        }));
+        assert!(!models.full_opaque_cube);
+    }
+
+    #[test]
+    fn fluid_surface_solid_projection_uses_collision_bounds_not_visual_opacity() {
+        assert!(legacy_solid_shape(&CollisionShape::FullCube));
+        assert!(!legacy_solid_shape(&CollisionShape::Empty));
+        assert!(legacy_solid_shape(&CollisionShape::Boxes(
+            std::sync::Arc::from([cubic_world::Aabb::new(
+                cubic_world::Vec3d::new(0.0, 0.0, 0.0),
+                cubic_world::Vec3d::new(1.0, 0.5, 1.0),
+            )])
+        )));
+        assert!(!legacy_solid_shape(&CollisionShape::Boxes(
+            std::sync::Arc::from([cubic_world::Aabb::new(
+                cubic_world::Vec3d::new(0.0, 0.0, 0.0),
+                cubic_world::Vec3d::new(1.0, 1.0 / 16.0, 1.0),
+            )])
+        )));
+    }
+
+    #[test]
+    fn malformed_animation_metadata_is_rejected_before_atlas_use() {
+        let texture = "minecraft:block/test";
+        let path = "assets/minecraft/textures/block/test.png.mcmeta";
+        for metadata in [
+            br#"{"animation":{"frametime":0}}"#.as_slice(),
+            br#"{"animation":{"frames":[3]}}"#.as_slice(),
+            br#"{"animation":{"frames":[]}}"#.as_slice(),
+            br#"{"animation":"invalid"}"#.as_slice(),
+        ] {
+            let error = decode_texture_metadata(Some(metadata), 2, texture, path)
+                .expect_err("malformed animation must fail");
+            let message = error.to_string();
+            assert!(message.contains(texture));
+            assert!(message.contains(path));
+            assert!(message.contains("animation"));
+        }
     }
 }

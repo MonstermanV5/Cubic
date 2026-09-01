@@ -66,6 +66,14 @@ pub struct WireLightData {
     pub empty_block_mask: Vec<u64>,
     pub sky_layer_count: usize,
     pub block_layer_count: usize,
+    pub sky_layers: Vec<WireLightLayer>,
+    pub block_layers: Vec<WireLightLayer>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WireLightLayer {
+    pub mask_index: usize,
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -501,15 +509,17 @@ fn decode_light_data(reader: &mut CodecReader<'_>) -> Result<WireLightData, Chun
     let empty_block = reader.read_bitset(limits)?;
     validate_disjoint("sky", sky.words(), empty_sky.words())?;
     validate_disjoint("block", block.words(), empty_block.words())?;
-    let sky_layers = decode_light_layers(reader, "sky", count_bits(sky.words()))?;
-    let block_layers = decode_light_layers(reader, "block", count_bits(block.words()))?;
+    let sky_layers = decode_light_layers(reader, "sky", sky.words())?;
+    let block_layers = decode_light_layers(reader, "block", block.words())?;
     Ok(WireLightData {
         sky_mask: sky.words().to_vec(),
         block_mask: block.words().to_vec(),
         empty_sky_mask: empty_sky.words().to_vec(),
         empty_block_mask: empty_block.words().to_vec(),
-        sky_layer_count: sky_layers,
-        block_layer_count: block_layers,
+        sky_layer_count: sky_layers.len(),
+        block_layer_count: block_layers.len(),
+        sky_layers,
+        block_layers,
     })
 }
 
@@ -535,8 +545,9 @@ fn count_bits(words: &[u64]) -> usize {
 fn decode_light_layers(
     reader: &mut CodecReader<'_>,
     kind: &'static str,
-    expected: usize,
-) -> Result<usize, ChunkDecodeError> {
+    mask: &[u64],
+) -> Result<Vec<WireLightLayer>, ChunkDecodeError> {
+    let expected = count_bits(mask);
     let count = read_count(reader, "light layer", MAX_LIGHT_LAYERS)?;
     if count != expected {
         return Err(ChunkDecodeError::LightLayerCount {
@@ -545,7 +556,8 @@ fn decode_light_layers(
             layers: count,
         });
     }
-    for _ in 0..count {
+    let mut layers = Vec::with_capacity(count);
+    for mask_index in set_bit_indices(mask) {
         let bytes = reader.read_byte_array(LIGHT_LAYER_BYTES)?;
         if bytes.len() != LIGHT_LAYER_BYTES {
             return Err(ChunkDecodeError::LightLayerLength {
@@ -554,8 +566,18 @@ fn decode_light_layers(
                 expected: LIGHT_LAYER_BYTES,
             });
         }
+        layers.push(WireLightLayer {
+            mask_index,
+            data: bytes.to_vec(),
+        });
     }
-    Ok(count)
+    Ok(layers)
+}
+
+fn set_bit_indices(words: &[u64]) -> impl Iterator<Item = usize> + '_ {
+    words.iter().enumerate().flat_map(|(word_index, word)| {
+        (0..64).filter_map(move |bit| (word & (1_u64 << bit) != 0).then_some(word_index * 64 + bit))
+    })
 }
 
 #[cfg(test)]

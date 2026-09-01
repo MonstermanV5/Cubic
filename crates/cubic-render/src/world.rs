@@ -21,7 +21,11 @@ use wgpu::{
 
 use crate::{
     BlockResources,
-    mesher::{ChunkMesh, MeshStatistics, TerrainVertex, mesh_chunk},
+    block_resources::TextureAnimationData,
+    mesher::{
+        ChunkMesh, FLUID_DEBUG_LOG_CELL_BUDGET, FluidDebugOptions, MeshStatistics, TerrainVertex,
+        log_fluid_mesh_diagnostics, mesh_chunk_with_debug,
+    },
 };
 
 const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
@@ -32,16 +36,28 @@ const MESH_INTEGRATION_TIME_BUDGET: Duration = Duration::from_millis(4);
 const _: () = assert!(MAX_MESH_RESULTS_PER_PREPARE < MAX_PENDING_MESH_JOBS);
 const SIMULATION_TICK: Duration = Duration::from_millis(50);
 const TERRAIN_CULL_MODE: Option<Face> = Some(Face::Back);
+const ATLAS_MAG_FILTER: FilterMode = FilterMode::Nearest;
+const ATLAS_MIN_FILTER: FilterMode = FilterMode::Linear;
+const ATLAS_CUTOUT_MIN_FILTER: FilterMode = FilterMode::Nearest;
+const SOLID_DEPTH_COMPARE: CompareFunction = CompareFunction::LessEqual;
+const TRANSLUCENT_DEPTH_COMPARE: CompareFunction = CompareFunction::LessEqual;
+const TRANSLUCENT_DEPTH_WRITE: bool = true;
+const LAYERED_TRANSLUCENT_DEPTH_WRITE: bool = false;
 
 pub(crate) struct WorldRenderer {
     pipeline: RenderPipeline,
+    translucent_pipeline: RenderPipeline,
+    layered_translucent_pipeline: RenderPipeline,
     camera_buffer: Buffer,
     camera_bind_group: BindGroup,
     atlas_bind_group: BindGroup,
-    _atlas_texture: Texture,
+    atlas_texture: Texture,
+    animations: Vec<TextureAnimationRuntime>,
+    animation_started: Instant,
     depth: DepthTarget,
     meshes: BTreeMap<ChunkCoordinate, GpuChunkMesh>,
     chunks: BTreeMap<ChunkCoordinate, Arc<Chunk>>,
+    biomes: Arc<[cubic_world::RuntimeBiome]>,
     dirty: BTreeMap<ChunkCoordinate, u64>,
     pending: BTreeSet<ChunkCoordinate>,
     generation: u64,
@@ -62,6 +78,16 @@ impl WorldRenderer {
         height: u32,
         mut resources: BlockResources,
     ) -> Self {
+        let fluid_debug = FluidDebugOptions::from_environment();
+        if fluid_debug.face_colors || fluid_debug.mesh_log {
+            tracing::warn!(
+                face_colors = fluid_debug.face_colors,
+                mesh_log = fluid_debug.mesh_log,
+                radius = fluid_debug.radius,
+                maximum_logged_cells = FLUID_DEBUG_LOG_CELL_BUDGET,
+                "temporary bounded fluid diagnostics enabled"
+            );
+        }
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("Cubic diagnostic terrain shader"),
             source: ShaderSource::Wgsl(include_str!("world.wgsl").into()),
@@ -129,9 +155,23 @@ impl WorldRenderer {
         resources.atlas.rgba.shrink_to_fit();
         let atlas_view = atlas_texture.create_view(&TextureViewDescriptor::default());
         let atlas_sampler = device.create_sampler(&SamplerDescriptor {
-            label: Some("Cubic nearest block sampler"),
-            mag_filter: FilterMode::Nearest,
-            min_filter: FilterMode::Nearest,
+            label: Some("Cubic pixel-art block sampler"),
+            mag_filter: ATLAS_MAG_FILTER,
+            // Preserve nearest magnification for pixel art while allowing
+            // minified terrain to filter rather than shimmer like a sharpened
+            // full-resolution atlas. Mip generation remains a later bounded
+            // atlas enhancement.
+            min_filter: ATLAS_MIN_FILTER,
+            mipmap_filter: MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let cutout_atlas_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("Cubic cutout pixel-art block sampler"),
+            mag_filter: ATLAS_MAG_FILTER,
+            // Linear minification averages narrow opaque texels with their
+            // transparent neighbours before the alpha test. At oblique angles
+            // that erases or darkens scaffolding nets and similar cutouts.
+            min_filter: ATLAS_CUTOUT_MIN_FILTER,
             mipmap_filter: MipmapFilterMode::Nearest,
             ..Default::default()
         });
@@ -154,6 +194,12 @@ impl WorldRenderer {
                     ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let atlas_bind_group = device.create_bind_group(&BindGroupDescriptor {
@@ -167,6 +213,10 @@ impl WorldRenderer {
                 BindGroupEntry {
                     binding: 1,
                     resource: BindingResource::Sampler(&atlas_sampler),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&cutout_atlas_sampler),
                 },
             ],
         });
@@ -211,7 +261,10 @@ impl WorldRenderer {
             depth_stencil: Some(DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(CompareFunction::Less),
+                // Vanilla models may deliberately layer coplanar cutout faces
+                // (grass side base + tinted overlay). Equal-depth fragments
+                // must reach the later overlay instead of being discarded.
+                depth_compare: Some(SOLID_DEPTH_COMPARE),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
@@ -219,15 +272,116 @@ impl WorldRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let translucent_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Cubic translucent terrain pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(VertexBufferLayout {
+                    array_stride: size_of::<TerrainVertex>() as BufferAddress,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x3, 3 => Uint32],
+                })],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: surface_format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: TERRAIN_CULL_MODE,
+                front_face: FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: DEPTH_FORMAT,
+                // Java 26.1.2 TRANSLUCENT_TERRAIN inherits the default
+                // LESS_EQUAL, depth-writing terrain state. Without depth
+                // writes, farther reverse-facing fluid boundaries remain
+                // visible through the nearer water surface.
+                depth_write_enabled: Some(TRANSLUCENT_DEPTH_WRITE),
+                depth_compare: Some(TRANSLUCENT_DEPTH_COMPARE),
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let layered_translucent_pipeline =
+            device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("Cubic layered translucent terrain pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    buffers: &[Some(VertexBufferLayout {
+                        array_stride: size_of::<TerrainVertex>() as BufferAddress,
+                        step_mode: VertexStepMode::Vertex,
+                        attributes: &vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x3, 3 => Uint32],
+                    })],
+                },
+                fragment: Some(FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    targets: &[Some(ColorTargetState {
+                        format: surface_format,
+                        blend: Some(BlendState::ALPHA_BLENDING),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    cull_mode: TERRAIN_CULL_MODE,
+                    front_face: FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    // Nested translucent model shells need all layers blended.
+                    // Vanilla achieves this with per-quad translucent sorting;
+                    // Cubic's explicit compatibility material keeps depth
+                    // testing while the general sorter remains deferred.
+                    depth_write_enabled: Some(LAYERED_TRANSLUCENT_DEPTH_WRITE),
+                    depth_compare: Some(TRANSLUCENT_DEPTH_COMPARE),
+                    stencil: StencilState::default(),
+                    bias: DepthBiasState::default(),
+                }),
+                multisample: MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        let animations = resources
+            .atlas
+            .animations
+            .iter()
+            .cloned()
+            .map(TextureAnimationRuntime::new)
+            .collect();
         Self {
             pipeline,
+            translucent_pipeline,
+            layered_translucent_pipeline,
             camera_buffer,
             camera_bind_group,
             atlas_bind_group,
-            _atlas_texture: atlas_texture,
+            atlas_texture,
+            animations,
+            animation_started: Instant::now(),
             depth: DepthTarget::new(device, width, height),
             meshes: BTreeMap::new(),
             chunks: BTreeMap::new(),
+            biomes: Arc::from([]),
             dirty: BTreeMap::new(),
             pending: BTreeSet::new(),
             generation: 0,
@@ -235,7 +389,7 @@ impl WorldRenderer {
             geometry: None,
             dimension: None,
             pose: None,
-            worker: MeshWorker::new(resources, device.clone()),
+            worker: MeshWorker::new(resources, device.clone(), fluid_debug),
             progress: MeshProgress::new(),
         }
     }
@@ -264,6 +418,9 @@ impl WorldRenderer {
         }
         self.dimension = update.dimension.or_else(|| self.dimension.take());
         self.geometry = update.geometry.or(self.geometry);
+        if let Some(biomes) = update.biomes {
+            self.biomes = biomes;
+        }
         if let Some(sample) = update.pose {
             if let Some(presentation) = &mut self.pose {
                 presentation.apply(sample);
@@ -299,6 +456,10 @@ impl WorldRenderer {
     }
 
     pub(crate) fn prepare(&mut self, _device: &Device, queue: &Queue, width: u32, height: u32) {
+        let elapsed = self.animation_started.elapsed();
+        for animation in &mut self.animations {
+            animation.update(queue, &self.atlas_texture, elapsed);
+        }
         let started = Instant::now();
         let integration_started = Instant::now();
         let mut integrated = 0;
@@ -389,8 +550,17 @@ impl WorldRenderer {
                 coordinate,
                 chunks: local_chunks,
                 geometry,
+                biomes: Arc::clone(&self.biomes),
                 generation: self.generation,
                 revision,
+                debug_origin: self.pose.map(|pose| {
+                    let pose = pose.current;
+                    [
+                        pose.x.floor() as i32,
+                        pose.y.floor() as i32,
+                        pose.z.floor() as i32,
+                    ]
+                }),
             };
             if worker.try_send(job) {
                 self.pending.insert(coordinate);
@@ -417,9 +587,41 @@ impl WorldRenderer {
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         pass.set_bind_group(1, &self.atlas_bind_group, &[]);
         for mesh in self.meshes.values() {
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_index_buffer(mesh.indices.slice(..), IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            if let Some(indices) = &mesh.indices {
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+        pass.set_pipeline(&self.translucent_pipeline);
+        let camera = self.pose.map(|pose| pose.display(Instant::now()));
+        let mut translucent = self.meshes.iter().collect::<Vec<_>>();
+        translucent.sort_by(|(left_position, _), (right_position, _)| {
+            let distance = |coordinate: &ChunkCoordinate| {
+                camera.map_or(0.0, |pose| {
+                    let dx = f64::from(coordinate.x * 16 + 8) - pose.x;
+                    let dz = f64::from(coordinate.z * 16 + 8) - pose.z;
+                    dx * dx + dz * dz
+                })
+            };
+            distance(right_position)
+                .total_cmp(&distance(left_position))
+                .then_with(|| left_position.cmp(right_position))
+        });
+        for (_, mesh) in &translucent {
+            if let Some(indices) = &mesh.translucent_indices {
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.translucent_index_count, 0, 0..1);
+            }
+        }
+        pass.set_pipeline(&self.layered_translucent_pipeline);
+        for (_, mesh) in translucent {
+            if let Some(indices) = &mesh.layered_translucent_indices {
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.layered_translucent_index_count, 0, 0..1);
+            }
         }
     }
 
@@ -520,6 +722,8 @@ struct PosePresentation {
     produced_look: RenderLookSample,
     display_yaw: f32,
     display_pitch: f32,
+    eye_transition_from: f64,
+    eye_transition_at: Instant,
 }
 
 impl PosePresentation {
@@ -532,10 +736,19 @@ impl PosePresentation {
             produced_look: sample.look,
             display_yaw: sample.pose.yaw.rem_euclid(360.0),
             display_pitch: sample.pose.pitch.clamp(-90.0, 90.0),
+            eye_transition_from: sample.pose.eye_height,
+            eye_transition_at: sample.tick_at,
         }
     }
 
     fn apply(&mut self, sample: RenderPoseSample) {
+        if sample.discontinuity {
+            self.eye_transition_from = sample.pose.eye_height;
+            self.eye_transition_at = sample.tick_at;
+        } else if sample.pose.eye_height != self.current.eye_height {
+            self.eye_transition_from = self.presented_eye_height(sample.tick_at);
+            self.eye_transition_at = sample.tick_at;
+        }
         if sample.discontinuity {
             if sample.look.sequence > self.produced_look.sequence {
                 self.produced_look = sample.look;
@@ -588,11 +801,25 @@ impl PosePresentation {
         pose.x = lerp(self.previous.x, self.current.x);
         pose.y = lerp(self.previous.y, self.current.y);
         pose.z = lerp(self.previous.z, self.current.z);
-        pose.eye_height = lerp(self.previous.eye_height, self.current.eye_height);
+        pose.eye_height = self.presented_eye_height(now);
         pose.yaw = self.display_yaw;
         pose.pitch = self.display_pitch;
         tracing::trace!(target: "movement::look", ?now, new_simulated_pose = false, simulation_yaw = self.current.yaw, simulation_pitch = self.current.pitch, acknowledged_sequence = self.acknowledged_look.sequence, produced_sequence = self.produced_look.sequence, outstanding_yaw = self.produced_look.yaw_total - self.acknowledged_look.yaw_total, outstanding_pitch = self.produced_look.pitch_total - self.acknowledged_look.pitch_total, display_yaw = pose.yaw, display_pitch = pose.pitch, "sampled persistent display orientation for render frame");
         pose
+    }
+
+    fn presented_eye_height(self, now: Instant) -> f64 {
+        const EYE_TRANSITION: Duration = Duration::from_millis(200);
+        let alpha = (now
+            .saturating_duration_since(self.eye_transition_at)
+            .as_secs_f64()
+            / EYE_TRANSITION.as_secs_f64())
+        .clamp(0.0, 1.0);
+        // Smoothstep is time based, frame-rate independent, and has zero
+        // velocity at both endpoints. Reversal starts from the currently
+        // presented height rather than snapping to either physical pose.
+        let eased = alpha * alpha * (3.0 - 2.0 * alpha);
+        self.eye_transition_from + (self.current.eye_height - self.eye_transition_from) * eased
     }
 
     fn is_interpolating(self, now: Instant) -> bool {
@@ -600,7 +827,7 @@ impl PosePresentation {
             && (self.previous.x != self.current.x
                 || self.previous.y != self.current.y
                 || self.previous.z != self.current.z
-                || self.previous.eye_height != self.current.eye_height)
+                || (self.presented_eye_height(now) - self.current.eye_height).abs() > f64::EPSILON)
     }
 }
 
@@ -608,6 +835,119 @@ impl Drop for WorldRenderer {
     fn drop(&mut self) {
         self.log_mesh_progress(true);
     }
+}
+
+struct TextureAnimationRuntime {
+    data: TextureAnimationData,
+    last_sample: Option<(usize, u32)>,
+    upload: Vec<u8>,
+}
+
+impl TextureAnimationRuntime {
+    fn new(data: TextureAnimationData) -> Self {
+        Self {
+            data,
+            last_sample: None,
+            upload: Vec::new(),
+        }
+    }
+
+    fn update(&mut self, queue: &Queue, atlas: &Texture, elapsed: Duration) {
+        let Some((step, blend)) = animation_sample(&self.data, elapsed) else {
+            return;
+        };
+        let sample = (step, if self.data.interpolate { blend } else { 0 });
+        if self.last_sample == Some(sample) {
+            return;
+        }
+        let current = self.data.sequence[step].frame;
+        let next = self.data.sequence[(step + 1) % self.data.sequence.len()].frame;
+        let Some(current_pixels) = self.data.frames.get(current) else {
+            return;
+        };
+        let pixels = if self.data.interpolate && blend != 0 {
+            let Some(next_pixels) = self.data.frames.get(next) else {
+                return;
+            };
+            self.upload.clear();
+            self.upload.reserve(current_pixels.len());
+            for (from, to) in current_pixels.iter().zip(next_pixels) {
+                let from = u32::from(*from);
+                let to = u32::from(*to);
+                self.upload
+                    .push(((from * (1000 - blend) + to * blend) / 1000) as u8);
+            }
+            self.upload.as_slice()
+        } else {
+            current_pixels.as_slice()
+        };
+        let guttered = guttered_frame(self.data.width, self.data.height, pixels);
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: atlas,
+                mip_level: 0,
+                origin: Origin3d {
+                    x: self.data.origin[0].saturating_sub(1),
+                    y: self.data.origin[1].saturating_sub(1),
+                    z: 0,
+                },
+                aspect: TextureAspect::All,
+            },
+            &guttered,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some((self.data.width + 2) * 4),
+                rows_per_image: Some(self.data.height + 2),
+            },
+            Extent3d {
+                width: self.data.width + 2,
+                height: self.data.height + 2,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.last_sample = Some(sample);
+    }
+}
+
+fn animation_sample(data: &TextureAnimationData, elapsed: Duration) -> Option<(usize, u32)> {
+    let total_millis = data
+        .sequence
+        .iter()
+        .map(|step| u64::from(step.ticks) * 50)
+        .sum::<u64>();
+    if total_millis == 0 || data.sequence.is_empty() {
+        return None;
+    }
+    let mut within = (elapsed.as_millis() as u64) % total_millis;
+    for (index, step) in data.sequence.iter().enumerate() {
+        let duration = u64::from(step.ticks) * 50;
+        if within < duration {
+            let blend = u32::try_from(within.saturating_mul(1000) / duration).unwrap_or(0);
+            return Some((index, blend));
+        }
+        within -= duration;
+    }
+    Some((0, 0))
+}
+
+fn guttered_frame(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+    let output_width = width + 2;
+    let mut output = vec![0; (output_width * (height + 2) * 4) as usize];
+    for y in 0..height + 2 {
+        for x in 0..width + 2 {
+            let source_x = x.saturating_sub(1).min(width - 1);
+            let source_y = y.saturating_sub(1).min(height - 1);
+            let source = ((source_y * width + source_x) * 4) as usize;
+            let destination = ((y * output_width + x) * 4) as usize;
+            if let (Some(source), Some(destination)) = (
+                pixels.get(source..source + 4),
+                output.get_mut(destination..destination + 4),
+            ) {
+                destination.copy_from_slice(source);
+            }
+        }
+    }
+    output
 }
 
 struct MeshWorker {
@@ -618,38 +958,80 @@ struct MeshWorker {
 }
 
 impl MeshWorker {
-    fn new(resources: BlockResources, device: Device) -> Option<Self> {
+    fn new(
+        resources: BlockResources,
+        device: Device,
+        fluid_debug: FluidDebugOptions,
+    ) -> Option<Self> {
         let (result_tx, results) = mpsc::sync_channel(MAX_PENDING_MESH_JOBS);
         let available = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         let (worker_count, queue_per_worker) = worker_layout(available);
         let resources = Arc::new(resources);
         let active = Arc::new(AtomicUsize::new(0));
+        let fluid_log_budget = Arc::new(AtomicUsize::new(FLUID_DEBUG_LOG_CELL_BUDGET));
         let mut jobs = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let (job_tx, job_rx) = mpsc::sync_channel::<MeshJob>(queue_per_worker);
             let result_tx = result_tx.clone();
             let resources = Arc::clone(&resources);
             let active = Arc::clone(&active);
+            let fluid_log_budget = Arc::clone(&fluid_log_budget);
             let device = device.clone();
             let spawn = thread::Builder::new()
                 .name(format!("cubic-chunk-mesher-{index}"))
                 .spawn(move || {
                     while let Ok(job) = job_rx.recv() {
                         active.fetch_add(1, Ordering::AcqRel);
-                        let mesh =
-                            mesh_chunk(job.coordinate, &job.chunks, job.geometry, &resources).map(
-                                |mesh| {
-                                    let statistics = mesh.statistics;
-                                    if mesh.indices.is_empty() {
-                                        PreparedChunkMesh::Empty { statistics }
-                                    } else {
-                                        PreparedChunkMesh::Ready {
-                                            mesh: GpuChunkMesh::new(&device, &mesh),
-                                            statistics,
-                                        }
-                                    }
-                                },
-                            );
+                        let mesh = mesh_chunk_with_debug(
+                            job.coordinate,
+                            &job.chunks,
+                            job.geometry,
+                            &resources,
+                            &job.biomes,
+                            fluid_debug,
+                            job.debug_origin,
+                        )
+                        .map(|mesh| {
+                            let logged_fluid_cells = if fluid_debug.mesh_log {
+                                log_fluid_mesh_diagnostics(
+                                    &mesh,
+                                    &fluid_log_budget,
+                                    job.coordinate,
+                                    job.generation,
+                                    job.revision,
+                                )
+                            } else {
+                                0
+                            };
+                            let statistics = mesh.statistics;
+                            if mesh.indices.is_empty()
+                                && mesh.translucent_indices.is_empty()
+                                && mesh.layered_translucent_indices.is_empty()
+                            {
+                                PreparedChunkMesh::Empty { statistics }
+                            } else {
+                                let gpu_mesh = GpuChunkMesh::new(&device, &mesh);
+                                if logged_fluid_cells > 0 {
+                                    tracing::debug!(
+                                        target: "render::fluid_mesh",
+                                        chunk_x = job.coordinate.x,
+                                        chunk_z = job.coordinate.z,
+                                        generation = job.generation,
+                                        revision = job.revision,
+                                        logged_fluid_cells,
+                                        vertex_count = mesh.vertices.len(),
+                                        opaque_draw_range = mesh.indices.len(),
+                                        translucent_draw_range = mesh.translucent_indices.len(),
+                                        layered_translucent_draw_range = mesh.layered_translucent_indices.len(),
+                                        "fluid diagnostic mesh GPU buffers created for normal draw submission"
+                                    );
+                                }
+                                PreparedChunkMesh::Ready {
+                                    mesh: gpu_mesh,
+                                    statistics,
+                                }
+                            }
+                        });
                         active.fetch_sub(1, Ordering::AcqRel);
                         if result_tx
                             .send(MeshResult {
@@ -811,8 +1193,10 @@ struct MeshJob {
     coordinate: ChunkCoordinate,
     chunks: BTreeMap<ChunkCoordinate, Arc<Chunk>>,
     geometry: DimensionGeometry,
+    biomes: Arc<[cubic_world::RuntimeBiome]>,
     generation: u64,
     revision: u64,
+    debug_origin: Option<[i32; 3]>,
 }
 
 struct MeshResult {
@@ -842,8 +1226,12 @@ impl PreparedChunkMesh {
 
 struct GpuChunkMesh {
     vertices: Buffer,
-    indices: Buffer,
+    indices: Option<Buffer>,
     index_count: u32,
+    translucent_indices: Option<Buffer>,
+    translucent_index_count: u32,
+    layered_translucent_indices: Option<Buffer>,
+    layered_translucent_index_count: u32,
 }
 impl GpuChunkMesh {
     fn new(device: &Device, mesh: &ChunkMesh) -> Self {
@@ -853,12 +1241,34 @@ impl GpuChunkMesh {
                 contents: bytemuck::cast_slice(&mesh.vertices),
                 usage: BufferUsages::VERTEX,
             }),
-            indices: device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("Cubic chunk indices"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: BufferUsages::INDEX,
+            indices: (!mesh.indices.is_empty()).then(|| {
+                device.create_buffer_init(&BufferInitDescriptor {
+                    label: Some("Cubic opaque/cutout chunk indices"),
+                    contents: bytemuck::cast_slice(&mesh.indices),
+                    usage: BufferUsages::INDEX,
+                })
             }),
             index_count: u32::try_from(mesh.indices.len()).unwrap_or(u32::MAX),
+            translucent_indices: (!mesh.translucent_indices.is_empty()).then(|| {
+                device.create_buffer_init(&BufferInitDescriptor {
+                    label: Some("Cubic translucent chunk indices"),
+                    contents: bytemuck::cast_slice(&mesh.translucent_indices),
+                    usage: BufferUsages::INDEX,
+                })
+            }),
+            translucent_index_count: u32::try_from(mesh.translucent_indices.len())
+                .unwrap_or(u32::MAX),
+            layered_translucent_indices: (!mesh.layered_translucent_indices.is_empty()).then(
+                || {
+                    device.create_buffer_init(&BufferInitDescriptor {
+                        label: Some("Cubic layered translucent chunk indices"),
+                        contents: bytemuck::cast_slice(&mesh.layered_translucent_indices),
+                        usage: BufferUsages::INDEX,
+                    })
+                },
+            ),
+            layered_translucent_index_count: u32::try_from(mesh.layered_translucent_indices.len())
+                .unwrap_or(u32::MAX),
         }
     }
 }
@@ -1036,6 +1446,22 @@ fn multiply(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
 mod tests {
     use super::*;
 
+    #[test]
+    fn atlas_filtering_preserves_pixel_magnification_and_filters_minification() {
+        assert_eq!(ATLAS_MAG_FILTER, FilterMode::Nearest);
+        assert_eq!(ATLAS_MIN_FILTER, FilterMode::Linear);
+        assert_eq!(ATLAS_CUTOUT_MIN_FILTER, FilterMode::Nearest);
+        assert_eq!(SOLID_DEPTH_COMPARE, CompareFunction::LessEqual);
+        assert_eq!(
+            (
+                TRANSLUCENT_DEPTH_COMPARE,
+                TRANSLUCENT_DEPTH_WRITE,
+                LAYERED_TRANSLUCENT_DEPTH_WRITE,
+            ),
+            (CompareFunction::LessEqual, true, false)
+        );
+    }
+
     #[derive(Clone, Copy)]
     enum MouseTrace {
         Horizontal,
@@ -1209,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_tick_presentation_interpolates_translation_and_eye_height_only() {
+    fn partial_tick_translation_and_time_based_eye_transition_are_independent() {
         let start = Instant::now();
         let previous = LocalPlayerPose {
             x: 0.0,
@@ -1242,12 +1668,13 @@ mod tests {
 
         let halfway = presentation.display(start + SIMULATION_TICK / 2);
         assert_eq!((halfway.x, halfway.y, halfway.z), (0.5, 64.5, -1.0));
-        assert!((halfway.eye_height - 1.445).abs() < 1.0e-9);
+        assert!((halfway.eye_height - 1.604_960_937_5).abs() < 1.0e-9);
         // Ordinary 20 Hz samples update translation but cannot replace the
         // persistent display-rate orientation without a mouse event.
         assert_eq!((halfway.yaw, halfway.pitch), (10.0, 5.0));
         let at_tick = presentation.display(start + SIMULATION_TICK);
         assert_eq!((at_tick.x, at_tick.y, at_tick.z), (1.0, 65.0, -2.0));
+        assert!((at_tick.eye_height - 1.565_312_5).abs() < 1.0e-9);
         assert_eq!((at_tick.yaw, at_tick.pitch), (10.0, 5.0));
     }
 
@@ -1714,5 +2141,45 @@ mod tests {
     #[test]
     fn terrain_backface_culling_prevents_coplanar_cross_face_fighting() {
         assert_eq!(TERRAIN_CULL_MODE, Some(Face::Back));
+    }
+
+    #[test]
+    fn animated_texture_timing_is_frame_rate_independent_and_mesh_neutral() {
+        let data = TextureAnimationData {
+            origin: [1, 1],
+            width: 1,
+            height: 1,
+            frames: vec![vec![0, 0, 0, 255], vec![255, 255, 255, 255]],
+            sequence: vec![
+                crate::block_resources::AnimationStep { frame: 0, ticks: 2 },
+                crate::block_resources::AnimationStep { frame: 1, ticks: 1 },
+            ],
+            interpolate: true,
+        };
+        assert_eq!(animation_sample(&data, Duration::ZERO), Some((0, 0)));
+        assert_eq!(
+            animation_sample(&data, Duration::from_millis(50)),
+            Some((0, 500))
+        );
+        assert_eq!(
+            animation_sample(&data, Duration::from_millis(100)),
+            Some((1, 0))
+        );
+        assert_eq!(
+            animation_sample(&data, Duration::from_millis(150)),
+            Some((0, 0))
+        );
+
+        let gutter = guttered_frame(1, 1, &data.frames[1]);
+        assert_eq!(gutter.len(), 3 * 3 * 4);
+        assert!(
+            gutter
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [255, 255, 255, 255])
+        );
+        // Animation updates only atlas texels: neither helper accepts chunk,
+        // generation, revision, dirty-queue, or mesh state.
     }
 }

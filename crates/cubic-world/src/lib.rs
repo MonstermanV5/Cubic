@@ -6,6 +6,7 @@
 
 mod chunk;
 mod collision_vanilla;
+mod environment;
 mod model;
 mod movement;
 mod render;
@@ -13,17 +14,22 @@ mod state;
 
 pub use chunk::{
     BlockEntitySummary, Chunk, ChunkCoordinate, ChunkLightSummary, ChunkSection, ChunkStoreError,
-    ChunkSummary, HeightmapData, LoadedChunks, MAX_BLOCK_ENTITIES_PER_CHUNK, MAX_CHUNK_SECTIONS,
-    MAX_HEIGHTMAP_LONGS, MAX_HEIGHTMAPS, MAX_LOADED_CHUNKS, PaletteForm, PalettedContainer,
-    RuntimeBiomeId, RuntimeBlockStateId, SECTION_BIOME_COUNT, SECTION_BLOCK_COUNT,
+    ChunkSummary, HeightmapData, LightLayerData, LoadedChunks, MAX_BLOCK_ENTITIES_PER_CHUNK,
+    MAX_CHUNK_SECTIONS, MAX_HEIGHTMAP_LONGS, MAX_HEIGHTMAPS, MAX_LOADED_CHUNKS, PaletteForm,
+    PalettedContainer, RuntimeBiomeId, RuntimeBlockStateId, SECTION_BIOME_COUNT,
+    SECTION_BLOCK_COUNT,
+};
+pub use environment::{
+    BlockEnvironment, BlockEnvironmentProfile, FluidKind, FluidState, SpecialSurface,
 };
 
 pub use model::{
     AuthoritativeRotation, AuthoritativeTransform, BlockCoordinates, BlockStateUpdate, ClockState,
-    Difficulty, DimensionGeometry, DimensionTypeReference, EnterWorld, GameMode, LastDeathLocation,
-    PlayerPositionUpdate, PlayerRotationUpdate, RelativeTransformFlags, Respawn, RespawnRotation,
-    RuntimeDimensionType, RuntimeRegistrySnapshot, RuntimeRegistrySummary, SpawnContext,
-    SpawnPoint, WeatherState, WorldBorder, WorldEvent, WorldSession, WorldTime,
+    Difficulty, DimensionGeometry, DimensionTypeReference, EnterWorld, GameMode,
+    GrassColorModifier, LastDeathLocation, PlayerPositionUpdate, PlayerRotationUpdate,
+    RelativeTransformFlags, Respawn, RespawnRotation, RuntimeBiome, RuntimeDimensionType,
+    RuntimeRegistrySnapshot, RuntimeRegistrySummary, SpawnContext, SpawnPoint, WeatherState,
+    WorldBorder, WorldEvent, WorldSession, WorldTime,
 };
 pub use movement::{
     Aabb, BlockCollisionProfile, CollisionCandidate, CollisionDiagnostics, CollisionShape,

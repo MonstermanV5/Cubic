@@ -51,6 +51,7 @@ pub struct WorldState {
     revision: u64,
     registries: RuntimeRegistrySnapshot,
     dimension_types: Vec<crate::RuntimeDimensionType>,
+    biomes: Vec<crate::RuntimeBiome>,
     session: Option<WorldSession>,
     chunks: LoadedChunks,
 }
@@ -92,6 +93,10 @@ pub enum WorldError {
     InvalidDimensionGeometry { min_y: i32, height: u32 },
     #[error("dimension-type registry contains a duplicate raw ID")]
     DuplicateDimensionType,
+    #[error("biome registry contains a duplicate raw ID")]
+    DuplicateBiome,
+    #[error("biome registry contains invalid climate data")]
+    InvalidBiome,
     #[error("teleport ID {value} is negative")]
     NegativeTeleportId { value: i32 },
     #[error("teleport ID {received} is not newer than applied ID {current}")]
@@ -128,6 +133,11 @@ impl WorldState {
         &self.chunks
     }
 
+    #[must_use]
+    pub fn biomes(&self) -> &[crate::RuntimeBiome] {
+        &self.biomes
+    }
+
     pub fn apply(&mut self, event: WorldEvent) -> Result<WorldTransition, WorldError> {
         let next_revision = self
             .revision
@@ -138,6 +148,7 @@ impl WorldState {
                 self.lifecycle = WorldLifecycle::Configuring;
                 self.registries = RuntimeRegistrySnapshot::default();
                 self.dimension_types.clear();
+                self.biomes.clear();
                 self.session = None;
                 self.chunks.clear();
                 (ResetScope::Connection, false)
@@ -164,6 +175,25 @@ impl WorldState {
                     return Err(WorldError::DuplicateDimensionType);
                 }
                 self.dimension_types = dimensions;
+                (ResetScope::None, false)
+            }
+            WorldEvent::RuntimeBiomes(mut biomes) => {
+                self.require(WorldLifecycle::Configuring, "RuntimeBiomes")?;
+                biomes.sort_by_key(|biome| biome.raw_id);
+                if biomes
+                    .windows(2)
+                    .any(|pair| pair[0].raw_id == pair[1].raw_id)
+                {
+                    return Err(WorldError::DuplicateBiome);
+                }
+                if biomes.iter().any(|biome| {
+                    !biome.temperature.is_finite()
+                        || !biome.downfall.is_finite()
+                        || !(0.0..=1.0).contains(&biome.downfall)
+                }) {
+                    return Err(WorldError::InvalidBiome);
+                }
+                self.biomes = biomes;
                 (ResetScope::None, false)
             }
             WorldEvent::EnterWorld(enter) => {
@@ -300,6 +330,7 @@ impl WorldState {
                 self.lifecycle = WorldLifecycle::Disconnected;
                 self.registries = RuntimeRegistrySnapshot::default();
                 self.dimension_types.clear();
+                self.biomes.clear();
                 self.session = None;
                 self.chunks.clear();
                 (ResetScope::Connection, false)

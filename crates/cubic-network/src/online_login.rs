@@ -92,6 +92,7 @@ pub(crate) struct AuthenticatedPlayConnection {
     pub(crate) connection: MinecraftConnection,
     pub(crate) initial_login: v775::InitialPlayLogin,
     pub(crate) dimension_types: Vec<cubic_world::RuntimeDimensionType>,
+    pub(crate) biomes: Vec<cubic_world::RuntimeBiome>,
     pub(crate) result: AuthenticatedLoginResult,
     pub(crate) secure_chat_rules: crate::secure_chat::SecureChatRules,
 }
@@ -247,6 +248,7 @@ async fn establish_authenticated_play_inner<J: MinecraftSessionJoiner>(
                     connection,
                     initial_login: configuration.initial_login,
                     dimension_types: configuration.dimension_types,
+                    biomes: configuration.biomes,
                     secure_chat_rules: profile.secure_chat_rules(),
                     result: AuthenticatedLoginResult {
                         address: address.clone(),

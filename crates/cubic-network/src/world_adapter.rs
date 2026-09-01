@@ -8,10 +8,11 @@ use cubic_version::MinecraftIdentifier;
 use cubic_world::{
     AuthoritativeRotation, BlockCoordinates, BlockEntitySummary, BlockStateUpdate, Chunk,
     ChunkCoordinate, ChunkLightSummary, ChunkSection, ClockState, Difficulty, DimensionGeometry,
-    DimensionTypeReference, EnterWorld, GameMode, HeightmapData, LastDeathLocation,
-    PalettedContainer, PlayerPositionUpdate, RelativeTransformFlags, Respawn, RespawnRotation,
-    RuntimeBiomeId, RuntimeBlockStateId, RuntimeDimensionType, SpawnContext, SpawnPoint,
-    WorldBorder, WorldEvent, WorldTime,
+    DimensionTypeReference, EnterWorld, GameMode, GrassColorModifier, HeightmapData,
+    LastDeathLocation, LightLayerData, PalettedContainer, PlayerPositionUpdate,
+    RelativeTransformFlags, Respawn, RespawnRotation, RuntimeBiome, RuntimeBiomeId,
+    RuntimeBlockStateId, RuntimeDimensionType, SpawnContext, SpawnPoint, WorldBorder, WorldEvent,
+    WorldTime,
 };
 use thiserror::Error;
 
@@ -36,6 +37,221 @@ pub(crate) enum WorldAdapterError {
     InvalidDimensionData { entry: String },
     #[error("dimension-type registry entry {entry} is missing integer field {field}")]
     MissingDimensionField { entry: String, field: &'static str },
+    #[error("invalid {registry} registry entry {entry} at {path}: {reason}")]
+    InvalidBiomeField {
+        registry: &'static str,
+        entry: String,
+        path: &'static str,
+        reason: &'static str,
+    },
+}
+
+pub(crate) fn biomes(
+    entries: Vec<v775::ConfigurationRegistryEntry<'_>>,
+) -> Result<Vec<RuntimeBiome>, WorldAdapterError> {
+    const REGISTRY: &str = "minecraft:worldgen/biome";
+    let biomes = entries
+        .into_iter()
+        .enumerate()
+        .map(|(raw_id, entry)| {
+            let identifier = identifier(entry.identifier.to_owned())?;
+            let data = entry
+                .data
+                .ok_or_else(|| WorldAdapterError::InvalidBiomeField {
+                    registry: REGISTRY,
+                    entry: identifier.to_string(),
+                    path: "entry data",
+                    reason: "required compound is absent",
+                })?;
+            let cubic_protocol::nbt::NbtTag::Compound(compound) = data else {
+                return Err(WorldAdapterError::InvalidBiomeField {
+                    registry: REGISTRY,
+                    entry: identifier.to_string(),
+                    path: "entry data",
+                    reason: "expected compound NBT",
+                });
+            };
+            let temperature = nbt_float(&compound, "temperature").ok_or_else(|| {
+                WorldAdapterError::InvalidBiomeField {
+                    registry: REGISTRY,
+                    entry: identifier.to_string(),
+                    path: "temperature",
+                    reason: "required finite NBT float is absent or has the wrong type",
+                }
+            })?;
+            let downfall = nbt_float(&compound, "downfall").ok_or_else(|| {
+                WorldAdapterError::InvalidBiomeField {
+                    registry: REGISTRY,
+                    entry: identifier.to_string(),
+                    path: "downfall",
+                    reason: "required finite NBT float is absent or has the wrong type",
+                }
+            })?;
+            let effects = match compound.get_str("effects") {
+                Some(cubic_protocol::nbt::NbtTag::Compound(effects)) => effects,
+                _ => {
+                    return Err(WorldAdapterError::InvalidBiomeField {
+                        registry: REGISTRY,
+                        entry: identifier.to_string(),
+                        path: "effects",
+                        reason: "required compound is absent or has the wrong NBT type",
+                    });
+                }
+            };
+            let water_color = biome_color(
+                effects,
+                "water_color",
+                "effects.water_color",
+                REGISTRY,
+                &identifier,
+                true,
+            )?
+            .ok_or_else(|| WorldAdapterError::InvalidBiomeField {
+                registry: REGISTRY,
+                entry: identifier.to_string(),
+                path: "effects.water_color",
+                reason: "required hexadecimal NBT string is absent",
+            })?;
+            let foliage_color = biome_color(
+                effects,
+                "foliage_color",
+                "effects.foliage_color",
+                REGISTRY,
+                &identifier,
+                false,
+            )?;
+            let dry_foliage_color = biome_color(
+                effects,
+                "dry_foliage_color",
+                "effects.dry_foliage_color",
+                REGISTRY,
+                &identifier,
+                false,
+            )?;
+            let grass_color = biome_color(
+                effects,
+                "grass_color",
+                "effects.grass_color",
+                REGISTRY,
+                &identifier,
+                false,
+            )?;
+            let grass_color_modifier = biome_grass_modifier(effects, REGISTRY, &identifier)?;
+            Ok(RuntimeBiome {
+                raw_id: u32::try_from(raw_id).map_err(|_| WorldAdapterError::InvalidInteger {
+                    field: "biome raw ID",
+                    value: i64::MAX,
+                })?,
+                identifier,
+                temperature,
+                downfall,
+                water_color,
+                foliage_color,
+                dry_foliage_color,
+                grass_color,
+                grass_color_modifier,
+            })
+        })
+        .collect::<Result<Vec<_>, WorldAdapterError>>()?;
+    tracing::debug!(
+        entries = biomes.len(),
+        grass_overrides = biomes
+            .iter()
+            .filter(|biome| biome.grass_color.is_some())
+            .count(),
+        foliage_overrides = biomes
+            .iter()
+            .filter(|biome| biome.foliage_color.is_some())
+            .count(),
+        grass_modifiers = biomes
+            .iter()
+            .filter(|biome| biome.grass_color_modifier != GrassColorModifier::None)
+            .count(),
+        "decoded protocol-775 runtime biome registry"
+    );
+    Ok(biomes)
+}
+
+fn biome_color(
+    effects: &cubic_protocol::nbt::NbtCompound,
+    field: &str,
+    path: &'static str,
+    registry: &'static str,
+    identifier: &MinecraftIdentifier,
+    required: bool,
+) -> Result<Option<u32>, WorldAdapterError> {
+    let Some(tag) = effects.get_str(field) else {
+        return if required {
+            Err(WorldAdapterError::InvalidBiomeField {
+                registry,
+                entry: identifier.to_string(),
+                path,
+                reason: "required hexadecimal NBT string is absent",
+            })
+        } else {
+            Ok(None)
+        };
+    };
+    let cubic_protocol::nbt::NbtTag::String(value) = tag else {
+        return Err(WorldAdapterError::InvalidBiomeField {
+            registry,
+            entry: identifier.to_string(),
+            path,
+            reason: "expected hexadecimal NBT string",
+        });
+    };
+    let value = value.to_string_lossy();
+    let Some(hex) = value.strip_prefix('#').filter(|hex| hex.len() == 6) else {
+        return Err(WorldAdapterError::InvalidBiomeField {
+            registry,
+            entry: identifier.to_string(),
+            path,
+            reason: "expected color in #RRGGBB form",
+        });
+    };
+    let color = u32::from_str_radix(hex, 16).map_err(|_| WorldAdapterError::InvalidBiomeField {
+        registry,
+        entry: identifier.to_string(),
+        path,
+        reason: "color contains non-hexadecimal digits",
+    })?;
+    Ok(Some(color))
+}
+
+fn biome_grass_modifier(
+    effects: &cubic_protocol::nbt::NbtCompound,
+    registry: &'static str,
+    identifier: &MinecraftIdentifier,
+) -> Result<GrassColorModifier, WorldAdapterError> {
+    let Some(tag) = effects.get_str("grass_color_modifier") else {
+        return Ok(GrassColorModifier::None);
+    };
+    let cubic_protocol::nbt::NbtTag::String(value) = tag else {
+        return Err(WorldAdapterError::InvalidBiomeField {
+            registry,
+            entry: identifier.to_string(),
+            path: "effects.grass_color_modifier",
+            reason: "expected NBT string",
+        });
+    };
+    match value.to_string_lossy().as_str() {
+        "none" => Ok(GrassColorModifier::None),
+        "dark_forest" => Ok(GrassColorModifier::DarkForest),
+        "swamp" => Ok(GrassColorModifier::Swamp),
+        _ => Err(WorldAdapterError::InvalidBiomeField {
+            registry,
+            entry: identifier.to_string(),
+            path: "effects.grass_color_modifier",
+            reason: "unknown modifier",
+        }),
+    }
+}
+
+fn nbt_float(compound: &cubic_protocol::nbt::NbtCompound, name: &str) -> Option<f32> {
+    match compound.get_str(name) {
+        Some(cubic_protocol::nbt::NbtTag::Float(value)) if value.is_finite() => Some(*value),
+        _ => None,
+    }
 }
 
 pub(crate) fn dimension_types(
@@ -267,6 +483,22 @@ fn semantic_light(light: v775::WireLightData) -> ChunkLightSummary {
         empty_block_mask: light.empty_block_mask,
         sky_layer_count: light.sky_layer_count,
         block_layer_count: light.block_layer_count,
+        sky_layers: light
+            .sky_layers
+            .into_iter()
+            .map(|layer| LightLayerData {
+                mask_index: layer.mask_index,
+                data: layer.data,
+            })
+            .collect(),
+        block_layers: light
+            .block_layers
+            .into_iter()
+            .map(|layer| LightLayerData {
+                mask_index: layer.mask_index,
+                data: layer.data,
+            })
+            .collect(),
     }
 }
 
@@ -448,6 +680,39 @@ fn block_coordinates(position: cubic_protocol::BlockPosition) -> BlockCoordinate
 mod tests {
     use super::*;
 
+    fn nbt_string(value: &str) -> cubic_protocol::nbt::NbtTag {
+        cubic_protocol::nbt::NbtTag::String(value.into())
+    }
+
+    fn biome_entry(
+        identifier: &'static str,
+        temperature: f32,
+        downfall: f32,
+        effects: impl IntoIterator<Item = (&'static str, cubic_protocol::nbt::NbtTag)>,
+    ) -> v775::ConfigurationRegistryEntry<'static> {
+        let mut effect_compound = cubic_protocol::nbt::NbtCompound::new();
+        for (name, value) in effects {
+            effect_compound.insert(name.into(), value);
+        }
+        let mut compound = cubic_protocol::nbt::NbtCompound::new();
+        compound.insert(
+            "temperature".into(),
+            cubic_protocol::nbt::NbtTag::Float(temperature),
+        );
+        compound.insert(
+            "downfall".into(),
+            cubic_protocol::nbt::NbtTag::Float(downfall),
+        );
+        compound.insert(
+            "effects".into(),
+            cubic_protocol::nbt::NbtTag::Compound(effect_compound),
+        );
+        v775::ConfigurationRegistryEntry {
+            identifier,
+            data: Some(cubic_protocol::nbt::NbtTag::Compound(compound)),
+        }
+    }
+
     fn spawn(dimension: &str) -> SpawnInfo {
         SpawnInfo {
             dimension_type_raw_id: 5,
@@ -460,6 +725,131 @@ mod tests {
             last_death_location: None,
             portal_cooldown_ticks: 4,
             sea_level: 64,
+        }
+    }
+
+    #[test]
+    fn current_biome_registry_decodes_required_strings_and_optional_overrides() {
+        let entries = vec![
+            biome_entry(
+                "minecraft:plains",
+                0.8,
+                0.4,
+                [
+                    ("water_color", nbt_string("#3f76e4")),
+                    ("future_visual_field", nbt_string("ignored")),
+                ],
+            ),
+            biome_entry(
+                "minecraft:badlands",
+                2.0,
+                0.0,
+                [
+                    ("water_color", nbt_string("#3f76e4")),
+                    ("foliage_color", nbt_string("#9e814d")),
+                    ("grass_color", nbt_string("#90814d")),
+                ],
+            ),
+            biome_entry(
+                "minecraft:swamp",
+                0.8,
+                0.9,
+                [
+                    ("water_color", nbt_string("#617b64")),
+                    ("foliage_color", nbt_string("#6a7039")),
+                    ("grass_color_modifier", nbt_string("swamp")),
+                ],
+            ),
+            biome_entry(
+                "minecraft:dark_forest",
+                0.7,
+                0.8,
+                [
+                    ("water_color", nbt_string("#3f76e4")),
+                    ("grass_color_modifier", nbt_string("dark_forest")),
+                ],
+            ),
+        ];
+
+        let decoded = biomes(entries).expect("current biome registry");
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(decoded[0].water_color, 0x3f76e4);
+        assert_eq!((decoded[0].temperature, decoded[0].downfall), (0.8, 0.4));
+        assert_eq!(
+            (decoded[0].grass_color, decoded[0].foliage_color),
+            (None, None)
+        );
+        assert_eq!(decoded[1].grass_color, Some(0x90814d));
+        assert_eq!(decoded[1].foliage_color, Some(0x9e814d));
+        assert_eq!(decoded[2].water_color, 0x617b64);
+        assert_eq!(decoded[2].grass_color_modifier, GrassColorModifier::Swamp);
+        assert_eq!(
+            decoded[3].grass_color_modifier,
+            GrassColorModifier::DarkForest
+        );
+    }
+
+    #[test]
+    fn biome_registry_rejects_missing_and_wrong_required_fields_with_paths() {
+        let missing = biome_entry("minecraft:test", 0.5, 0.5, []);
+        let error = biomes(vec![missing]).expect_err("water color is required");
+        let message = error.to_string();
+        assert!(message.contains("minecraft:worldgen/biome"));
+        assert!(message.contains("minecraft:test"));
+        assert!(message.contains("effects.water_color"));
+
+        let wrong_color = biome_entry(
+            "minecraft:test",
+            0.5,
+            0.5,
+            [("water_color", cubic_protocol::nbt::NbtTag::Int(0x3f76e4))],
+        );
+        assert!(
+            biomes(vec![wrong_color])
+                .expect_err("integer color is obsolete in 26.1.2")
+                .to_string()
+                .contains("expected hexadecimal NBT string")
+        );
+
+        let mut wrong_temperature = biome_entry(
+            "minecraft:test",
+            0.5,
+            0.5,
+            [("water_color", nbt_string("#3f76e4"))],
+        );
+        let Some(cubic_protocol::nbt::NbtTag::Compound(compound)) = wrong_temperature.data.as_mut()
+        else {
+            panic!("test biome compound")
+        };
+        compound.insert(
+            "temperature".into(),
+            cubic_protocol::nbt::NbtTag::Double(0.5),
+        );
+        assert!(
+            biomes(vec![wrong_temperature])
+                .expect_err("temperature must use the current float type")
+                .to_string()
+                .contains("temperature")
+        );
+    }
+
+    #[test]
+    fn malformed_present_optional_biome_fields_are_not_treated_as_absent() {
+        for (field, value) in [
+            ("grass_color", nbt_string("90814d")),
+            ("foliage_color", cubic_protocol::nbt::NbtTag::Int(1)),
+            ("grass_color_modifier", cubic_protocol::nbt::NbtTag::Byte(1)),
+        ] {
+            let entry = biome_entry(
+                "minecraft:test",
+                0.5,
+                0.5,
+                [("water_color", nbt_string("#3f76e4")), (field, value)],
+            );
+            assert!(
+                biomes(vec![entry]).is_err(),
+                "field {field} must be validated"
+            );
         }
     }
 

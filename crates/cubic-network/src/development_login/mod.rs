@@ -141,6 +141,7 @@ pub(crate) struct ConnectedPlay {
     pub(crate) connection: MinecraftConnection,
     pub(crate) initial_login: v775::InitialPlayLogin,
     pub(crate) dimension_types: Vec<cubic_world::RuntimeDimensionType>,
+    pub(crate) biomes: Vec<cubic_world::RuntimeBiome>,
     pub(crate) result: DevelopmentLoginResult,
 }
 
@@ -211,6 +212,7 @@ async fn connect_to_play_inner(
         connection,
         initial_login: configuration.initial_login,
         dimension_types: configuration.dimension_types,
+        biomes: configuration.biomes,
         result: DevelopmentLoginResult {
             address: address.clone(),
             minecraft_version: profile.minecraft_version().clone(),
@@ -306,6 +308,7 @@ pub(crate) struct ConfigurationOutcome {
     pub(crate) skipped_packets: usize,
     pub(crate) initial_login: v775::InitialPlayLogin,
     pub(crate) dimension_types: Vec<cubic_world::RuntimeDimensionType>,
+    pub(crate) biomes: Vec<cubic_world::RuntimeBiome>,
 }
 
 pub(crate) async fn run_configuration(
@@ -314,11 +317,15 @@ pub(crate) async fn run_configuration(
 ) -> Result<ConfigurationOutcome, DevelopmentLoginError> {
     let mut skipped_packets = 0_usize;
     let mut dimension_types = Vec::new();
+    let mut biomes = Vec::new();
     for _ in 0..=MAX_RECONFIGURATIONS_DURING_ACCEPTANCE {
         let phase = run_configuration_phase(connection, state).await?;
         skipped_packets = skipped_packets.saturating_add(phase.skipped_packets);
         if !phase.dimension_types.is_empty() {
             dimension_types = phase.dimension_types;
+        }
+        if !phase.biomes.is_empty() {
+            biomes = phase.biomes;
         }
         match await_initial_play_login(connection, state).await? {
             PlayAcceptance::Login(initial_login) => {
@@ -326,6 +333,7 @@ pub(crate) async fn run_configuration(
                     skipped_packets,
                     initial_login,
                     dimension_types,
+                    biomes,
                 });
             }
             PlayAcceptance::Reconfigure => {}
@@ -340,6 +348,7 @@ pub(crate) async fn run_configuration(
 struct ConfigurationPhaseOutcome {
     skipped_packets: usize,
     dimension_types: Vec<cubic_world::RuntimeDimensionType>,
+    biomes: Vec<cubic_world::RuntimeBiome>,
 }
 
 async fn run_configuration_phase(
@@ -348,6 +357,7 @@ async fn run_configuration_phase(
 ) -> Result<ConfigurationPhaseOutcome, DevelopmentLoginError> {
     let mut skipped_packets = 0_usize;
     let mut dimension_types = Vec::new();
+    let mut biomes = Vec::new();
     for _ in 0..MAX_CONFIGURATION_PACKETS {
         let frame = connection
             .read_frame("Configuration packet read")
@@ -372,6 +382,10 @@ async fn run_configuration_phase(
                         crate::world_adapter::dimension_types(entries).map_err(|error| {
                             DevelopmentLoginError::ConfigurationData(error.to_string())
                         })?;
+                } else if registry == "minecraft:worldgen/biome" {
+                    biomes = crate::world_adapter::biomes(entries).map_err(|error| {
+                        DevelopmentLoginError::ConfigurationData(error.to_string())
+                    })?;
                 }
             }
             ConfigurationClientbound::Disconnect { reason } => {
@@ -394,6 +408,7 @@ async fn run_configuration_phase(
                 return Ok(ConfigurationPhaseOutcome {
                     skipped_packets,
                     dimension_types,
+                    biomes,
                 });
             }
             ConfigurationClientbound::KeepAlive { id } => {
