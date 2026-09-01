@@ -205,6 +205,7 @@ struct WorldApplication {
     look_sequence: u64,
     cursor_captured: bool,
     pending_pose_presentation: Option<(Instant, Instant, bool)>,
+    frame_rate: FrameRateCounter,
 }
 
 impl WorldApplication {
@@ -228,6 +229,7 @@ impl WorldApplication {
             look_sequence: 0,
             cursor_captured: false,
             pending_pose_presentation: None,
+            frame_rate: FrameRateCounter::default(),
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), StartupError> {
@@ -257,6 +259,7 @@ impl WorldApplication {
         self.window = Some(Arc::clone(&window));
         self.renderer = Some(renderer);
         self.egui = Some(egui);
+        self.frame_rate.reset();
         self.chat
             .set_presentation_mode(SessionPresentationMode::Play);
         window.request_redraw();
@@ -368,6 +371,7 @@ impl WorldApplication {
             self.clear_input();
             self.chat
                 .set_presentation_mode(SessionPresentationMode::Play);
+            self.frame_rate.reset();
             if let Some(window) = &self.window {
                 window.set_title("Cubic — World Mode");
             }
@@ -387,11 +391,27 @@ impl WorldApplication {
         let context = egui.egui_ctx().clone();
         let mut play_requested = false;
         let mut chat_requested = false;
+        let fps = self.frame_rate.frames_per_second();
         let mut output = context.run_ui(input, |ui| match mode {
             SessionPresentationMode::Chat => {
                 play_requested = self.chat.show_with_play_control(ui, true);
             }
             SessionPresentationMode::Play => {
+                egui::Area::new(egui::Id::new("cubic-frame-rate"))
+                    .anchor(egui::Align2::LEFT_TOP, [12.0, 12.0])
+                    .interactable(false)
+                    .show(ui.ctx(), |ui| {
+                        let value = fps.map_or_else(
+                            || "FPS: —".to_owned(),
+                            |value| format!("FPS: {value:.0}"),
+                        );
+                        ui.label(
+                            egui::RichText::new(value)
+                                .monospace()
+                                .strong()
+                                .background_color(egui::Color32::from_black_alpha(160)),
+                        );
+                    });
                 egui::Area::new(egui::Id::new("cubic-enter-chat"))
                     .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
                     .show(ui.ctx(), |ui| {
@@ -413,10 +433,17 @@ impl WorldApplication {
                 renderer.render_ui(&paint_jobs, textures, pixels_per_point)
             }
         };
-        if let Err(error) = result {
-            tracing::error!(%error, "fatal Play/Chat rendering error");
-            event_loop.exit();
-            return;
+        match result {
+            Ok(status) => {
+                if mode == SessionPresentationMode::Play {
+                    self.frame_rate.record(status, Instant::now());
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "fatal Play/Chat rendering error");
+                event_loop.exit();
+                return;
+            }
         }
         if play_requested {
             self.enter_play();
@@ -516,6 +543,7 @@ impl ApplicationHandler for WorldApplication {
             WindowEvent::Occluded(value) => {
                 self.occluded = value;
                 if !value {
+                    self.frame_rate.reset();
                     self.request_redraw();
                 }
             }
@@ -622,6 +650,44 @@ impl ApplicationHandler for WorldApplication {
         self.clear_input();
         self.chat.disconnect();
         tracing::info!("Cubic Play/Chat session stopped cleanly");
+    }
+}
+
+const FPS_SAMPLE_WINDOW: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Default)]
+struct FrameRateCounter {
+    window_started: Option<Instant>,
+    presented_since_start: u32,
+    frames_per_second: Option<f64>,
+}
+
+impl FrameRateCounter {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn record(&mut self, status: FrameStatus, now: Instant) {
+        if status != FrameStatus::Presented {
+            return;
+        }
+        let Some(started) = self.window_started else {
+            self.window_started = Some(now);
+            return;
+        };
+        self.presented_since_start = self.presented_since_start.saturating_add(1);
+        let elapsed = now.saturating_duration_since(started);
+        if elapsed >= FPS_SAMPLE_WINDOW {
+            self.frames_per_second = Some(
+                f64::from(self.presented_since_start) / elapsed.as_secs_f64().max(f64::EPSILON),
+            );
+            self.window_started = Some(now);
+            self.presented_since_start = 0;
+        }
+    }
+
+    fn frames_per_second(&self) -> Option<f64> {
+        self.frames_per_second
     }
 }
 
@@ -1065,6 +1131,29 @@ mod tests {
             update_movement_key(&mut input, KeyCode::KeyW, true);
         }
         assert_eq!(input, MovementInput::default());
+    }
+
+    #[test]
+    fn frame_rate_counter_reports_completed_presentation_window_and_resets() {
+        let mut counter = FrameRateCounter::default();
+        let started = Instant::now();
+        counter.record(FrameStatus::Skipped, started);
+        counter.record(FrameStatus::Reconfigured, started);
+        assert_eq!(counter.frames_per_second(), None);
+        counter.record(FrameStatus::Presented, started);
+        for frame in 1..=50 {
+            counter.record(
+                FrameStatus::Presented,
+                started + Duration::from_millis(frame * 10),
+            );
+        }
+        let measured = counter
+            .frames_per_second()
+            .expect("a complete half-second window must produce a rate");
+        assert!((measured - 100.0).abs() < f64::EPSILON);
+
+        counter.reset();
+        assert_eq!(counter.frames_per_second(), None);
     }
 
     #[test]
