@@ -186,6 +186,18 @@ pub struct TextureAtlasData {
     pub(crate) animations: Vec<TextureAnimationData>,
 }
 
+/// A bounded GUI sprite decoded from the verified exact-version resource set.
+///
+/// Keeping the logical sprite separate from the terrain atlas lets the HUD
+/// retain Minecraft's native sprite identity and leaves a clean replacement
+/// point for later resource-pack selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuiSpriteData {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TextureAnimationData {
     pub origin: [u32; 2],
@@ -225,6 +237,8 @@ pub struct BlockResources {
     pub model_count: usize,
     pub texture_count: usize,
     pub fallback_count: usize,
+    pub crosshair: GuiSpriteData,
+    pub destroy_stages: Vec<GuiSpriteData>,
     pub(crate) grass_colormap: Vec<u32>,
     pub(crate) foliage_colormap: Vec<u32>,
     pub(crate) dry_foliage_colormap: Vec<u32>,
@@ -286,6 +300,10 @@ impl BlockResources {
         let grass_colormap = loader.load_colormap("minecraft:colormap/grass")?;
         let foliage_colormap = loader.load_colormap("minecraft:colormap/foliage")?;
         let dry_foliage_colormap = loader.load_colormap("minecraft:colormap/dry_foliage")?;
+        let crosshair = loader.load_gui_sprite("minecraft:gui/sprites/hud/crosshair")?;
+        let destroy_stages = (0..cubic_world::DESTROY_STAGE_COUNT)
+            .map(|stage| loader.load_gui_sprite(&format!("minecraft:block/destroy_stage_{stage}")))
+            .collect::<Result<Vec<_>, _>>()?;
         for models in states.values_mut() {
             prepare_runtime_state(models, &atlas);
         }
@@ -321,6 +339,8 @@ impl BlockResources {
             model_count: loader.models.len(),
             texture_count,
             fallback_count,
+            crosshair,
+            destroy_stages,
             grass_colormap,
             foliage_colormap,
             dry_foliage_colormap,
@@ -362,6 +382,18 @@ impl BlockResources {
             model_count: 0,
             texture_count: 1,
             fallback_count: 0,
+            crosshair: GuiSpriteData {
+                width: 15,
+                height: 15,
+                rgba: vec![0; 15 * 15 * 4],
+            },
+            destroy_stages: (0..cubic_world::DESTROY_STAGE_COUNT)
+                .map(|stage| GuiSpriteData {
+                    width: 16,
+                    height: 16,
+                    rgba: vec![stage; 16 * 16 * 4],
+                })
+                .collect(),
             grass_colormap: vec![0x7fb238; 256 * 256],
             foliage_colormap: vec![0x48b518; 256 * 256],
             dry_foliage_colormap: vec![0x9e814d; 256 * 256],
@@ -764,7 +796,10 @@ pub(crate) fn rotate_blockstate_corner(
         *value -= 0.5;
     }
     for _ in 0..(x_rotation / 90) {
-        point = [point[0], -point[2], point[1]];
+        // Minecraft blockstate X rotations are clockwise when viewed along
+        // +X. Cubic's +Y-up/+Z-south coordinates therefore use the inverse of
+        // the conventional right-handed positive-X matrix.
+        point = [point[0], point[2], -point[1]];
     }
     for _ in 0..(y_rotation / 90) {
         point = [-point[2], point[1], point[0]];
@@ -782,10 +817,10 @@ pub(crate) fn rotate_blockstate_direction(
 ) -> Direction {
     for _ in 0..(x_rotation / 90) {
         direction = match direction {
-            Direction::Up => Direction::South,
-            Direction::South => Direction::Down,
-            Direction::Down => Direction::North,
-            Direction::North => Direction::Up,
+            Direction::Up => Direction::North,
+            Direction::North => Direction::Down,
+            Direction::Down => Direction::South,
+            Direction::South => Direction::Up,
             other => other,
         };
     }
@@ -867,7 +902,7 @@ fn face_uv_axes(direction: Direction) -> ([i8; 3], [i8; 3]) {
 
 fn rotate_blockstate_vector(mut vector: [i8; 3], x_rotation: u16, y_rotation: u16) -> [i8; 3] {
     for _ in 0..(x_rotation / 90) {
-        vector = [vector[0], -vector[2], vector[1]];
+        vector = [vector[0], vector[2], -vector[1]];
     }
     for _ in 0..(y_rotation / 90) {
         vector = [-vector[2], vector[1], vector[0]];
@@ -1284,6 +1319,28 @@ impl<'a, S: VanillaResourceSource> Loader<'a, S> {
                 (u32::from(pixel[0]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[2])
             })
             .collect())
+    }
+
+    fn load_gui_sprite(&mut self, name: &str) -> Result<GuiSpriteData, BlockResourceError> {
+        let identifier = parse_identifier(name)?;
+        let path = resource_path(&identifier, "textures", "png")?;
+        let bytes = self
+            .source
+            .read_resource(&path, MAX_VANILLA_RESOURCE_BYTES)?
+            .ok_or_else(|| malformed("GUI sprite", name, "resource is missing"))?;
+        let image = decode_png(&bytes)?;
+        if image.frames.len() != 1 {
+            return Err(malformed(
+                "GUI sprite",
+                name,
+                "animated sprites are not supported by this HUD path",
+            ));
+        }
+        Ok(GuiSpriteData {
+            width: image.width,
+            height: image.height,
+            rgba: image.rgba,
+        })
     }
 }
 
@@ -2198,6 +2255,46 @@ mod tests {
     }
 
     #[test]
+    fn exact_version_gui_sprite_is_loaded_without_embedding_asset_pixels() {
+        let mut source = MemorySource::default();
+        let pixels = (0..15 * 15)
+            .flat_map(|index| {
+                let value = u8::try_from(index % 256).unwrap_or(0);
+                [value, 255 - value, value / 2, 255]
+            })
+            .collect::<Vec<_>>();
+        source.insert_bytes(
+            "assets/minecraft/textures/gui/sprites/hud/crosshair.png",
+            rgba_png(15, 15, &pixels),
+        );
+        let mut loader = Loader::new(&mut source);
+        let sprite = loader
+            .load_gui_sprite("minecraft:gui/sprites/hud/crosshair")
+            .unwrap();
+        assert_eq!((sprite.width, sprite.height), (15, 15));
+        assert_eq!(sprite.rgba, pixels);
+    }
+
+    #[test]
+    fn all_ten_destroy_stages_are_loaded_from_official_runtime_resource_paths() {
+        let mut source = MemorySource::default();
+        for stage in 0..cubic_world::DESTROY_STAGE_COUNT {
+            source.insert_bytes(
+                &format!("assets/minecraft/textures/block/destroy_stage_{stage}.png"),
+                rgba_png(16, 16, &vec![stage; 16 * 16 * 4]),
+            );
+        }
+        let mut loader = Loader::new(&mut source);
+        let stages = (0..cubic_world::DESTROY_STAGE_COUNT)
+            .map(|stage| loader.load_gui_sprite(&format!("minecraft:block/destroy_stage_{stage}")))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(stages.len(), usize::from(cubic_world::DESTROY_STAGE_COUNT));
+        assert_eq!((stages[0].width, stages[0].height), (16, 16));
+        assert_eq!(stages[9].rgba[0], 9);
+    }
+
+    #[test]
     fn variants_select_exact_properties_and_reject_malformed_selectors() {
         let properties = BTreeMap::from([
             ("facing".to_owned(), "north".to_owned()),
@@ -2690,6 +2787,31 @@ mod tests {
             rotated_uv.rotate_left(1);
             assert_eq!(face.uv, rotated_uv, "wrong 90-degree rotation on {name}");
         }
+    }
+
+    #[test]
+    fn button_style_floor_model_rotates_to_the_vanilla_north_wall_attachment() {
+        let source = [
+            [5.0 / 16.0, 0.0, 6.0 / 16.0],
+            [11.0 / 16.0, 2.0 / 16.0, 10.0 / 16.0],
+        ];
+        let rotated = source.map(|corner| rotate_blockstate_corner(corner, 90, 0));
+        let xs = [rotated[0][0], rotated[1][0]];
+        let ys = [rotated[0][1], rotated[1][1]];
+        let zs = [rotated[0][2], rotated[1][2]];
+        assert_eq!(
+            (xs[0].min(xs[1]), xs[0].max(xs[1])),
+            (5.0 / 16.0, 11.0 / 16.0)
+        );
+        assert_eq!(
+            (ys[0].min(ys[1]), ys[0].max(ys[1])),
+            (6.0 / 16.0, 10.0 / 16.0)
+        );
+        assert_eq!((zs[0].min(zs[1]), zs[0].max(zs[1])), (14.0 / 16.0, 1.0));
+        assert_eq!(
+            rotate_blockstate_direction(Direction::Up, 90, 0),
+            Direction::North
+        );
     }
 
     #[test]

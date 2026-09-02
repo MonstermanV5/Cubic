@@ -7,6 +7,7 @@
 mod chunk;
 mod collision_vanilla;
 mod environment;
+mod interaction;
 mod model;
 mod movement;
 mod render;
@@ -21,6 +22,9 @@ pub use chunk::{
 };
 pub use environment::{
     BlockEnvironment, BlockEnvironmentProfile, FluidKind, FluidState, SpecialSurface,
+};
+pub use interaction::{
+    BlockFace, BlockOutlineProfile, BlockReach, BlockTarget, RaycastError, raycast_blocks,
 };
 
 pub use model::{
@@ -38,7 +42,8 @@ pub use movement::{
     Vec3d,
 };
 pub use render::{
-    BlockVisualProfile, ChunkRenderDelta, RenderLookSample, RenderPoseSample, WorldRenderUpdate,
+    BlockBreakingOverlay, BlockVisualProfile, ChunkRenderDelta, DESTROY_STAGE_COUNT,
+    RenderLookSample, RenderPoseSample, WorldRenderUpdate,
 };
 pub use state::{
     BlockUpdateResult, MAX_BLOCK_UPDATES_PER_EVENT, MAX_KNOWN_DIMENSIONS, MAX_RUNTIME_REGISTRIES,

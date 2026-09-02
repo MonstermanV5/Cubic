@@ -267,6 +267,7 @@ pub async fn run_authenticated_chat_session<J: MinecraftSessionJoiner>(
 }
 
 /// Runs the existing development Play session while publishing coalesced world deltas.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_development_world_session(
     address: &ServerAddress,
     username: &DevelopmentUsername,
@@ -275,6 +276,7 @@ pub async fn run_development_world_session(
     render: WorldRenderRunner,
     controls: WorldControlRunner,
     collisions: BlockCollisionProfile,
+    outlines: cubic_world::BlockOutlineProfile,
 ) -> Result<(), ChatSessionError> {
     let mut connected = connect_to_play(address, username, &options.login).await?;
     run_play_session(
@@ -285,7 +287,7 @@ pub async fn run_development_world_session(
         connected.dimension_types,
         connected.biomes,
         Some(render),
-        Some((controls, collisions)),
+        Some((controls, collisions, outlines)),
     )
     .await
 }
@@ -423,7 +425,11 @@ async fn run_play_session(
     dimension_types: Vec<cubic_world::RuntimeDimensionType>,
     biomes: Vec<cubic_world::RuntimeBiome>,
     render: Option<WorldRenderRunner>,
-    movement: Option<(WorldControlRunner, BlockCollisionProfile)>,
+    movement: Option<(
+        WorldControlRunner,
+        BlockCollisionProfile,
+        cubic_world::BlockOutlineProfile,
+    )>,
 ) -> Result<(), ChatSessionError> {
     let player_entity_id = initial_login.player_entity_id;
     let pose_authority = if movement.is_some() {
@@ -453,8 +459,8 @@ async fn run_play_session(
     let mut salt_counter = 0_i64;
     let mut sent_player_loaded = false;
     let mut safety = SessionSafetyTracker::default();
-    let mut movement = movement.map(|(controls, collisions)| {
-        WorldMovementController::new(controls, collisions, player_entity_id)
+    let mut movement = movement.map(|(controls, collisions, outlines)| {
+        WorldMovementController::new(controls, collisions, outlines, player_entity_id)
     });
     let mut movement_ticks = tokio::time::interval(std::time::Duration::from_millis(50));
     movement_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -462,7 +468,7 @@ async fn run_play_session(
     loop {
         tokio::select! {
             scheduled = movement_ticks.tick(), if movement.is_some() => {
-                service_movement_tick(connection, &mut movement, &world, &render, scheduled).await?;
+                service_movement_tick(connection, &mut movement, &mut world, &render, scheduled).await?;
             }
             command = runner.commands.recv() => {
                 match command {
@@ -503,7 +509,7 @@ async fn run_play_session(
                                     .map_err(|_| ChatSessionError::Movement("bounded chunk decode worker stopped unexpectedly".to_owned()))??;
                             }
                             scheduled = movement_ticks.tick(), if movement.is_some() => {
-                                service_movement_tick(connection, &mut movement, &world, &render, scheduled).await?;
+                                service_movement_tick(connection, &mut movement, &mut world, &render, scheduled).await?;
                             }
                         }
                     }
@@ -566,6 +572,9 @@ async fn run_play_session(
                     crate::world_adapter::ChunkAdaptation::Blocks(updates) => {
                         let update_count = updates.len();
                         let semantic_started = std::time::Instant::now();
+                        if let Some(controller) = &mut movement {
+                            controller.reconcile_block_updates(&updates);
+                        }
                         let result = world.apply_block_updates(&updates)?;
                         let semantic_elapsed = semantic_started.elapsed();
                         let publication_started = std::time::Instant::now();
@@ -638,6 +647,11 @@ async fn run_play_session(
                 match packet {
                     PlayClientbound::KeepAlive { id } => {
                         write(connection, v775::encode_play_keep_alive(id)?, "Play Keep Alive response write").await?;
+                    }
+                    PlayClientbound::BlockChangedAck { sequence } => {
+                        if let Some(controller) = &mut movement {
+                            controller.acknowledge_interaction(sequence);
+                        }
                     }
                     PlayClientbound::Ping { id } => {
                         write(connection, v775::encode_play_pong(id)?, "Play Pong write").await?;
@@ -861,7 +875,7 @@ async fn run_play_session(
 async fn service_movement_tick(
     connection: &mut crate::connection::MinecraftConnection,
     movement: &mut Option<WorldMovementController>,
-    world: &WorldState,
+    world: &mut WorldState,
     render: &Option<WorldRenderRunner>,
     scheduled: tokio::time::Instant,
 ) -> Result<(), ChatSessionError> {
@@ -901,6 +915,18 @@ async fn service_movement_tick(
         }
         if let Some(render) = render {
             render.pose_tick(tick.pose, scheduled.into_std(), tick.look, tick.jumped);
+            render.target(tick.target);
+            render.breaking(tick.breaking);
+        }
+        if let Some(prediction) = tick.prediction {
+            let result = world.apply_block_updates(&[prediction])?;
+            if let Some(render) = render {
+                for coordinate in result.changed_chunks {
+                    if let Some(chunk) = world.loaded_chunks().get_shared(coordinate) {
+                        render.load(chunk);
+                    }
+                }
+            }
         }
         for frame in tick.frames {
             write(connection, frame, "Play movement write").await?;
@@ -1258,8 +1284,12 @@ mod tests {
         }
 
         let (_controls, control_runner) = WorldControlHandle::new();
-        let mut controller =
-            WorldMovementController::new(control_runner, BlockCollisionProfile::synthetic([]), 7);
+        let mut controller = WorldMovementController::new(
+            control_runner,
+            BlockCollisionProfile::synthetic([]),
+            cubic_world::BlockOutlineProfile::synthetic([]),
+            7,
+        );
         let corrected = controller
             .reconcile(
                 v775::PlayerPosition {
@@ -1361,7 +1391,11 @@ mod tests {
                 dimension_types(),
                 vec![],
                 None,
-                Some((control_runner, BlockCollisionProfile::synthetic([]))),
+                Some((
+                    control_runner,
+                    BlockCollisionProfile::synthetic([]),
+                    cubic_world::BlockOutlineProfile::synthetic([]),
+                )),
             )
             .await
         });

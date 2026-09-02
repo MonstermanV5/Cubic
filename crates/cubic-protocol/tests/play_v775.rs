@@ -81,6 +81,110 @@ fn movement_and_input_packets_match_independent_protocol_775_vectors() {
 }
 
 #[test]
+fn interaction_packets_match_independent_protocol_775_vectors() {
+    let position = cubic_protocol::BlockPosition::new(1, 2, 3).unwrap();
+    assert_eq!(
+        v775::encode_play_player_action(
+            v775::PlayerAction::StartDestroyBlock,
+            position,
+            v775::BlockFace::East,
+            5,
+        )
+        .unwrap(),
+        [
+            0x0c, 0x29, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x30, 0x02, 0x05, 0x05
+        ]
+    );
+
+    let mut expected_use_on = vec![
+        0x1a, 0x42, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x30, 0x02, 0x05,
+    ];
+    expected_use_on.extend_from_slice(&0.25_f32.to_be_bytes());
+    expected_use_on.extend_from_slice(&0.5_f32.to_be_bytes());
+    expected_use_on.extend_from_slice(&0.75_f32.to_be_bytes());
+    expected_use_on.extend_from_slice(&[0x00, 0x00, 0x07]);
+    assert_eq!(
+        v775::encode_play_use_item_on(
+            v775::InteractionHand::Main,
+            v775::BlockHit {
+                position,
+                face: v775::BlockFace::East,
+                location_x: 0.25,
+                location_y: 0.5,
+                location_z: 0.75,
+                inside: false,
+                world_border_hit: false,
+            },
+            7,
+        )
+        .unwrap(),
+        expected_use_on
+    );
+
+    assert_eq!(
+        v775::encode_play_use_item(v775::InteractionHand::Main, 9, 90.0, -30.0).unwrap(),
+        [
+            vec![0x0b, 0x43, 0x00, 0x09],
+            90.0_f32.to_be_bytes().to_vec(),
+            (-30.0_f32).to_be_bytes().to_vec(),
+        ]
+        .concat()
+    );
+    assert_eq!(
+        v775::decode_play_clientbound(&[0x04, 0xac, 0x02]).unwrap(),
+        v775::PlayClientbound::BlockChangedAck { sequence: 300 }
+    );
+}
+
+#[test]
+fn interaction_ids_match_official_26_1_2_play_registry_fixture() {
+    // Independently transcribed from GameProtocols' 26.1.2 serverbound
+    // registration order. Keeping the neighbouring entries here prevents a
+    // self-consistent bootstrap encoder/vector pair from hiding an ID shift.
+    const OFFICIAL_NEIGHBOURS: &[(u32, &str)] = &[
+        (0x22, "minecraft:move_vehicle"),
+        (0x23, "minecraft:paddle_boat"),
+        (0x24, "minecraft:pick_item_from_block"),
+        (0x25, "minecraft:pick_item_from_entity"),
+        (0x26, "minecraft:ping_request"),
+        (0x27, "minecraft:place_recipe"),
+        (0x28, "minecraft:player_abilities"),
+        (0x29, "minecraft:player_action"),
+        (0x2a, "minecraft:player_command"),
+        (0x2b, "minecraft:player_input"),
+        (0x3d, "minecraft:sign_update"),
+        (0x3e, "minecraft:spectate_entity"),
+        (0x3f, "minecraft:swing"),
+        (0x40, "minecraft:teleport_to_entity"),
+        (0x41, "minecraft:test_instance_block_action"),
+        (0x42, "minecraft:use_item_on"),
+        (0x43, "minecraft:use_item"),
+        (0x44, "minecraft:custom_click_action"),
+    ];
+    let checks = v775::packet_identity_cross_checks();
+    for &(id, identity) in OFFICIAL_NEIGHBOURS {
+        if matches!(
+            identity,
+            "minecraft:pick_item_from_block"
+                | "minecraft:pick_item_from_entity"
+                | "minecraft:player_abilities"
+                | "minecraft:player_action"
+                | "minecraft:player_command"
+                | "minecraft:player_input"
+                | "minecraft:swing"
+                | "minecraft:use_item_on"
+                | "minecraft:use_item"
+        ) {
+            let check = checks
+                .iter()
+                .find(|check| check.identity == identity)
+                .unwrap_or_else(|| panic!("bootstrap cross-check missing {identity}"));
+            assert_eq!(check.id, id, "official registry mismatch for {identity}");
+        }
+    }
+}
+
+#[test]
 fn clientbound_player_abilities_matches_protocol_775_wire_layout() {
     let mut packet = vec![0x40, 0x0f];
     packet.extend_from_slice(&0.05_f32.to_be_bytes());

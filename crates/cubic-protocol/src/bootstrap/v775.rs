@@ -108,8 +108,15 @@ const PLAY_PLAYER_COMMAND_ID: i32 = 0x2a;
 const PLAY_PLAYER_INPUT_ID: i32 = 0x2b;
 const PLAY_PLAYER_LOADED_ID: i32 = 0x2c;
 const PLAY_PONG_ID: i32 = 0x2d;
+const PLAY_PICK_ITEM_FROM_BLOCK_ID: i32 = 0x24;
+const PLAY_PICK_ITEM_FROM_ENTITY_ID: i32 = 0x25;
+const PLAY_PLAYER_ACTION_ID: i32 = 0x29;
+const PLAY_SWING_ID: i32 = 0x3f;
+const PLAY_USE_ITEM_ON_ID: i32 = 0x42;
+const PLAY_USE_ITEM_ID: i32 = 0x43;
 
 const PLAY_CHANGE_DIFFICULTY_ID: i32 = 0x0a;
+const PLAY_BLOCK_CHANGED_ACK_ID: i32 = 0x04;
 const PLAY_BLOCK_UPDATE_ID: i32 = 0x08;
 const PLAY_CHUNK_BATCH_FINISHED_ID: i32 = 0x0b;
 const PLAY_CHUNK_BATCH_START_ID: i32 = 0x0c;
@@ -167,6 +174,48 @@ pub const fn packet_identity_cross_checks() -> &'static [PacketIdentityCheck] {
             direction: C,
             identity: "minecraft:block_update",
             id: PLAY_BLOCK_UPDATE_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:block_changed_ack",
+            id: PLAY_BLOCK_CHANGED_ACK_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:pick_item_from_block",
+            id: PLAY_PICK_ITEM_FROM_BLOCK_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:pick_item_from_entity",
+            id: PLAY_PICK_ITEM_FROM_ENTITY_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:player_action",
+            id: PLAY_PLAYER_ACTION_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:swing",
+            id: PLAY_SWING_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:use_item_on",
+            id: PLAY_USE_ITEM_ON_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:use_item",
+            id: PLAY_USE_ITEM_ID as u32,
         },
         PacketIdentityCheck {
             state: Handshake,
@@ -809,6 +858,9 @@ impl ChatLastSeenUpdate {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayClientbound {
+    BlockChangedAck {
+        sequence: i32,
+    },
     Login(InitialPlayLogin),
     KeepAlive {
         id: i64,
@@ -1027,6 +1079,42 @@ pub struct PlayerAbilities {
 pub enum PlayerCommandAction {
     StartSprinting,
     StopSprinting,
+}
+
+/// Direction data values used by the protocol-775 interaction packets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum BlockFace {
+    Down = 0,
+    Up = 1,
+    North = 2,
+    South = 3,
+    West = 4,
+    East = 5,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlayerAction {
+    StartDestroyBlock,
+    AbortDestroyBlock,
+    StopDestroyBlock,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InteractionHand {
+    Main,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockHit {
+    pub position: crate::BlockPosition,
+    pub face: BlockFace,
+    pub location_x: f32,
+    pub location_y: f32,
+    pub location_z: f32,
+    pub inside: bool,
+    pub world_border_hit: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1365,6 +1453,17 @@ pub fn decode_play_clientbound(
     let packet = split_raw_packet(frame_body)?;
     let mut reader = CodecReader::new(packet.payload);
     match packet.id {
+        PLAY_BLOCK_CHANGED_ACK_ID => {
+            let sequence = reader.read_var_int()?;
+            if sequence < 0 {
+                return Err(BootstrapProtocolError::NegativeCount {
+                    context: "Block Changed Ack sequence",
+                    value: sequence,
+                });
+            }
+            require_consumed(&reader, "Block Changed Ack")?;
+            Ok(PlayClientbound::BlockChangedAck { sequence })
+        }
         INITIAL_PLAY_LOGIN_ID => decode_initial_play_login(&mut reader).map(PlayClientbound::Login),
         PLAY_CHANGE_DIFFICULTY_ID => {
             let difficulty = reader.read_var_int()?;
@@ -2006,6 +2105,94 @@ pub fn encode_play_player_command(
     writer.write_var_int(entity_id);
     writer.write_var_int(action);
     writer.write_var_int(0);
+    frame(writer)
+}
+
+pub fn encode_play_player_action(
+    action: PlayerAction,
+    position: crate::BlockPosition,
+    face: BlockFace,
+    sequence: i32,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    if sequence < 0 {
+        return Err(BootstrapProtocolError::NegativeCount {
+            context: "Player Action sequence",
+            value: sequence,
+        });
+    }
+    let action = match action {
+        PlayerAction::StartDestroyBlock => 0,
+        PlayerAction::AbortDestroyBlock => 1,
+        PlayerAction::StopDestroyBlock => 2,
+    };
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_PLAYER_ACTION_ID);
+    writer.write_var_int(action);
+    writer.write_block_position(position.x(), position.y(), position.z())?;
+    writer.write_u8(face as u8);
+    writer.write_var_int(sequence);
+    frame(writer)
+}
+
+pub fn encode_play_use_item_on(
+    hand: InteractionHand,
+    hit: BlockHit,
+    sequence: i32,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    if sequence < 0 {
+        return Err(BootstrapProtocolError::NegativeCount {
+            context: "Use Item On sequence",
+            value: sequence,
+        });
+    }
+    if !hit.location_x.is_finite() || !hit.location_y.is_finite() || !hit.location_z.is_finite() {
+        return Err(BootstrapProtocolError::NonFinite {
+            context: "Use Item On hit location",
+        });
+    }
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_USE_ITEM_ON_ID);
+    writer.write_var_int(match hand {
+        InteractionHand::Main => 0,
+        InteractionHand::Off => 1,
+    });
+    writer.write_block_position(hit.position.x(), hit.position.y(), hit.position.z())?;
+    writer.write_var_int(i32::from(hit.face as u8));
+    writer.write_f32(hit.location_x);
+    writer.write_f32(hit.location_y);
+    writer.write_f32(hit.location_z);
+    writer.write_bool(hit.inside);
+    writer.write_bool(hit.world_border_hit);
+    writer.write_var_int(sequence);
+    frame(writer)
+}
+
+pub fn encode_play_use_item(
+    hand: InteractionHand,
+    sequence: i32,
+    yaw: f32,
+    pitch: f32,
+) -> Result<Vec<u8>, BootstrapProtocolError> {
+    if sequence < 0 {
+        return Err(BootstrapProtocolError::NegativeCount {
+            context: "Use Item sequence",
+            value: sequence,
+        });
+    }
+    if !yaw.is_finite() || !pitch.is_finite() {
+        return Err(BootstrapProtocolError::NonFinite {
+            context: "Use Item rotation",
+        });
+    }
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_USE_ITEM_ID);
+    writer.write_var_int(match hand {
+        InteractionHand::Main => 0,
+        InteractionHand::Off => 1,
+    });
+    writer.write_var_int(sequence);
+    writer.write_f32(yaw);
+    writer.write_f32(pitch);
     frame(writer)
 }
 

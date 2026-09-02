@@ -20,6 +20,8 @@ struct Mailbox {
     pose: Option<RenderPoseSample>,
     pose_published_at: Option<Instant>,
     pose_contains_jump: bool,
+    target: Option<cubic_world::BlockTarget>,
+    breaking: Option<cubic_world::BlockBreakingOverlay>,
     chunks: BTreeMap<ChunkCoordinate, ChunkRenderDelta>,
     waker: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -58,6 +60,8 @@ impl WorldRenderHandle {
         let pose = mailbox.pose.take();
         let pose_published_at = mailbox.pose_published_at.take();
         let pose_contains_jump = std::mem::take(&mut mailbox.pose_contains_jump);
+        let target = mailbox.target.clone();
+        let breaking = mailbox.breaking;
         let chunks = std::mem::take(&mut mailbox.chunks);
         drop(mailbox);
         Some(WorldRenderUpdate {
@@ -69,6 +73,8 @@ impl WorldRenderHandle {
             pose,
             pose_published_at,
             pose_contains_jump,
+            target,
+            breaking,
             chunks: chunks.into_values().collect(),
         })
     }
@@ -99,7 +105,41 @@ impl WorldRenderRunner {
             mailbox.pose = None;
             mailbox.pose_published_at = None;
             mailbox.pose_contains_jump = false;
+            mailbox.target = None;
+            mailbox.breaking = None;
             mailbox.chunks.clear();
+            mailbox.dirty = true;
+            mailbox.waker.clone()
+        } else {
+            None
+        };
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    pub fn target(&self, target: Option<cubic_world::BlockTarget>) {
+        let waker = if let Ok(mut mailbox) = self.0.lock() {
+            if mailbox.target == target {
+                return;
+            }
+            mailbox.target = target;
+            mailbox.dirty = true;
+            mailbox.waker.clone()
+        } else {
+            None
+        };
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    pub fn breaking(&self, breaking: Option<cubic_world::BlockBreakingOverlay>) {
+        let waker = if let Ok(mut mailbox) = self.0.lock() {
+            if mailbox.breaking == breaking {
+                return;
+            }
+            mailbox.breaking = breaking;
             mailbox.dirty = true;
             mailbox.waker.clone()
         } else {

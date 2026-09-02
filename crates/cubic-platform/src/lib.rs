@@ -163,6 +163,8 @@ pub trait WorldSessionPort {
     fn set_movement_input(&self, sequence: u64, input: MovementInput);
     fn reset_movement_input(&self, sequence: u64);
     fn add_look_delta(&self, sequence: u64, yaw: f32, pitch: f32);
+    fn set_attack(&self, pressed: bool);
+    fn press_use(&self);
     fn disconnect(&self);
 }
 
@@ -318,6 +320,7 @@ impl WorldApplication {
         self.input_sequence = self.input_sequence.saturating_add(1);
         self.input = MovementInput::default();
         self.port.reset_movement_input(self.input_sequence);
+        self.port.set_attack(false);
         tracing::trace!(target: "movement::input", sequence = self.input_sequence, "platform recorded synthetic focus/control release");
     }
 
@@ -520,7 +523,28 @@ impl ApplicationHandler for WorldApplication {
             } if self.mode.mode() == SessionPresentationMode::Play
                 && !egui_response.is_some_and(|response| response.consumed) =>
             {
-                self.set_cursor_capture(true);
+                if self.cursor_captured {
+                    self.port.set_attack(true);
+                } else {
+                    self.set_cursor_capture(true);
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } if self.mode.mode() == SessionPresentationMode::Play => {
+                self.port.set_attack(false);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } if self.mode.mode() == SessionPresentationMode::Play
+                && self.cursor_captured
+                && !egui_response.is_some_and(|response| response.consumed) =>
+            {
+                self.port.press_use();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.mode.mode() == SessionPresentationMode::Play

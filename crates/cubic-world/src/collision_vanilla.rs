@@ -79,6 +79,31 @@ impl CollisionRuleSet {
         }
     }
 
+    pub(crate) fn outline_shape(
+        self,
+        path: &str,
+        properties: &BTreeMap<String, String>,
+    ) -> CollisionShape {
+        match self {
+            Self::Java26_1_2 => classify_outline_shape(path, properties),
+            Self::Conservative => self.shape(path, properties),
+        }
+    }
+
+    /// Empty-hand destroy progress per 20 Hz client tick. Phase 20 can replace
+    /// the baseline speed/tool-correctness inputs without changing the break
+    /// state machine.
+    pub(crate) fn bare_hand_destroy_progress(self, path: &str) -> f32 {
+        let Some((hardness, requires_correct_tool)) = destroy_properties(path) else {
+            return 0.0;
+        };
+        if hardness < 0.0 {
+            return 0.0;
+        }
+        let divisor = if requires_correct_tool { 100.0 } else { 30.0 };
+        1.0 / hardness / divisor
+    }
+
     pub(crate) fn offset(self, path: &str) -> CollisionOffset {
         match self {
             Self::Java26_1_2 if matches!(path, "bamboo" | "bamboo_sapling") => {
@@ -103,7 +128,8 @@ pub(crate) fn has_verified_shape(path: &str) -> bool {
         || path.ends_with("_fence_gate")
         || path.ends_with("_wall")
         || is_pane(path)
-        || matches!(path, "ladder" | "honey_block" | "scaffolding")
+        || matches!(path, "ladder" | "honey_block" | "scaffolding" | "lever")
+        || path.ends_with("_button")
         || is_verified_block_entity_shape(path)
         || matches!(
             path,
@@ -121,6 +147,11 @@ pub(crate) fn has_verified_shape(path: &str) -> bool {
 }
 
 pub(crate) fn classify_shape(path: &str, properties: &BTreeMap<String, String>) -> CollisionShape {
+    // Both blocks are registered with noCollision in 26.1.2. Their non-empty
+    // state-dependent interaction outline is intentionally handled separately.
+    if path == "lever" || path.ends_with("_button") {
+        return CollisionShape::Empty;
+    }
     if let Some(family) = plant_collision_family(path) {
         return plant_collision_shape(family, properties);
     }
@@ -742,10 +773,10 @@ fn trapdoor_shape(properties: &BTreeMap<String, String>) -> CollisionShape {
     const T: f64 = 3.0 / 16.0;
     if property(properties, "open") == Some("true") {
         return match property(properties, "facing") {
-            Some("north") => boundary_plane(1, T, 1.0),
-            Some("south") => boundary_plane(3, T, 1.0),
-            Some("west") => boundary_plane(0, T, 1.0),
-            Some("east") => boundary_plane(2, T, 1.0),
+            Some("north") => boundary_plane(3, T, 1.0),
+            Some("south") => boundary_plane(1, T, 1.0),
+            Some("west") => boundary_plane(2, T, 1.0),
+            Some("east") => boundary_plane(0, T, 1.0),
             _ => CollisionShape::FullCube,
         };
     }
@@ -754,6 +785,141 @@ fn trapdoor_shape(properties: &BTreeMap<String, String>) -> CollisionShape {
     } else {
         cuboid(0.0, 0.0, 0.0, 1.0, T, 1.0)
     }
+}
+
+fn classify_outline_shape(path: &str, properties: &BTreeMap<String, String>) -> CollisionShape {
+    if path == "short_grass" {
+        return cuboid(
+            2.0 / 16.0,
+            0.0,
+            2.0 / 16.0,
+            14.0 / 16.0,
+            13.0 / 16.0,
+            14.0 / 16.0,
+        );
+    }
+    if path.ends_with("_fence") {
+        return cross_shape(properties, 4.0 / 16.0, 1.0);
+    }
+    if path.ends_with("_button") {
+        return attached_control_shape(properties, true);
+    }
+    if path == "lever" {
+        return attached_control_shape(properties, false);
+    }
+    if path == "scaffolding" {
+        return scaffolding_outline(properties);
+    }
+    match classify_shape(path, properties) {
+        CollisionShape::Empty => CollisionShape::FullCube,
+        shape => shape,
+    }
+}
+
+fn attached_control_shape(properties: &BTreeMap<String, String>, button: bool) -> CollisionShape {
+    let pressed = property(properties, "powered") == Some("true");
+    let base = if button {
+        // ButtonBlock starts with boxZ(6, 4, 8, 16), then subtracts a
+        // centered 12/16 (unpowered) or 14/16 (powered) cube. The remaining
+        // protruding part is therefore 6x4x2 or 6x4x1 sixteenths.
+        let depth = if pressed { 1.0 / 16.0 } else { 2.0 / 16.0 };
+        Aabb::new(
+            Vec3d::new(5.0 / 16.0, 6.0 / 16.0, 1.0 - depth),
+            Vec3d::new(11.0 / 16.0, 10.0 / 16.0, 1.0),
+        )
+    } else {
+        // LeverBlock.boxZ(6, 8, 10, 16), before rotateAttachFace.
+        Aabb::new(
+            Vec3d::new(5.0 / 16.0, 4.0 / 16.0, 10.0 / 16.0),
+            Vec3d::new(11.0 / 16.0, 12.0 / 16.0, 1.0),
+        )
+    };
+    let x_turns = match property(properties, "face") {
+        Some("wall") => 0,
+        Some("floor") => 1,
+        Some("ceiling") => 3,
+        _ => return CollisionShape::Empty,
+    };
+    let y_turns = match property(properties, "facing") {
+        Some("north") => 0,
+        Some("east") => 1,
+        Some("south") => 2,
+        Some("west") => 3,
+        _ => return CollisionShape::Empty,
+    };
+    CollisionShape::Boxes([rotate_attachment_box(base, x_turns, y_turns)].into())
+}
+
+fn rotate_attachment_box(bounds: Aabb, x_turns: u8, y_turns: u8) -> Aabb {
+    let mut min = Vec3d::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut max = Vec3d::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for mut point in [
+        Vec3d::new(bounds.min.x, bounds.min.y, bounds.min.z),
+        Vec3d::new(bounds.min.x, bounds.min.y, bounds.max.z),
+        Vec3d::new(bounds.min.x, bounds.max.y, bounds.min.z),
+        Vec3d::new(bounds.min.x, bounds.max.y, bounds.max.z),
+        Vec3d::new(bounds.max.x, bounds.min.y, bounds.min.z),
+        Vec3d::new(bounds.max.x, bounds.min.y, bounds.max.z),
+        Vec3d::new(bounds.max.x, bounds.max.y, bounds.min.z),
+        Vec3d::new(bounds.max.x, bounds.max.y, bounds.max.z),
+    ] {
+        point = Vec3d::new(point.x - 0.5, point.y - 0.5, point.z - 0.5);
+        for _ in 0..x_turns {
+            point = Vec3d::new(point.x, -point.z, point.y);
+        }
+        for _ in 0..y_turns {
+            point = Vec3d::new(-point.z, point.y, point.x);
+        }
+        point = Vec3d::new(point.x + 0.5, point.y + 0.5, point.z + 0.5);
+        min = Vec3d::new(min.x.min(point.x), min.y.min(point.y), min.z.min(point.z));
+        max = Vec3d::new(max.x.max(point.x), max.y.max(point.y), max.z.max(point.z));
+    }
+    Aabb::new(min, max)
+}
+
+fn scaffolding_outline(properties: &BTreeMap<String, String>) -> CollisionShape {
+    let t = 2.0 / 16.0;
+    let mut parts = vec![
+        Aabb::new(Vec3d::new(0.0, 14.0 / 16.0, 0.0), Vec3d::new(1.0, 1.0, 1.0)),
+        Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(t, 1.0, t)),
+        Aabb::new(Vec3d::new(1.0 - t, 0.0, 0.0), Vec3d::new(1.0, 1.0, t)),
+        Aabb::new(Vec3d::new(0.0, 0.0, 1.0 - t), Vec3d::new(t, 1.0, 1.0)),
+        Aabb::new(Vec3d::new(1.0 - t, 0.0, 1.0 - t), Vec3d::new(1.0, 1.0, 1.0)),
+    ];
+    if property(properties, "bottom") == Some("true") {
+        parts.push(Aabb::new(
+            Vec3d::new(0.0, 0.0, 0.0),
+            Vec3d::new(1.0, t, 1.0),
+        ));
+    }
+    boxes(parts)
+}
+
+fn destroy_properties(path: &str) -> Option<(f32, bool)> {
+    if matches!(
+        path,
+        "bedrock" | "barrier" | "end_portal" | "end_portal_frame"
+    ) {
+        return Some((-1.0, true));
+    }
+    let value = if matches!(path, "dirt" | "sand" | "clay" | "gravel") {
+        (0.5, false)
+    } else if matches!(path, "grass_block" | "podzol" | "mycelium") {
+        (0.6, false)
+    } else if path.ends_with("_leaves") {
+        (0.2, false)
+    } else if path.contains("glass") {
+        (0.3, false)
+    } else if path.ends_with("_planks") || path.ends_with("_log") || path.ends_with("_wood") {
+        (2.0, false)
+    } else if matches!(path, "stone" | "cobblestone") {
+        (1.5, true)
+    } else if path.ends_with("_button") || path == "lever" {
+        (0.5, false)
+    } else {
+        return None;
+    };
+    Some(value)
 }
 
 fn fence_gate_shape(properties: &BTreeMap<String, String>) -> CollisionShape {
@@ -1272,7 +1438,7 @@ mod tests {
             "oak_trapdoor",
             &props(&[("open", "true"), ("half", "bottom"), ("facing", "north")]),
         ));
-        assert_eq!((open[0].min.z, open[0].max.z), (0.0, 3.0 / 16.0));
+        assert_eq!((open[0].min.z, open[0].max.z), (13.0 / 16.0, 1.0));
         assert_eq!(
             classify_shape(
                 "oak_fence_gate",
@@ -1531,5 +1697,196 @@ mod tests {
         );
         assert_eq!(future.shape("air", &BTreeMap::new()), CollisionShape::Empty);
         assert!(!future.has_verified_shape("oak_stairs"));
+    }
+
+    #[test]
+    fn trapdoor_open_planes_match_the_rendered_facing_for_every_direction() {
+        let expected = [("north", 3_u8), ("south", 1), ("west", 2), ("east", 0)];
+        for (facing, plane) in expected {
+            let properties = props(&[("facing", facing), ("open", "true"), ("half", "bottom")]);
+            assert_eq!(
+                trapdoor_shape(&properties),
+                boundary_plane(plane, 3.0 / 16.0, 1.0)
+            );
+        }
+    }
+
+    #[test]
+    fn fence_outline_is_connection_aware_but_collision_keeps_extra_height() {
+        let connected = props(&[
+            ("north", "true"),
+            ("east", "true"),
+            ("south", "false"),
+            ("west", "false"),
+        ]);
+        let outline = shape_boxes(classify_outline_shape("oak_fence", &connected));
+        let collision = shape_boxes(classify_shape("oak_fence", &connected));
+        assert_eq!(outline.len(), 3);
+        assert!(outline.iter().all(|bounds| bounds.max.y == 1.0));
+        assert_eq!(collision.len(), 3);
+        assert!(collision.iter().all(|bounds| bounds.max.y == 1.5));
+    }
+
+    #[test]
+    fn buttons_and_levers_are_non_colliding_with_thin_state_dependent_outlines() {
+        for path in ["stone_button", "oak_button", "lever"] {
+            for face in ["wall", "floor", "ceiling"] {
+                for facing in ["north", "east", "south", "west"] {
+                    for powered in ["false", "true"] {
+                        let properties =
+                            props(&[("face", face), ("facing", facing), ("powered", powered)]);
+                        assert_eq!(classify_shape(path, &properties), CollisionShape::Empty);
+                        let boxes = shape_boxes(classify_outline_shape(path, &properties));
+                        assert_eq!(boxes.len(), 1);
+                        let bounds = boxes[0];
+                        assert!(bounds.max.x - bounds.min.x < 1.0);
+                        assert!(bounds.max.y - bounds.min.y < 1.0);
+                        assert!(bounds.max.z - bounds.min.z < 1.0);
+                    }
+                }
+            }
+        }
+        let north = shape_boxes(classify_outline_shape(
+            "oak_button",
+            &props(&[("face", "wall"), ("facing", "north"), ("powered", "false")]),
+        ));
+        assert_eq!((north[0].min.z, north[0].max.z), (14.0 / 16.0, 1.0));
+        assert_eq!((north[0].min.y, north[0].max.y), (6.0 / 16.0, 10.0 / 16.0));
+
+        for face in ["wall", "floor", "ceiling"] {
+            for facing in ["north", "east", "south", "west"] {
+                for (powered, depth) in [("false", 2.0 / 16.0), ("true", 1.0 / 16.0)] {
+                    let outline = shape_boxes(classify_outline_shape(
+                        "stone_button",
+                        &props(&[("face", face), ("facing", facing), ("powered", powered)]),
+                    ));
+                    assert_eq!(outline.len(), 1);
+                    let bounds = outline[0];
+                    let mut dimensions = [
+                        bounds.max.x - bounds.min.x,
+                        bounds.max.y - bounds.min.y,
+                        bounds.max.z - bounds.min.z,
+                    ];
+                    dimensions.sort_by(f64::total_cmp);
+                    assert_eq!(dimensions, [depth, 4.0 / 16.0, 6.0 / 16.0]);
+                }
+            }
+        }
+        for (powered, depth) in [("false", 2.0 / 16.0), ("true", 1.0 / 16.0)] {
+            for (face, expected) in [
+                (
+                    "wall",
+                    Aabb::new(
+                        Vec3d::new(5.0 / 16.0, 6.0 / 16.0, 1.0 - depth),
+                        Vec3d::new(11.0 / 16.0, 10.0 / 16.0, 1.0),
+                    ),
+                ),
+                (
+                    "floor",
+                    Aabb::new(
+                        Vec3d::new(5.0 / 16.0, 0.0, 6.0 / 16.0),
+                        Vec3d::new(11.0 / 16.0, depth, 10.0 / 16.0),
+                    ),
+                ),
+                (
+                    "ceiling",
+                    Aabb::new(
+                        Vec3d::new(5.0 / 16.0, 1.0 - depth, 6.0 / 16.0),
+                        Vec3d::new(11.0 / 16.0, 1.0, 10.0 / 16.0),
+                    ),
+                ),
+            ] {
+                assert_eq!(
+                    shape_boxes(classify_outline_shape(
+                        "stone_button",
+                        &props(&[("face", face), ("facing", "north"), ("powered", powered),]),
+                    )),
+                    [expected].into()
+                );
+            }
+        }
+
+        // Vanilla 26.1.2's LeverBlock.boxZ(6, 8, 10, 16) expands to a
+        // 6x8x6-sixteenth wall-mounted outline. POWERED is deliberately not
+        // part of the shape cache, so both states have identical bounds.
+        for powered in ["false", "true"] {
+            let wall = shape_boxes(classify_outline_shape(
+                "lever",
+                &props(&[("face", "wall"), ("facing", "north"), ("powered", powered)]),
+            ));
+            assert_eq!(
+                wall,
+                [Aabb::new(
+                    Vec3d::new(5.0 / 16.0, 4.0 / 16.0, 10.0 / 16.0),
+                    Vec3d::new(11.0 / 16.0, 12.0 / 16.0, 1.0),
+                )]
+                .into()
+            );
+        }
+        for (face, facing) in [
+            ("wall", "east"),
+            ("wall", "south"),
+            ("wall", "west"),
+            ("floor", "north"),
+            ("floor", "east"),
+            ("floor", "south"),
+            ("floor", "west"),
+            ("ceiling", "north"),
+            ("ceiling", "east"),
+            ("ceiling", "south"),
+            ("ceiling", "west"),
+        ] {
+            let unpowered = shape_boxes(classify_outline_shape(
+                "lever",
+                &props(&[("face", face), ("facing", facing), ("powered", "false")]),
+            ));
+            let powered = shape_boxes(classify_outline_shape(
+                "lever",
+                &props(&[("face", face), ("facing", facing), ("powered", "true")]),
+            ));
+            assert_eq!(powered, unpowered);
+            let bounds = unpowered[0];
+            let mut dimensions = [
+                bounds.max.x - bounds.min.x,
+                bounds.max.y - bounds.min.y,
+                bounds.max.z - bounds.min.z,
+            ];
+            dimensions.sort_by(f64::total_cmp);
+            assert_eq!(dimensions, [6.0 / 16.0, 6.0 / 16.0, 8.0 / 16.0]);
+        }
+    }
+
+    #[test]
+    fn short_grass_has_exact_outline_and_no_collision() {
+        let properties = BTreeMap::new();
+        assert_eq!(
+            classify_shape("short_grass", &properties),
+            CollisionShape::Empty
+        );
+        assert_eq!(
+            shape_boxes(classify_outline_shape("short_grass", &properties)),
+            [Aabb::new(
+                Vec3d::new(2.0 / 16.0, 0.0, 2.0 / 16.0),
+                Vec3d::new(14.0 / 16.0, 13.0 / 16.0, 14.0 / 16.0),
+            )]
+            .into()
+        );
+        assert_eq!(
+            classify_outline_shape("tall_grass", &properties),
+            CollisionShape::FullCube,
+            "the short-grass override must not alter DoublePlantBlock"
+        );
+    }
+
+    #[test]
+    fn empty_hand_destroy_progress_uses_hardness_and_correct_tool_divisor() {
+        let rules = CollisionRuleSet::Java26_1_2;
+        assert!((rules.bare_hand_destroy_progress("dirt") - 1.0 / 15.0).abs() < f32::EPSILON);
+        assert!((rules.bare_hand_destroy_progress("stone") - 1.0 / 150.0).abs() < f32::EPSILON);
+        assert_eq!(rules.bare_hand_destroy_progress("bedrock"), 0.0);
+        assert_eq!(
+            rules.bare_hand_destroy_progress("unknown_future_block"),
+            0.0
+        );
     }
 }

@@ -71,6 +71,76 @@ pub(crate) struct TerrainVertex {
     pub layer: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub(crate) struct DestroyOverlayVertex {
+    pub position: [f32; 3],
+    pub uv: [f32; 2],
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DestroyOverlayMesh {
+    pub vertices: Vec<DestroyOverlayVertex>,
+    pub indices: Vec<u32>,
+}
+
+/// Bakes the exact selected block model for vanilla's projected destroy-stage
+/// decal. Original face UVs are intentionally ignored, matching the official
+/// sheeted-decal vertex consumer.
+pub(crate) fn mesh_destroy_overlay(
+    position: cubic_world::BlockCoordinates,
+    state: RuntimeBlockStateId,
+    resources: &BlockResources,
+) -> Result<DestroyOverlayMesh, MeshError> {
+    let models = resources.state(state);
+    let mut random = ModelVariantRandom::at_position(position.x, position.y, position.z);
+    let offset = model_offset(models.model_offset, position.x, position.z);
+    let mut mesh = DestroyOverlayMesh::default();
+    for part in &models.parts {
+        let Some(model) = select_model(part, &mut random) else {
+            continue;
+        };
+        for face in &model.faces {
+            let base = u32::try_from(mesh.vertices.len()).map_err(|_| MeshError::IndexOverflow)?;
+            let direction =
+                rotate_blockstate_direction(face.direction, model.x_rotation, model.y_rotation);
+            for corner in face.corners {
+                let corner = rotate_blockstate_corner(corner, model.x_rotation, model.y_rotation);
+                let geometry_local = [
+                    corner[0] + offset[0],
+                    corner[1] + offset[1],
+                    corner[2] + offset[2],
+                ];
+                mesh.vertices.push(DestroyOverlayVertex {
+                    position: [
+                        position.x as f32 + geometry_local[0],
+                        position.y as f32 + geometry_local[1],
+                        position.z as f32 + geometry_local[2],
+                    ],
+                    // The official sheeted-decal consumer applies the inverse
+                    // current pose before projection. Model offset therefore
+                    // moves geometry but does not translate the crack texture.
+                    uv: destroy_decal_uv(direction, corner),
+                });
+            }
+            mesh.indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+    Ok(mesh)
+}
+
+const fn destroy_decal_uv(direction: Direction, point: [f32; 3]) -> [f32; 2] {
+    match direction {
+        Direction::Down => [point[0], 1.0 - point[2]],
+        Direction::Up => [point[0], point[2]],
+        Direction::North => [1.0 - point[0], 1.0 - point[1]],
+        Direction::South => [point[0], 1.0 - point[1]],
+        Direction::West => [point[2], 1.0 - point[1]],
+        Direction::East => [1.0 - point[2], 1.0 - point[1]],
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ChunkMesh {
     pub vertices: Vec<TerrainVertex>,
@@ -2145,6 +2215,39 @@ mod tests {
             .indices
             .is_empty()
         );
+    }
+
+    #[test]
+    fn destroy_overlay_uses_full_selected_model_and_projected_face_uvs() {
+        let resources = BlockResources::synthetic([RuntimeBlockStateId(0)]);
+        let mesh = mesh_destroy_overlay(
+            cubic_world::BlockCoordinates { x: -3, y: 7, z: 11 },
+            RuntimeBlockStateId(7),
+            &resources,
+        )
+        .unwrap();
+        assert_eq!(mesh.vertices.len(), 24);
+        assert_eq!(mesh.indices.len(), 36);
+        assert!(mesh.vertices.iter().all(|vertex| {
+            vertex.uv[0] >= 0.0 && vertex.uv[0] <= 1.0 && vertex.uv[1] >= 0.0 && vertex.uv[1] <= 1.0
+        }));
+        assert_eq!(
+            mesh.vertices[0].position,
+            [-3.0, 7.0, 12.0],
+            "overlay geometry must remain attached to the actual model"
+        );
+        assert_eq!(mesh.vertices[0].uv, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn destroy_decal_projection_matches_all_six_minecraft_face_bases() {
+        let point = [0.25, 0.75, 0.5];
+        assert_eq!(destroy_decal_uv(Direction::Down, point), [0.25, 0.5]);
+        assert_eq!(destroy_decal_uv(Direction::Up, point), [0.25, 0.5]);
+        assert_eq!(destroy_decal_uv(Direction::North, point), [0.75, 0.25]);
+        assert_eq!(destroy_decal_uv(Direction::South, point), [0.25, 0.25]);
+        assert_eq!(destroy_decal_uv(Direction::West, point), [0.5, 0.25]);
+        assert_eq!(destroy_decal_uv(Direction::East, point), [0.5, 0.25]);
     }
 
     #[test]

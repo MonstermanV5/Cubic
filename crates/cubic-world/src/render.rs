@@ -3,8 +3,37 @@ use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use cubic_version::{GameData, MinecraftIdentifier, VersionError};
 
 use crate::{
-    Chunk, ChunkCoordinate, DimensionGeometry, LocalPlayerPose, RuntimeBiome, RuntimeBlockStateId,
+    BlockCoordinates, BlockTarget, Chunk, ChunkCoordinate, DimensionGeometry, LocalPlayerPose,
+    RuntimeBiome, RuntimeBlockStateId,
 };
+
+pub const DESTROY_STAGE_COUNT: u8 = 10;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockBreakingOverlay {
+    pub position: BlockCoordinates,
+    pub state: RuntimeBlockStateId,
+    pub stage: u8,
+}
+
+impl BlockBreakingOverlay {
+    #[must_use]
+    pub fn from_progress(
+        position: BlockCoordinates,
+        state: RuntimeBlockStateId,
+        progress: f32,
+    ) -> Option<Self> {
+        if !progress.is_finite() || progress <= 0.0 || progress >= 1.0 {
+            return None;
+        }
+        let stage = (progress * f32::from(DESTROY_STAGE_COUNT)).floor() as u8;
+        (stage < DESTROY_STAGE_COUNT).then_some(Self {
+            position,
+            state,
+            stage,
+        })
+    }
+}
 
 /// Version-selected semantic classification needed by the Phase 15 diagnostic renderer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +109,8 @@ pub struct WorldRenderUpdate {
     pub pose_published_at: Option<Instant>,
     /// Coalesced low-frequency marker for a grounded jump pose.
     pub pose_contains_jump: bool,
+    pub target: Option<BlockTarget>,
+    pub breaking: Option<BlockBreakingOverlay>,
     pub chunks: Vec<ChunkRenderDelta>,
 }
 
@@ -96,5 +127,37 @@ mod tests {
         ]);
         assert!(profile.is_air(RuntimeBlockStateId(17)));
         assert!(!profile.is_air(RuntimeBlockStateId(u32::MAX)));
+    }
+
+    #[test]
+    fn destroy_progress_maps_to_ten_vanilla_stages_and_clears_at_completion() {
+        let position = BlockCoordinates { x: 1, y: 2, z: 3 };
+        let state = RuntimeBlockStateId(4);
+        assert_eq!(
+            BlockBreakingOverlay::from_progress(position, state, 0.0),
+            None
+        );
+        assert_eq!(
+            BlockBreakingOverlay::from_progress(position, state, 0.099)
+                .unwrap()
+                .stage,
+            0
+        );
+        assert_eq!(
+            BlockBreakingOverlay::from_progress(position, state, 0.1)
+                .unwrap()
+                .stage,
+            1
+        );
+        assert_eq!(
+            BlockBreakingOverlay::from_progress(position, state, 0.999)
+                .unwrap()
+                .stage,
+            9
+        );
+        assert_eq!(
+            BlockBreakingOverlay::from_progress(position, state, 1.0),
+            None
+        );
     }
 }

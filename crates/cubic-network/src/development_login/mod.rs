@@ -584,6 +584,7 @@ async fn await_initial_play_login(
             | PlayClientbound::LightUpdate(_)
             | PlayClientbound::BlockUpdate(_)
             | PlayClientbound::SectionBlocksUpdate(_)
+            | PlayClientbound::BlockChangedAck { .. }
             | PlayClientbound::Ignored { .. } => {}
         }
     }

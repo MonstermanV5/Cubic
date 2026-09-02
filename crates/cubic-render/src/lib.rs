@@ -1,10 +1,11 @@
 //! Minimal cross-platform wgpu renderer for the graphical bootstrap.
 
 mod block_resources;
+mod hud;
 mod mesher;
 mod world;
 
-pub use block_resources::{BlockResourceError, BlockResources, TextureAtlasData};
+pub use block_resources::{BlockResourceError, BlockResources, GuiSpriteData, TextureAtlasData};
 
 use std::{
     error::Error,
@@ -16,10 +17,11 @@ use std::{
 };
 
 use cubic_world::WorldRenderUpdate;
+use hud::CrosshairRenderer;
 use wgpu::{
     Color, CommandEncoderDescriptor, CurrentSurfaceTexture, Device, DeviceDescriptor, Instance,
     InstanceDescriptor, LoadOp, Operations, Queue, RenderPassColorAttachment, RenderPassDescriptor,
-    StoreOp, Surface, SurfaceConfiguration, TextureViewDescriptor,
+    StoreOp, Surface, SurfaceConfiguration, TextureFormat, TextureViewDescriptor,
 };
 use winit::{dpi::PhysicalSize, window::Window};
 use world::WorldRenderer;
@@ -75,12 +77,14 @@ pub struct Renderer {
     device: Device,
     queue: Queue,
     config: SurfaceConfiguration,
+    overlay_format: TextureFormat,
     size: PhysicalSize<u32>,
     configured: bool,
     out_of_memory: Arc<AtomicBool>,
     ui_renderer: egui_wgpu::Renderer,
     ui_textures: TextureDeltaQueue,
     world_renderer: Option<WorldRenderer>,
+    crosshair_renderer: Option<CrosshairRenderer>,
 }
 
 impl Renderer {
@@ -131,6 +135,10 @@ impl Renderer {
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or(RendererInitError::UnsupportedSurface)?;
         config.present_mode = wgpu::PresentMode::AutoVsync;
+        let overlay_format = framebuffer_channel_format(config.format);
+        if overlay_format != config.format && !config.view_formats.contains(&overlay_format) {
+            config.view_formats.push(overlay_format);
+        }
 
         let configured = has_renderable_area(size);
         if configured {
@@ -157,12 +165,14 @@ impl Renderer {
             device,
             queue,
             config,
+            overlay_format,
             size,
             configured,
             out_of_memory,
             ui_renderer,
             ui_textures: TextureDeltaQueue::default(),
             world_renderer: None,
+            crosshair_renderer: None,
         })
     }
 
@@ -187,10 +197,17 @@ impl Renderer {
 
     /// Enables textured terrain using preloaded, exact-version block resources.
     pub fn enable_world(&mut self, resources: BlockResources) {
+        self.crosshair_renderer = Some(CrosshairRenderer::new(
+            &self.device,
+            &self.queue,
+            self.overlay_format,
+            &resources.crosshair,
+        ));
         self.world_renderer = Some(WorldRenderer::new(
             &self.device,
             &self.queue,
             self.config.format,
+            self.overlay_format,
             self.size.width,
             self.size.height,
             resources,
@@ -316,6 +333,11 @@ impl Renderer {
             }
         }
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        let overlay_view = frame.texture.create_view(&TextureViewDescriptor {
+            label: Some("Cubic framebuffer-channel overlay view"),
+            format: Some(self.overlay_format),
+            ..Default::default()
+        });
         let Some(world) = &mut self.world_renderer else {
             return;
         };
@@ -361,6 +383,48 @@ impl Renderer {
             world.draw(&mut pass);
         }
         {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Cubic block selection overlay"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &overlay_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: world.depth_view(),
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            world.draw_destroy_overlay(&mut pass);
+            world.draw_selection(&mut pass);
+        }
+        if let Some(crosshair) = &self.crosshair_renderer {
+            crosshair.prepare(&self.queue, self.size.width, self.size.height);
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Cubic vanilla crosshair overlay"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &overlay_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            crosshair.draw(&mut pass);
+        }
+        {
             let pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("Cubic Play Mode control overlay"),
                 color_attachments: &[Some(RenderPassColorAttachment {
@@ -387,6 +451,11 @@ impl Renderer {
 
     fn paint_world(&mut self, frame: wgpu::SurfaceTexture) {
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        let overlay_view = frame.texture.create_view(&TextureViewDescriptor {
+            label: Some("Cubic framebuffer-channel overlay view"),
+            format: Some(self.overlay_format),
+            ..Default::default()
+        });
         let Some(world) = &mut self.world_renderer else {
             self.clear_and_present(frame);
             return;
@@ -420,6 +489,31 @@ impl Renderer {
                 ..Default::default()
             });
             world.draw(&mut pass);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Cubic block selection overlay"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &overlay_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: world.depth_view(),
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            world.draw_destroy_overlay(&mut pass);
+            world.draw_selection(&mut pass);
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
@@ -611,6 +705,14 @@ impl Renderer {
     }
 }
 
+const fn framebuffer_channel_format(format: TextureFormat) -> TextureFormat {
+    match format {
+        TextureFormat::Bgra8UnormSrgb => TextureFormat::Bgra8Unorm,
+        TextureFormat::Rgba8UnormSrgb => TextureFormat::Rgba8Unorm,
+        _ => format,
+    }
+}
+
 /// Result of attempting to render one frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameStatus {
@@ -703,9 +805,26 @@ const fn has_renderable_area(size: PhysicalSize<u32>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextureDeltaQueue, has_renderable_area};
+    use super::{TextureDeltaQueue, framebuffer_channel_format, has_renderable_area};
     use egui::{Color32, ColorImage, TextureId, TextureOptions, epaint::ImageDelta};
+    use wgpu::TextureFormat;
     use winit::dpi::PhysicalSize;
+
+    #[test]
+    fn exact_framebuffer_blends_use_non_srgb_view_formats() {
+        assert_eq!(
+            framebuffer_channel_format(TextureFormat::Bgra8UnormSrgb),
+            TextureFormat::Bgra8Unorm
+        );
+        assert_eq!(
+            framebuffer_channel_format(TextureFormat::Rgba8UnormSrgb),
+            TextureFormat::Rgba8Unorm
+        );
+        assert_eq!(
+            framebuffer_channel_format(TextureFormat::Rgba16Float),
+            TextureFormat::Rgba16Float
+        );
+    }
 
     #[test]
     fn only_two_non_zero_dimensions_are_renderable() {

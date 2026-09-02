@@ -6,9 +6,11 @@ use std::{
 
 use cubic_protocol::bootstrap::v775::{self, PlayerCommandAction, PlayerInput, PlayerPosition};
 use cubic_world::{
-    AuthoritativeTransform, BlockCollisionProfile, ChunkCoordinate, LocalPlayerPose, MovementInput,
-    PlayerMovementState, PlayerPositionUpdate, PlayerRotationUpdate, RelativeTransformFlags,
-    RenderLookSample, SimulationError, Vec3d, WorldState,
+    AuthoritativeTransform, BlockBreakingOverlay, BlockCollisionProfile, BlockCoordinates,
+    BlockFace, BlockOutlineProfile, BlockReach, BlockStateUpdate, BlockTarget, ChunkCoordinate,
+    GameMode, LocalPlayerPose, MovementInput, PlayerMovementState, PlayerPositionUpdate,
+    PlayerRotationUpdate, RelativeTransformFlags, RenderLookSample, RuntimeBlockStateId,
+    SimulationError, Vec3d, WorldState, raycast_blocks,
 };
 use thiserror::Error;
 
@@ -38,6 +40,9 @@ struct ControlState {
     intended_yaw: Option<f32>,
     intended_pitch: Option<f32>,
     jump_changed_at: Option<Instant>,
+    attack: bool,
+    attack_changed: bool,
+    use_presses: u8,
 }
 
 #[derive(Debug, Default)]
@@ -51,6 +56,9 @@ struct ControlSample {
     intended_yaw: Option<f32>,
     intended_pitch: Option<f32>,
     jump_changed_at: Option<Instant>,
+    attack: bool,
+    attack_changed: bool,
+    use_presses: u8,
 }
 
 /// UI-side movement endpoint. Held input and look deltas coalesce, while a
@@ -90,6 +98,9 @@ impl WorldControlHandle {
                 Instant::now(),
                 true,
             );
+            state.attack = false;
+            state.attack_changed = true;
+            state.use_presses = 0;
         }
         let elapsed = started.elapsed();
         if elapsed > SLOW_INPUT_PATH {
@@ -135,10 +146,28 @@ impl WorldControlHandle {
                 Instant::now(),
                 true,
             );
+            state.attack = false;
+            state.attack_changed = true;
+            state.use_presses = 0;
         }
         let elapsed = started.elapsed();
         if elapsed > SLOW_INPUT_PATH {
             tracing::warn!(target: "movement::latency", ?elapsed, "movement focus-release cleanup was slow");
+        }
+    }
+
+    pub fn set_attack(&self, pressed: bool) {
+        if let Ok(mut state) = self.0.lock()
+            && state.attack != pressed
+        {
+            state.attack = pressed;
+            state.attack_changed = true;
+        }
+    }
+
+    pub fn press_use(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.use_presses = state.use_presses.saturating_add(1).min(8);
         }
     }
 }
@@ -158,6 +187,9 @@ impl WorldControlRunner {
             intended_yaw: state.intended_yaw,
             intended_pitch: state.intended_pitch,
             jump_changed_at: state.jump_changed_at,
+            attack: state.attack,
+            attack_changed: std::mem::take(&mut state.attack_changed),
+            use_presses: std::mem::take(&mut state.use_presses),
         }
     }
 
@@ -236,6 +268,8 @@ pub enum MovementError {
     Protocol(#[from] v775::BootstrapProtocolError),
     #[error("relative server correction has no local {field} baseline")]
     MissingCorrectionBaseline { field: &'static str },
+    #[error("block interaction failed: {0}")]
+    Interaction(String),
 }
 
 pub(crate) struct WorldMovementController {
@@ -251,12 +285,14 @@ pub(crate) struct WorldMovementController {
     last_look: RenderLookSample,
     flight_toggle: FlightToggleTracker,
     abilities: Option<v775::PlayerAbilities>,
+    interaction: BlockInteractionTracker,
 }
 
 impl WorldMovementController {
     pub(crate) fn new(
         controls: WorldControlRunner,
         collisions: BlockCollisionProfile,
+        outlines: BlockOutlineProfile,
         entity_id: i32,
     ) -> Self {
         Self {
@@ -272,6 +308,7 @@ impl WorldMovementController {
             last_look: RenderLookSample::default(),
             flight_toggle: FlightToggleTracker::default(),
             abilities: None,
+            interaction: BlockInteractionTracker::new(outlines),
         }
     }
 
@@ -285,6 +322,7 @@ impl WorldMovementController {
         self.last_correction_at = None;
         self.flight_toggle.reset();
         self.last_look = self.controls.clear_look_intent();
+        self.interaction.reset();
         if let Some(abilities) = &mut self.abilities {
             abilities.flying = false;
         }
@@ -362,13 +400,16 @@ impl WorldMovementController {
             (simulation.pose.z / 16.0).floor() as i32,
         );
         if world.loaded_chunks().get(player_chunk).is_none() {
-            let frames = self.packets.frames_with_flight(
+            let mut frames = self.packets.frames_with_flight(
                 simulation,
                 &controls.transitions,
                 controls.input,
                 self.entity_id,
                 &flight_changes,
             )?;
+            let interaction =
+                self.interaction
+                    .tick(world, simulation.pose, &controls, &mut frames)?;
             return Ok(Some(MovementTick {
                 pose: simulation.pose,
                 velocity: simulation.velocity,
@@ -386,6 +427,9 @@ impl WorldMovementController {
                 input_sampled_at,
                 jump_changed_at: controls.jump_changed_at,
                 frames,
+                target: interaction.target,
+                breaking: interaction.breaking,
+                prediction: interaction.prediction,
             }));
         }
         let result = simulation.tick(
@@ -400,13 +444,16 @@ impl WorldMovementController {
         if result.approximate_collision {
             self.approximate_collision_count = self.approximate_collision_count.saturating_add(1);
         }
-        let frames = self.packets.frames_with_flight(
+        let mut frames = self.packets.frames_with_flight(
             simulation,
             &controls.transitions,
             controls.input,
             self.entity_id,
             &flight_changes,
         )?;
+        let interaction = self
+            .interaction
+            .tick(world, simulation.pose, &controls, &mut frames)?;
         Ok(Some(MovementTick {
             pose: simulation.pose,
             velocity: simulation.velocity,
@@ -424,6 +471,9 @@ impl WorldMovementController {
             input_sampled_at,
             jump_changed_at: controls.jump_changed_at,
             frames,
+            target: interaction.target,
+            breaking: interaction.breaking,
+            prediction: interaction.prediction,
         }))
     }
 
@@ -433,6 +483,14 @@ impl WorldMovementController {
 
     pub(crate) fn predicted_pose(&self) -> Option<LocalPlayerPose> {
         self.simulation.as_ref().map(|state| state.pose)
+    }
+
+    pub(crate) fn acknowledge_interaction(&mut self, sequence: i32) {
+        self.interaction.acknowledge(sequence);
+    }
+
+    pub(crate) fn reconcile_block_updates(&mut self, updates: &[BlockStateUpdate]) {
+        self.interaction.reconcile_block_updates(updates);
     }
 
     pub(crate) fn reconcile(
@@ -779,6 +837,327 @@ impl FlightToggleTracker {
     }
 }
 
+struct BlockInteractionTracker {
+    outlines: BlockOutlineProfile,
+    active_break: Option<ActiveBreak>,
+    destroy_delay: u8,
+    next_sequence: i32,
+    latest_acknowledged: Option<i32>,
+    predictions: VecDeque<BreakPrediction>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveBreak {
+    target: BlockTarget,
+    progress: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InteractionTick {
+    target: Option<BlockTarget>,
+    breaking: Option<BlockBreakingOverlay>,
+    prediction: Option<BlockStateUpdate>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BreakPrediction {
+    sequence: i32,
+    position: BlockCoordinates,
+    previous: RuntimeBlockStateId,
+    expected: RuntimeBlockStateId,
+}
+
+const MAX_BREAK_PREDICTIONS: usize = 32;
+
+const CREATIVE_DESTROY_DELAY_TICKS: u8 = 5;
+
+impl BlockInteractionTracker {
+    fn new(outlines: BlockOutlineProfile) -> Self {
+        Self {
+            outlines,
+            active_break: None,
+            destroy_delay: 0,
+            next_sequence: 0,
+            latest_acknowledged: None,
+            predictions: VecDeque::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.active_break = None;
+        self.destroy_delay = 0;
+        self.next_sequence = 0;
+        self.latest_acknowledged = None;
+        self.predictions.clear();
+    }
+
+    fn acknowledge(&mut self, sequence: i32) {
+        if sequence >= 0
+            && self
+                .latest_acknowledged
+                .is_none_or(|current| sequence > current)
+        {
+            self.latest_acknowledged = Some(sequence);
+            while self
+                .predictions
+                .front()
+                .is_some_and(|prediction| prediction.sequence <= sequence)
+            {
+                if let Some(prediction) = self.predictions.pop_front() {
+                    tracing::debug!(
+                        target: "interaction::prediction",
+                        sequence = prediction.sequence,
+                        x = prediction.position.x,
+                        y = prediction.position.y,
+                        z = prediction.position.z,
+                        "server acknowledged predicted block break"
+                    );
+                }
+            }
+        }
+    }
+
+    fn reconcile_block_updates(&mut self, updates: &[BlockStateUpdate]) {
+        for update in updates {
+            if let Some(index) = self
+                .predictions
+                .iter()
+                .position(|prediction| prediction.position == update.position)
+                && let Some(prediction) = self.predictions.remove(index)
+            {
+                if update.state == prediction.expected {
+                    tracing::debug!(
+                        target: "interaction::prediction",
+                        sequence = prediction.sequence,
+                        x = update.position.x,
+                        y = update.position.y,
+                        z = update.position.z,
+                        "authoritative block update confirmed predicted break"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "interaction::prediction",
+                        sequence = prediction.sequence,
+                        x = update.position.x,
+                        y = update.position.y,
+                        z = update.position.z,
+                        predicted_state = prediction.expected.0,
+                        authoritative_state = update.state.0,
+                        previous_state = prediction.previous.0,
+                        "authoritative block update rolled back predicted break"
+                    );
+                }
+            }
+        }
+    }
+
+    fn tick(
+        &mut self,
+        world: &WorldState,
+        pose: LocalPlayerPose,
+        controls: &ControlSample,
+        frames: &mut Vec<Vec<u8>>,
+    ) -> Result<InteractionTick, MovementError> {
+        let Some(session) = world.session() else {
+            self.active_break = None;
+            self.destroy_delay = 0;
+            return Ok(InteractionTick::default());
+        };
+        let yaw = f64::from(pose.yaw).to_radians();
+        let pitch = f64::from(pose.pitch).to_radians();
+        let direction = Vec3d::new(
+            -yaw.sin() * pitch.cos(),
+            -pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        );
+        let target = raycast_blocks(
+            world.loaded_chunks(),
+            session.dimension_geometry,
+            &self.outlines,
+            Vec3d::new(pose.x, pose.y + pose.eye_height, pose.z),
+            direction,
+            BlockReach::for_game_mode(session.spawn_context.game_mode),
+        )
+        .map_err(|error| MovementError::Interaction(error.to_string()))?;
+        let mut predicted_update = None;
+
+        if session.spawn_context.game_mode == GameMode::Creative {
+            self.active_break = None;
+            if self.creative_attack_ready(controls.attack, target.is_some())
+                && let Some(target) = target.as_ref()
+            {
+                let sequence = self.sequence();
+                frames.push(v775::encode_play_player_action(
+                    v775::PlayerAction::StartDestroyBlock,
+                    protocol_position(target.position)?,
+                    protocol_face(target.face),
+                    sequence,
+                )?);
+            }
+        } else {
+            if self.destroy_delay > 0 {
+                self.destroy_delay -= 1;
+            } else {
+                let should_abort = self.active_break.as_ref().is_some_and(|active| {
+                    !controls.attack
+                        || target
+                            .as_ref()
+                            .is_none_or(|target| target.position != active.target.position)
+                });
+                if should_abort && let Some(active) = self.active_break.take() {
+                    let sequence = self.sequence();
+                    frames.push(v775::encode_play_player_action(
+                        v775::PlayerAction::AbortDestroyBlock,
+                        protocol_position(active.target.position)?,
+                        protocol_face(active.target.face),
+                        sequence,
+                    )?);
+                }
+                if controls.attack
+                    && self.active_break.is_none()
+                    && let Some(target) = target.as_ref()
+                    && self.outlines.bare_hand_destroy_progress(target.state) > 0.0
+                {
+                    let sequence = self.sequence();
+                    frames.push(v775::encode_play_player_action(
+                        v775::PlayerAction::StartDestroyBlock,
+                        protocol_position(target.position)?,
+                        protocol_face(target.face),
+                        sequence,
+                    )?);
+                    self.active_break = Some(ActiveBreak {
+                        target: target.clone(),
+                        progress: 0.0,
+                    });
+                } else if controls.attack
+                    && let Some(active) = self.active_break.as_mut()
+                {
+                    let completed = Self::advance_survival_break(&self.outlines, active);
+                    if completed && let Some(completed) = self.active_break.take() {
+                        let sequence = self.sequence();
+                        frames.push(v775::encode_play_player_action(
+                            v775::PlayerAction::StopDestroyBlock,
+                            protocol_position(completed.target.position)?,
+                            protocol_face(completed.target.face),
+                            sequence,
+                        )?);
+                        let prediction = self.outlines.air_state().map(|air| BlockStateUpdate {
+                            position: completed.target.position,
+                            state: air,
+                        });
+                        if let Some(prediction) = prediction {
+                            if self.predictions.len() == MAX_BREAK_PREDICTIONS {
+                                self.predictions.pop_front();
+                            }
+                            self.predictions.push_back(BreakPrediction {
+                                sequence,
+                                position: prediction.position,
+                                previous: completed.target.state,
+                                expected: prediction.state,
+                            });
+                            tracing::debug!(
+                                target: "interaction::prediction",
+                                sequence,
+                                x = prediction.position.x,
+                                y = prediction.position.y,
+                                z = prediction.position.z,
+                                previous_state = completed.target.state.0,
+                                predicted_state = prediction.state.0,
+                                "applied completed local block-break prediction"
+                            );
+                            predicted_update = Some(prediction);
+                        }
+                        self.destroy_delay = CREATIVE_DESTROY_DELAY_TICKS;
+                    }
+                }
+            }
+        }
+        for _ in 0..controls.use_presses {
+            if let Some(target) = target.as_ref() {
+                frames.push(v775::encode_play_use_item_on(
+                    v775::InteractionHand::Main,
+                    v775::BlockHit {
+                        position: protocol_position(target.position)?,
+                        face: protocol_face(target.face),
+                        location_x: (target.hit.x - f64::from(target.position.x)) as f32,
+                        location_y: (target.hit.y - f64::from(target.position.y)) as f32,
+                        location_z: (target.hit.z - f64::from(target.position.z)) as f32,
+                        inside: target.distance == 0.0,
+                        world_border_hit: false,
+                    },
+                    self.sequence(),
+                )?);
+            } else {
+                frames.push(v775::encode_play_use_item(
+                    v775::InteractionHand::Main,
+                    self.sequence(),
+                    pose.yaw,
+                    pose.pitch,
+                )?);
+            }
+        }
+        let _ = controls.attack_changed;
+        let breaking = self.active_break.as_ref().and_then(|active| {
+            BlockBreakingOverlay::from_progress(
+                active.target.position,
+                active.target.state,
+                active.progress,
+            )
+        });
+        let visible_target = if predicted_update.is_some() {
+            None
+        } else {
+            target
+        };
+        Ok(InteractionTick {
+            target: visible_target,
+            breaking,
+            prediction: predicted_update,
+        })
+    }
+
+    fn sequence(&mut self) -> i32 {
+        let result = self.next_sequence;
+        self.next_sequence = self.next_sequence.checked_add(1).unwrap_or(0);
+        result
+    }
+
+    fn creative_attack_ready(&mut self, attack: bool, has_target: bool) -> bool {
+        if self.destroy_delay > 0 {
+            self.destroy_delay -= 1;
+            return false;
+        }
+        if attack && has_target {
+            self.destroy_delay = CREATIVE_DESTROY_DELAY_TICKS;
+            return true;
+        }
+        false
+    }
+
+    fn advance_survival_break(outlines: &BlockOutlineProfile, active: &mut ActiveBreak) -> bool {
+        active.progress += outlines.bare_hand_destroy_progress(active.target.state);
+        active.progress >= 1.0
+    }
+}
+
+fn protocol_position(
+    position: BlockCoordinates,
+) -> Result<cubic_protocol::BlockPosition, MovementError> {
+    cubic_protocol::BlockPosition::new(position.x, position.y, position.z)
+        .map_err(|error| MovementError::Interaction(error.to_string()))
+}
+
+const fn protocol_face(face: BlockFace) -> v775::BlockFace {
+    match face {
+        BlockFace::Down => v775::BlockFace::Down,
+        BlockFace::Up => v775::BlockFace::Up,
+        BlockFace::North => v775::BlockFace::North,
+        BlockFace::South => v775::BlockFace::South,
+        BlockFace::West => v775::BlockFace::West,
+        BlockFace::East => v775::BlockFace::East,
+    }
+}
+
 pub(crate) struct MovementTick {
     pub(crate) pose: LocalPlayerPose,
     pub(crate) velocity: Vec3d,
@@ -796,6 +1175,9 @@ pub(crate) struct MovementTick {
     pub(crate) input_sampled_at: Instant,
     pub(crate) jump_changed_at: Option<Instant>,
     pub(crate) frames: Vec<Vec<u8>>,
+    pub(crate) target: Option<BlockTarget>,
+    pub(crate) breaking: Option<BlockBreakingOverlay>,
+    pub(crate) prediction: Option<BlockStateUpdate>,
 }
 
 #[derive(Default)]
@@ -1063,6 +1445,25 @@ mod tests {
             Vec3d::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn interaction_input_is_bounded_and_focus_reset_releases_attack() {
+        let (handle, runner) = WorldControlHandle::new();
+        handle.set_attack(true);
+        for _ in 0..100 {
+            handle.press_use();
+        }
+        let sample = runner.take();
+        assert!(sample.attack);
+        assert!(sample.attack_changed);
+        assert_eq!(sample.use_presses, 8);
+
+        handle.reset_input(1);
+        let reset = runner.take();
+        assert!(!reset.attack);
+        assert!(reset.attack_changed);
+        assert_eq!(reset.use_presses, 0);
     }
 
     #[test]
@@ -1603,8 +2004,12 @@ mod tests {
     #[test]
     fn relative_position_correction_uses_predicted_pose_not_stale_server_pose() {
         let (_handle, runner) = WorldControlHandle::new();
-        let mut controller =
-            WorldMovementController::new(runner, BlockCollisionProfile::synthetic([]), 7);
+        let mut controller = WorldMovementController::new(
+            runner,
+            BlockCollisionProfile::synthetic([]),
+            BlockOutlineProfile::synthetic([]),
+            7,
+        );
         controller.simulation = Some(
             PlayerMovementState::from_authoritative(
                 LocalPlayerPose::new(100.0, 70.0, -40.0, 30.0, 10.0),
@@ -1637,8 +2042,12 @@ mod tests {
     #[test]
     fn correction_metrics_count_distinct_and_rapid_packets_and_zero_replaced_velocity() {
         let (_handle, runner) = WorldControlHandle::new();
-        let mut controller =
-            WorldMovementController::new(runner, BlockCollisionProfile::synthetic([]), 7);
+        let mut controller = WorldMovementController::new(
+            runner,
+            BlockCollisionProfile::synthetic([]),
+            BlockOutlineProfile::synthetic([]),
+            7,
+        );
         controller.simulation = Some(
             PlayerMovementState::from_authoritative(
                 LocalPlayerPose::new(-2.25, 69.0, -4.5, 0.0, 0.0),
@@ -1768,8 +2177,12 @@ mod tests {
     #[test]
     fn server_ability_revocation_clears_flight_and_partial_toggle_state() {
         let (_handle, runner) = WorldControlHandle::new();
-        let mut controller =
-            WorldMovementController::new(runner, BlockCollisionProfile::synthetic([]), 7);
+        let mut controller = WorldMovementController::new(
+            runner,
+            BlockCollisionProfile::synthetic([]),
+            BlockOutlineProfile::synthetic([]),
+            7,
+        );
         controller.simulation = Some(test_state());
         controller
             .apply_abilities(v775::PlayerAbilities {
@@ -1809,5 +2222,119 @@ mod tests {
         controller.reset(9);
         assert!(controller.simulation.is_none());
         assert_eq!(controller.abilities.map(|value| value.flying), Some(false));
+    }
+
+    fn test_block_target(state: cubic_world::RuntimeBlockStateId) -> BlockTarget {
+        let bounds = cubic_world::Aabb::new(Vec3d::new(0.0, 64.0, 0.0), Vec3d::new(1.0, 65.0, 1.0));
+        BlockTarget {
+            position: BlockCoordinates { x: 0, y: 64, z: 0 },
+            state,
+            face: BlockFace::Up,
+            hit: Vec3d::new(0.5, 65.0, 0.5),
+            distance: 2.0,
+            bounds,
+            outline: [bounds].into(),
+        }
+    }
+
+    #[test]
+    fn creative_destroy_delay_is_fixed_tick_based_and_target_changes_do_not_bypass_it() {
+        let mut tracker = BlockInteractionTracker::new(BlockOutlineProfile::synthetic([]));
+        assert!(tracker.creative_attack_ready(true, true));
+        for _ in 0..CREATIVE_DESTROY_DELAY_TICKS {
+            assert!(!tracker.creative_attack_ready(true, true));
+        }
+        assert!(tracker.creative_attack_ready(true, true));
+
+        // Release and target loss consume the existing delay; neither arms a
+        // fresh delay nor permits an immediate second block.
+        assert!(!tracker.creative_attack_ready(false, false));
+        assert!(!tracker.creative_attack_ready(true, true));
+        tracker.reset();
+        assert!(tracker.creative_attack_ready(true, true));
+    }
+
+    #[test]
+    fn survival_empty_hand_progress_completes_on_ticks_and_unbreakable_never_advances() {
+        let breakable = cubic_world::RuntimeBlockStateId(40);
+        let unbreakable = cubic_world::RuntimeBlockStateId(41);
+        let profile = BlockOutlineProfile::synthetic_with_break_progress([
+            (breakable, cubic_world::CollisionShape::FullCube, 0.25),
+            (unbreakable, cubic_world::CollisionShape::FullCube, 0.0),
+        ]);
+        let mut active = ActiveBreak {
+            target: test_block_target(breakable),
+            progress: 0.0,
+        };
+        for _ in 0..3 {
+            assert!(!BlockInteractionTracker::advance_survival_break(
+                &profile,
+                &mut active
+            ));
+        }
+        assert!(BlockInteractionTracker::advance_survival_break(
+            &profile,
+            &mut active
+        ));
+
+        let mut blocked = ActiveBreak {
+            target: test_block_target(unbreakable),
+            progress: 0.0,
+        };
+        for _ in 0..200 {
+            assert!(!BlockInteractionTracker::advance_survival_break(
+                &profile,
+                &mut blocked
+            ));
+        }
+        assert_eq!(blocked.progress, 0.0);
+    }
+
+    #[test]
+    fn break_predictions_are_bounded_confirmed_and_reconciled_by_position() {
+        let mut tracker = BlockInteractionTracker::new(BlockOutlineProfile::synthetic([]));
+        for sequence in 0..(MAX_BREAK_PREDICTIONS as i32 + 3) {
+            tracker.predictions.push_back(BreakPrediction {
+                sequence,
+                position: BlockCoordinates {
+                    x: sequence,
+                    y: 64,
+                    z: 0,
+                },
+                previous: RuntimeBlockStateId(5),
+                expected: RuntimeBlockStateId(0),
+            });
+            if tracker.predictions.len() > MAX_BREAK_PREDICTIONS {
+                tracker.predictions.pop_front();
+            }
+        }
+        assert_eq!(tracker.predictions.len(), MAX_BREAK_PREDICTIONS);
+
+        let confirmed = tracker.predictions[3];
+        tracker.reconcile_block_updates(&[BlockStateUpdate {
+            position: confirmed.position,
+            state: confirmed.expected,
+        }]);
+        assert!(
+            !tracker
+                .predictions
+                .iter()
+                .any(|prediction| prediction.position == confirmed.position)
+        );
+
+        let rolled_back = tracker.predictions[4];
+        tracker.reconcile_block_updates(&[BlockStateUpdate {
+            position: rolled_back.position,
+            state: rolled_back.previous,
+        }]);
+        assert!(
+            !tracker
+                .predictions
+                .iter()
+                .any(|prediction| prediction.position == rolled_back.position)
+        );
+
+        tracker.acknowledge(i32::MAX);
+        assert!(tracker.predictions.is_empty());
     }
 }

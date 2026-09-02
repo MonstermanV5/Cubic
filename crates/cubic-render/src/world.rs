@@ -23,8 +23,9 @@ use crate::{
     BlockResources,
     block_resources::TextureAnimationData,
     mesher::{
-        ChunkMesh, FLUID_DEBUG_LOG_CELL_BUDGET, FluidDebugOptions, MeshStatistics, TerrainVertex,
-        log_fluid_mesh_diagnostics, mesh_chunk_with_debug,
+        ChunkMesh, DestroyOverlayVertex, FLUID_DEBUG_LOG_CELL_BUDGET, FluidDebugOptions,
+        MeshStatistics, TerrainVertex, log_fluid_mesh_diagnostics, mesh_chunk_with_debug,
+        mesh_destroy_overlay,
     },
 };
 
@@ -43,11 +44,39 @@ const SOLID_DEPTH_COMPARE: CompareFunction = CompareFunction::LessEqual;
 const TRANSLUCENT_DEPTH_COMPARE: CompareFunction = CompareFunction::LessEqual;
 const TRANSLUCENT_DEPTH_WRITE: bool = true;
 const LAYERED_TRANSLUCENT_DEPTH_WRITE: bool = false;
+const SELECTION_TOPOLOGY: PrimitiveTopology = PrimitiveTopology::TriangleList;
+const SELECTION_DEPTH_COMPARE: CompareFunction = CompareFunction::LessEqual;
+const SELECTION_DEPTH_BIAS: DepthBiasState = DepthBiasState {
+    constant: 0,
+    slope_scale: 0.0,
+    clamp: 0.0,
+};
+const SELECTION_VIEW_SHRINK: f32 = 255.0 / 256.0;
+const SELECTION_COLOR_RGBA8: [u8; 4] = [0, 0, 0, 102];
+const DESTROY_DEPTH_BIAS: DepthBiasState = DepthBiasState {
+    constant: -1,
+    slope_scale: -10.0,
+    clamp: 0.0,
+};
+const DESTROY_BLEND: BlendState = BlendState {
+    color: BlendComponent {
+        src_factor: BlendFactor::Dst,
+        dst_factor: BlendFactor::Src,
+        operation: BlendOperation::Add,
+    },
+    alpha: BlendComponent {
+        src_factor: BlendFactor::One,
+        dst_factor: BlendFactor::Zero,
+        operation: BlendOperation::Add,
+    },
+};
 
 pub(crate) struct WorldRenderer {
     pipeline: RenderPipeline,
     translucent_pipeline: RenderPipeline,
     layered_translucent_pipeline: RenderPipeline,
+    selection_pipeline: RenderPipeline,
+    destroy_pipeline: RenderPipeline,
     camera_buffer: Buffer,
     camera_bind_group: BindGroup,
     atlas_bind_group: BindGroup,
@@ -67,6 +96,18 @@ pub(crate) struct WorldRenderer {
     pose: Option<PosePresentation>,
     worker: Option<MeshWorker>,
     progress: MeshProgress,
+    target: Option<cubic_world::BlockTarget>,
+    selection_buffer: Option<Buffer>,
+    selection_vertex_count: u32,
+    selection_dirty: bool,
+    resources: Arc<BlockResources>,
+    _destroy_textures: Vec<Texture>,
+    destroy_bind_groups: Vec<BindGroup>,
+    breaking: Option<cubic_world::BlockBreakingOverlay>,
+    destroy_vertex_buffer: Option<Buffer>,
+    destroy_index_buffer: Option<Buffer>,
+    destroy_index_count: u32,
+    rebuild_destroy_overlay: bool,
 }
 
 impl WorldRenderer {
@@ -74,6 +115,7 @@ impl WorldRenderer {
         device: &Device,
         queue: &Queue,
         surface_format: TextureFormat,
+        selection_format: TextureFormat,
         width: u32,
         height: u32,
         mut resources: BlockResources,
@@ -92,11 +134,19 @@ impl WorldRenderer {
             label: Some("Cubic diagnostic terrain shader"),
             source: ShaderSource::Wgsl(include_str!("world.wgsl").into()),
         });
+        let selection_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Cubic block selection shader"),
+            source: ShaderSource::Wgsl(include_str!("selection.wgsl").into()),
+        });
+        let destroy_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Cubic block destroy overlay shader"),
+            source: ShaderSource::Wgsl(include_str!("destroy.wgsl").into()),
+        });
         let camera_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("Cubic world camera layout"),
             entries: &[BindGroupLayoutEntry {
                 binding: 0,
-                visibility: ShaderStages::VERTEX,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                 ty: BindingType::Buffer {
                     ty: BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -361,6 +411,179 @@ impl WorldRenderer {
                 multiview_mask: None,
                 cache: None,
             });
+        let selection_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Cubic block selection pipeline layout"),
+            bind_group_layouts: &[Some(&camera_layout)],
+            immediate_size: 0,
+        });
+        let selection_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Cubic block selection pipeline"),
+            layout: Some(&selection_layout),
+            vertex: VertexState {
+                module: &selection_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(VertexBufferLayout {
+                    array_stride: size_of::<SelectionVertex>() as BufferAddress,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
+                })],
+            },
+            fragment: Some(FragmentState {
+                module: &selection_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: selection_format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: SELECTION_TOPOLOGY,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(SELECTION_DEPTH_COMPARE),
+                stencil: StencilState::default(),
+                // The outline remains expanded in world space. Keeping bias
+                // zero also avoids resurrecting the former LineList validation
+                // failure if this portable triangle implementation evolves.
+                bias: SELECTION_DEPTH_BIAS,
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let destroy_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Cubic destroy-stage texture layout"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let destroy_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("Cubic destroy-stage sampler"),
+            mag_filter: FilterMode::Nearest,
+            min_filter: FilterMode::Nearest,
+            mipmap_filter: MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let mut destroy_textures = Vec::with_capacity(resources.destroy_stages.len());
+        let mut destroy_bind_groups = Vec::with_capacity(resources.destroy_stages.len());
+        for (stage, sprite) in resources.destroy_stages.iter().enumerate() {
+            let texture = device.create_texture(&TextureDescriptor {
+                label: Some("Cubic vanilla destroy-stage texture"),
+                size: Extent3d {
+                    width: sprite.width,
+                    height: sprite.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8Unorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                &sprite.rgba,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(sprite.width * 4),
+                    rows_per_image: Some(sprite.height),
+                },
+                Extent3d {
+                    width: sprite.width,
+                    height: sprite.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = texture.create_view(&TextureViewDescriptor::default());
+            destroy_bind_groups.push(device.create_bind_group(&BindGroupDescriptor {
+                label: Some(&format!("Cubic destroy-stage {stage} bind group")),
+                layout: &destroy_layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::TextureView(&view),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::Sampler(&destroy_sampler),
+                    },
+                ],
+            }));
+            destroy_textures.push(texture);
+        }
+        let destroy_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Cubic destroy overlay pipeline layout"),
+            bind_group_layouts: &[Some(&camera_layout), Some(&destroy_layout)],
+            immediate_size: 0,
+        });
+        let destroy_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Cubic block destroy overlay pipeline"),
+            layout: Some(&destroy_pipeline_layout),
+            vertex: VertexState {
+                module: &destroy_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(VertexBufferLayout {
+                    array_stride: size_of::<DestroyOverlayVertex>() as BufferAddress,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &vertex_attr_array![0 => Float32x3, 1 => Float32x2],
+                })],
+            },
+            fragment: Some(FragmentState {
+                module: &destroy_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: selection_format,
+                    blend: Some(DESTROY_BLEND),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: Some(Face::Back),
+                front_face: FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::LessEqual),
+                stencil: StencilState::default(),
+                bias: DESTROY_DEPTH_BIAS,
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let animations = resources
             .atlas
             .animations
@@ -368,10 +591,13 @@ impl WorldRenderer {
             .cloned()
             .map(TextureAnimationRuntime::new)
             .collect();
+        let resources = Arc::new(resources);
         Self {
             pipeline,
             translucent_pipeline,
             layered_translucent_pipeline,
+            selection_pipeline,
+            destroy_pipeline,
             camera_buffer,
             camera_bind_group,
             atlas_bind_group,
@@ -389,8 +615,20 @@ impl WorldRenderer {
             geometry: None,
             dimension: None,
             pose: None,
-            worker: MeshWorker::new(resources, device.clone(), fluid_debug),
+            worker: MeshWorker::new(Arc::clone(&resources), device.clone(), fluid_debug),
             progress: MeshProgress::new(),
+            target: None,
+            selection_buffer: None,
+            selection_vertex_count: 0,
+            selection_dirty: false,
+            resources,
+            _destroy_textures: destroy_textures,
+            destroy_bind_groups,
+            breaking: None,
+            destroy_vertex_buffer: None,
+            destroy_index_buffer: None,
+            destroy_index_count: 0,
+            rebuild_destroy_overlay: false,
         }
     }
 
@@ -415,6 +653,14 @@ impl WorldRenderer {
             self.pending.clear();
             self.pose = None;
             self.progress = MeshProgress::new();
+            self.target = None;
+            self.breaking = None;
+            self.selection_buffer = None;
+            self.selection_vertex_count = 0;
+            self.selection_dirty = false;
+            self.destroy_vertex_buffer = None;
+            self.destroy_index_buffer = None;
+            self.destroy_index_count = 0;
         }
         self.dimension = update.dimension.or_else(|| self.dimension.take());
         self.geometry = update.geometry.or(self.geometry);
@@ -427,6 +673,14 @@ impl WorldRenderer {
             } else {
                 self.pose = Some(PosePresentation::new(sample));
             }
+        }
+        if self.target != update.target {
+            self.target = update.target;
+            self.selection_dirty = true;
+        }
+        if self.breaking != update.breaking {
+            self.breaking = update.breaking;
+            self.rebuild_destroy_overlay = true;
         }
         for delta in update.chunks {
             match delta {
@@ -455,7 +709,7 @@ impl WorldRenderer {
         mark_dirty_with_neighbors(&mut self.dirty, coordinate, self.revision);
     }
 
-    pub(crate) fn prepare(&mut self, _device: &Device, queue: &Queue, width: u32, height: u32) {
+    pub(crate) fn prepare(&mut self, device: &Device, queue: &Queue, width: u32, height: u32) {
         let elapsed = self.animation_started.elapsed();
         for animation in &mut self.animations {
             animation.update(queue, &self.atlas_texture, elapsed);
@@ -506,6 +760,45 @@ impl WorldRenderer {
         if let Some(pose) = self.pose.map(|pose| pose.display(Instant::now())) {
             let camera = CameraUniform::from_pose(pose, width, height);
             queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera));
+        }
+        if self.selection_dirty {
+            self.selection_dirty = false;
+            let vertices = selection_vertices_for_target(self.target.clone());
+            self.selection_vertex_count = u32::try_from(vertices.len()).unwrap_or(0);
+            self.selection_buffer = (!vertices.is_empty()).then(|| {
+                device.create_buffer_init(&BufferInitDescriptor {
+                    label: Some("Cubic block selection outline"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: BufferUsages::VERTEX,
+                })
+            });
+        }
+        if self.rebuild_destroy_overlay {
+            self.rebuild_destroy_overlay = false;
+            self.destroy_vertex_buffer = None;
+            self.destroy_index_buffer = None;
+            self.destroy_index_count = 0;
+            if let Some(breaking) = self.breaking {
+                match mesh_destroy_overlay(breaking.position, breaking.state, &self.resources) {
+                    Ok(mesh) if !mesh.indices.is_empty() => {
+                        self.destroy_index_count = u32::try_from(mesh.indices.len()).unwrap_or(0);
+                        self.destroy_vertex_buffer =
+                            Some(device.create_buffer_init(&BufferInitDescriptor {
+                                label: Some("Cubic block destroy overlay vertices"),
+                                contents: bytemuck::cast_slice(&mesh.vertices),
+                                usage: BufferUsages::VERTEX,
+                            }));
+                        self.destroy_index_buffer =
+                            Some(device.create_buffer_init(&BufferInitDescriptor {
+                                label: Some("Cubic block destroy overlay indices"),
+                                contents: bytemuck::cast_slice(&mesh.indices),
+                                usage: BufferUsages::INDEX,
+                            }));
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "bounded destroy-overlay baking failed"),
+                }
+            }
         }
         let camera_elapsed = camera_started.elapsed();
         let elapsed = started.elapsed();
@@ -623,6 +916,41 @@ impl WorldRenderer {
                 pass.draw_indexed(0..mesh.layered_translucent_index_count, 0, 0..1);
             }
         }
+    }
+
+    pub(crate) fn draw_selection<'a>(&'a self, pass: &mut RenderPass<'a>) {
+        if self.pose.is_none() {
+            return;
+        }
+        let Some(buffer) = &self.selection_buffer else {
+            return;
+        };
+        pass.set_pipeline(&self.selection_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..self.selection_vertex_count, 0..1);
+    }
+
+    pub(crate) fn draw_destroy_overlay<'a>(&'a self, pass: &mut RenderPass<'a>) {
+        if self.pose.is_none() || self.destroy_index_count == 0 {
+            return;
+        }
+        let (Some(breaking), Some(vertices), Some(indices)) = (
+            self.breaking,
+            self.destroy_vertex_buffer.as_ref(),
+            self.destroy_index_buffer.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(texture) = self.destroy_bind_groups.get(usize::from(breaking.stage)) else {
+            return;
+        };
+        pass.set_pipeline(&self.destroy_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, texture, &[]);
+        pass.set_vertex_buffer(0, vertices.slice(..));
+        pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
+        pass.draw_indexed(0..self.destroy_index_count, 0, 0..1);
     }
 
     pub(crate) fn depth_view(&self) -> &TextureView {
@@ -959,14 +1287,13 @@ struct MeshWorker {
 
 impl MeshWorker {
     fn new(
-        resources: BlockResources,
+        resources: Arc<BlockResources>,
         device: Device,
         fluid_debug: FluidDebugOptions,
     ) -> Option<Self> {
         let (result_tx, results) = mpsc::sync_channel(MAX_PENDING_MESH_JOBS);
         let available = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         let (worker_count, queue_per_worker) = worker_layout(available);
-        let resources = Arc::new(resources);
         let active = Arc::new(AtomicUsize::new(0));
         let fluid_log_budget = Arc::new(AtomicUsize::new(FLUID_DEBUG_LOG_CELL_BUDGET));
         let mut jobs = Vec::with_capacity(worker_count);
@@ -1303,8 +1630,149 @@ impl DepthTarget {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct SelectionVertex {
+    start: [f32; 3],
+    end: [f32; 3],
+    corner: [f32; 2],
+}
+
+fn selection_vertices(target: cubic_world::BlockTarget) -> Vec<SelectionVertex> {
+    let boxes = target.outline.as_ref();
+    let xs = shape_coordinates(boxes, |bounds| (bounds.min.x, bounds.max.x));
+    let ys = shape_coordinates(boxes, |bounds| (bounds.min.y, bounds.max.y));
+    let zs = shape_coordinates(boxes, |bounds| (bounds.min.z, bounds.max.z));
+    if xs.len() < 2 || ys.len() < 2 || zs.len() < 2 {
+        return Vec::new();
+    }
+    let mut segments = Vec::new();
+    collect_axis_edges(boxes, &xs, &ys, &zs, 0, &mut segments);
+    collect_axis_edges(boxes, &ys, &xs, &zs, 1, &mut segments);
+    collect_axis_edges(boxes, &zs, &xs, &ys, 2, &mut segments);
+
+    segments
+        .into_iter()
+        .flat_map(selection_segment_vertices)
+        .collect()
+}
+
+fn selection_segment_vertices((start, end): ([f64; 3], [f64; 3])) -> [SelectionVertex; 6] {
+    let start = start.map(|coordinate| coordinate as f32);
+    let end = end.map(|coordinate| coordinate as f32);
+    [
+        [0.0, -1.0],
+        [1.0, -1.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+        [1.0, -1.0],
+        [1.0, 1.0],
+    ]
+    .map(|corner| SelectionVertex { start, end, corner })
+}
+
+fn selection_line_width(framebuffer_width: u32) -> f32 {
+    (framebuffer_width as f32 / 1920.0 * 2.5).max(2.5)
+}
+
+fn shape_coordinates(
+    boxes: &[cubic_world::Aabb],
+    select: impl Fn(&cubic_world::Aabb) -> (f64, f64),
+) -> Vec<f64> {
+    let mut values = boxes
+        .iter()
+        .flat_map(|bounds| {
+            let (min, max) = select(bounds);
+            [min, max]
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(f64::total_cmp);
+    values.dedup();
+    values
+}
+
+fn collect_axis_edges(
+    boxes: &[cubic_world::Aabb],
+    along: &[f64],
+    perpendicular_a: &[f64],
+    perpendicular_b: &[f64],
+    axis: usize,
+    output: &mut Vec<([f64; 3], [f64; 3])>,
+) {
+    const SAMPLE_EPSILON: f64 = 1.0e-7;
+    for &a in perpendicular_a {
+        for &b in perpendicular_b {
+            let mut run_start = None;
+            for interval in along.windows(2) {
+                let middle = (interval[0] + interval[1]) * 0.5;
+                let occupied = [
+                    shape_contains(
+                        boxes,
+                        axis_point(axis, middle, a - SAMPLE_EPSILON, b - SAMPLE_EPSILON),
+                    ),
+                    shape_contains(
+                        boxes,
+                        axis_point(axis, middle, a - SAMPLE_EPSILON, b + SAMPLE_EPSILON),
+                    ),
+                    shape_contains(
+                        boxes,
+                        axis_point(axis, middle, a + SAMPLE_EPSILON, b - SAMPLE_EPSILON),
+                    ),
+                    shape_contains(
+                        boxes,
+                        axis_point(axis, middle, a + SAMPLE_EPSILON, b + SAMPLE_EPSILON),
+                    ),
+                ];
+                let count = occupied.iter().filter(|value| **value).count();
+                let visible = matches!(count, 1 | 3)
+                    || (count == 2
+                        && ((occupied[0] && occupied[3]) || (occupied[1] && occupied[2])));
+                if visible {
+                    run_start.get_or_insert(interval[0]);
+                } else if let Some(start) = run_start.take() {
+                    output.push((
+                        axis_point(axis, start, a, b),
+                        axis_point(axis, interval[0], a, b),
+                    ));
+                }
+            }
+            if let Some(start) = run_start
+                && let Some(end) = along.last().copied()
+            {
+                output.push((axis_point(axis, start, a, b), axis_point(axis, end, a, b)));
+            }
+        }
+    }
+}
+
+fn axis_point(axis: usize, along: f64, a: f64, b: f64) -> [f64; 3] {
+    match axis {
+        0 => [along, a, b],
+        1 => [a, along, b],
+        _ => [a, b, along],
+    }
+}
+
+fn shape_contains(boxes: &[cubic_world::Aabb], point: [f64; 3]) -> bool {
+    boxes.iter().any(|bounds| {
+        point[0] > bounds.min.x
+            && point[0] < bounds.max.x
+            && point[1] > bounds.min.y
+            && point[1] < bounds.max.y
+            && point[2] > bounds.min.z
+            && point[2] < bounds.max.z
+    })
+}
+
+fn selection_vertices_for_target(target: Option<cubic_world::BlockTarget>) -> Vec<SelectionVertex> {
+    target.map_or_else(Vec::new, selection_vertices)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     view_projection: [[f32; 4]; 4],
+    eye_and_selection_shrink: [f32; 4],
+    viewport_and_selection_width: [f32; 4],
+    selection_color: [f32; 4],
 }
 impl CameraUniform {
     const fn identity() -> Self {
@@ -1315,6 +1783,9 @@ impl CameraUniform {
                 [0., 0., 1., 0.],
                 [0., 0., 0., 1.],
             ],
+            eye_and_selection_shrink: [0.0, 0.0, 0.0, SELECTION_VIEW_SHRINK],
+            viewport_and_selection_width: [1.0, 1.0, 2.5, 0.0],
+            selection_color: selection_color(),
         }
     }
     fn from_pose(pose: LocalPlayerPose, width: u32, height: u32) -> Self {
@@ -1330,8 +1801,25 @@ impl CameraUniform {
                 perspective(70_f32.to_radians(), aspect, 0.05, 2048.0),
                 look_to_basis(eye, forward, right, up),
             ),
+            eye_and_selection_shrink: [eye[0], eye[1], eye[2], SELECTION_VIEW_SHRINK],
+            viewport_and_selection_width: [
+                width.max(1) as f32,
+                height.max(1) as f32,
+                selection_line_width(width),
+                0.0,
+            ],
+            selection_color: selection_color(),
         }
     }
+}
+
+const fn selection_color() -> [f32; 4] {
+    [
+        SELECTION_COLOR_RGBA8[0] as f32 / 255.0,
+        SELECTION_COLOR_RGBA8[1] as f32 / 255.0,
+        SELECTION_COLOR_RGBA8[2] as f32 / 255.0,
+        SELECTION_COLOR_RGBA8[3] as f32 / 255.0,
+    ]
 }
 
 fn neighbors_including(c: ChunkCoordinate) -> [ChunkCoordinate; 5] {
@@ -1445,6 +1933,93 @@ fn multiply(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destroy_overlay_uses_vanillas_multiplicative_crumbling_state() {
+        assert_eq!(DESTROY_BLEND.color.src_factor, BlendFactor::Dst);
+        assert_eq!(DESTROY_BLEND.color.dst_factor, BlendFactor::Src);
+        assert_eq!(DESTROY_BLEND.alpha.src_factor, BlendFactor::One);
+        assert_eq!(DESTROY_BLEND.alpha.dst_factor, BlendFactor::Zero);
+        assert_eq!(DESTROY_DEPTH_BIAS.constant, -1);
+        assert_eq!(DESTROY_DEPTH_BIAS.slope_scale, -10.0);
+    }
+
+    #[test]
+    fn selection_outline_uses_screen_space_triangles_for_twelve_exact_edges() {
+        let target = cubic_world::BlockTarget {
+            position: cubic_world::BlockCoordinates { x: 2, y: 3, z: 4 },
+            state: cubic_world::RuntimeBlockStateId(9),
+            face: cubic_world::BlockFace::Up,
+            hit: cubic_world::Vec3d::new(2.5, 3.5, 4.5),
+            distance: 2.0,
+            bounds: cubic_world::Aabb::new(
+                cubic_world::Vec3d::new(2.0, 3.0, 4.0),
+                cubic_world::Vec3d::new(3.0, 3.5, 5.0),
+            ),
+            outline: [cubic_world::Aabb::new(
+                cubic_world::Vec3d::new(2.0, 3.0, 4.0),
+                cubic_world::Vec3d::new(3.0, 3.5, 5.0),
+            )]
+            .into(),
+        };
+        let vertices = selection_vertices(target);
+        assert_eq!(vertices.len(), 12 * 6);
+        assert!(vertices.iter().all(|vertex| {
+            vertex
+                .start
+                .iter()
+                .chain(&vertex.end)
+                .all(|value| value.is_finite())
+        }));
+        assert_eq!(SELECTION_TOPOLOGY, PrimitiveTopology::TriangleList);
+        assert_eq!(SELECTION_VIEW_SHRINK, 255.0 / 256.0);
+        assert_eq!(SELECTION_DEPTH_COMPARE, CompareFunction::LessEqual);
+        assert_eq!(SELECTION_DEPTH_BIAS.constant, 0);
+        assert_eq!(SELECTION_DEPTH_BIAS.slope_scale, 0.0);
+        assert_eq!(SELECTION_DEPTH_BIAS.clamp, 0.0);
+        assert!(selection_vertices_for_target(None).is_empty());
+    }
+
+    #[test]
+    fn multipart_selection_merges_shared_internal_box_edges() {
+        let left = cubic_world::Aabb::new(
+            cubic_world::Vec3d::new(2.0, 3.0, 4.0),
+            cubic_world::Vec3d::new(2.5, 4.0, 5.0),
+        );
+        let right = cubic_world::Aabb::new(
+            cubic_world::Vec3d::new(2.5, 3.0, 4.0),
+            cubic_world::Vec3d::new(3.0, 4.0, 5.0),
+        );
+        let vertices = selection_vertices(cubic_world::BlockTarget {
+            position: cubic_world::BlockCoordinates { x: 2, y: 3, z: 4 },
+            state: cubic_world::RuntimeBlockStateId(10),
+            face: cubic_world::BlockFace::West,
+            hit: cubic_world::Vec3d::new(2.0, 3.5, 4.5),
+            distance: 1.0,
+            bounds: left,
+            outline: [left, right].into(),
+        });
+        assert_eq!(vertices.len(), 12 * 6, "the union is one external box");
+        assert!(vertices.iter().all(|vertex| {
+            (f64::from(vertex.start[0]) - 2.5).abs() > f64::EPSILON
+                && (f64::from(vertex.end[0]) - 2.5).abs() > f64::EPSILON
+        }));
+    }
+
+    #[test]
+    fn selection_line_width_matches_vanilla_framebuffer_scaling() {
+        assert_eq!(selection_line_width(1280), 2.5);
+        assert_eq!(selection_line_width(1920), 2.5);
+        assert!((selection_line_width(2560) - 10.0 / 3.0).abs() < 1.0e-6);
+        assert_eq!(selection_line_width(3840), 5.0);
+    }
+
+    #[test]
+    fn selection_color_is_exact_vanilla_argb_66000000() {
+        assert_eq!(SELECTION_COLOR_RGBA8, [0, 0, 0, 102]);
+        assert_eq!(selection_color(), [0.0, 0.0, 0.0, 102.0 / 255.0]);
+        assert_eq!(CameraUniform::identity().selection_color, selection_color());
+    }
 
     #[test]
     fn atlas_filtering_preserves_pixel_magnification_and_filters_minification() {

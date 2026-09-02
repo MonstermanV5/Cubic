@@ -4,11 +4,11 @@
 
 Cubic is an independent project intended to become a Minecraft: Java Edition-compatible multiplayer client, primarily implemented in Rust.
 
-Cubic does not contain Mojang or Microsoft code or assets. The repository currently contains the architectural scaffold, native graphics bootstrap, protocol/NBT and generated-data foundations, authenticated Chat Mode, semantic world/chunk state, accepted runtime-only official block resources, movement/collision, seamless Play/Chat presentation, and accepted Phase 18B rendering fidelity and Phase 18C special movement.
+Cubic does not contain Mojang or Microsoft code or assets. The repository currently contains the architectural scaffold, native graphics bootstrap, protocol/NBT and generated-data foundations, authenticated Chat Mode, semantic world/chunk state, accepted runtime-only official block resources, movement/collision, seamless Play/Chat presentation, accepted Phase 18B/18C fidelity, and accepted Phase 19 block targeting and interaction.
 
 ## Current state
 
-With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status`, `dev-login`, and `chat` retain their accepted behavior. `world <server> --username <name>` opens the offline-development Play window that renders bounded decoded chunks using official exact-version block resources verified and cached by Cubic. It includes accepted movement/collision, rendering fidelity, special movement, and the same-session `CHAT`/`PLAY` toggle. It requires the Phase 11 generated game-data artifact and may populate the Phase 10 official client cache before opening the window. Entities and block interaction remain unimplemented. See `docs/WORLD_RENDERING.md`, `docs/BLOCK_RESOURCES.md`, `docs/MOVEMENT.md`, and `docs/CHAT_MODE.md`.
+With no arguments, `cubic-app` opens the Phase 2 clear-frame window. `status`, `dev-login`, and `chat` retain their accepted behavior. `world <server> --username <name>` opens the offline-development Play window that renders bounded decoded chunks using official exact-version block resources verified and cached by Cubic. It includes accepted movement/collision, rendering fidelity, special movement, the same-session `CHAT`/`PLAY` toggle, and Phase 19's current selection/interaction path. Captured left mouse starts or aborts breaking; right mouse sends generic main-hand use. Survival completion has bounded air-state prediction/reconciliation and official runtime destroy-stage rendering. Held-item-aware placement prediction remains a Phase 20 boundary. Entities remain unimplemented. See `docs/INTERACTION.md`, `docs/WORLD_RENDERING.md`, `docs/BLOCK_RESOURCES.md`, `docs/MOVEMENT.md`, and `docs/CHAT_MODE.md`.
 
 ## Build and validate
 

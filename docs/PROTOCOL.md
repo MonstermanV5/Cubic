@@ -6,6 +6,8 @@ Phase 17 extends only that isolated profile with the verified protocol-775 movem
 
 Phase 17 also consumes authoritative live world mutation without adding Phase 19 interaction: clientbound Block Update `0x08` is packed Position plus VarInt runtime state, and Section Blocks Update `0x54` is fixed packed SectionPos plus a bounded VarInt count and VarLong entries (`state<<12 | localX<<8 | localZ<<4 | localY`). Both IDs remain in `bootstrap::v775`; networking projects them into packet-ID-free semantic updates. Section batches are capped at 4,096 entries before allocation.
 
+Phase 19's current protocol-775 interaction subset remains isolated in the same exact-version profile. Official 26.1.2 `GameProtocols` registration and the generated official-report artifact establish clientbound Block Changed Ack `0x04` (VarInt sequence), serverbound Pick Item From Block `0x24`, Pick Item From Entity `0x25`, Player Action `0x29` (action VarInt, packed Position, direction byte, sequence VarInt), Swing `0x3f`, Use Item On `0x42` (hand, BlockHitResult, sequence), and Use Item `0x43` (hand, sequence, yaw, pitch). Current BlockHitResult contains packed Position, direction VarInt, three local hit floats, `inside`, and `world_border_hit`; Cubic does not use an obsolete layout missing the final flag. Full framed interaction vectors and an independently transcribed neighbouring-registry fixture prevent a hand-written encoder and its test from drifting together.
+
 ## Layer boundary
 
 The intended data flow is:

@@ -641,6 +641,7 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
         }
     };
     let collisions = cubic_world::BlockCollisionProfile::from_game_data(&data);
+    let outlines = cubic_world::BlockOutlineProfile::from_game_data(&data);
     tracing::info!(version = %version, blockstates = resources.blockstate_count, models = resources.model_count, textures = resources.texture_count, atlas_width = resources.atlas.width, atlas_height = resources.atlas.height, atlas_bytes = resources.atlas.rgba.len(), fallbacks = resources.fallback_count, "vanilla block resources prepared");
     let options = ChatSessionOptions::default();
     let (chat_handle, chat_runner) = ChatSessionHandle::bounded(&options);
@@ -665,6 +666,7 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
                         world_runner,
                         control_runner,
                         collisions,
+                        outlines,
                     )) {
                         tracing::error!(%error, "World Mode network task stopped");
                     }
@@ -731,6 +733,14 @@ impl cubic_platform::WorldSessionPort for NetworkWorldPort {
 
     fn add_look_delta(&self, sequence: u64, yaw: f32, pitch: f32) {
         self.controls.add_look_delta(sequence, yaw, pitch);
+    }
+
+    fn set_attack(&self, pressed: bool) {
+        self.controls.set_attack(pressed);
+    }
+
+    fn press_use(&self) {
+        self.controls.press_use();
     }
 }
 
