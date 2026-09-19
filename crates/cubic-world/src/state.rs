@@ -3,9 +3,10 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 
 use crate::{
-    AuthoritativeRotation, AuthoritativeTransform, BlockStateUpdate, ChunkCoordinate, EnterWorld,
-    LoadedChunks, PlayerPositionUpdate, RespawnRotation, RuntimeRegistrySnapshot, SpawnPoint,
-    WorldBorder, WorldEvent, WorldSession, WorldTime,
+    AuthoritativeRotation, AuthoritativeTransform, BlockCoordinates, BlockEntityData,
+    BlockStateUpdate, ChunkCoordinate, EnterWorld, LoadedChunks, PlayerPositionUpdate,
+    RespawnRotation, RuntimeRegistrySnapshot, SpawnPoint, WorldBorder, WorldEvent, WorldSession,
+    WorldTime,
 };
 
 pub const MAX_KNOWN_DIMENSIONS: usize = 1_024;
@@ -415,6 +416,44 @@ impl WorldState {
             revision: self.revision,
             changed_chunks: changed.into_iter().collect(),
             ignored_unloaded_or_out_of_bounds: ignored,
+        })
+    }
+
+    pub fn apply_block_entity_update(
+        &mut self,
+        position: BlockCoordinates,
+        type_raw_id: u32,
+        data: BlockEntityData,
+    ) -> Result<BlockUpdateResult, WorldError> {
+        self.require(WorldLifecycle::Active, "BlockEntityData")?;
+        let coordinate = ChunkCoordinate::new(position.x.div_euclid(16), position.z.div_euclid(16));
+        let (Ok(local_x), Ok(local_z), Ok(y)) = (
+            u8::try_from(position.x.rem_euclid(16)),
+            u8::try_from(position.z.rem_euclid(16)),
+            i16::try_from(position.y),
+        ) else {
+            return Ok(BlockUpdateResult {
+                revision: self.revision,
+                changed_chunks: Vec::new(),
+                ignored_unloaded_or_out_of_bounds: 1,
+            });
+        };
+        let changed =
+            self.chunks
+                .update_block_entity(coordinate, local_x, y, local_z, type_raw_id, data);
+        if changed == Some(true) {
+            self.revision = self
+                .revision
+                .checked_add(1)
+                .ok_or(WorldError::RevisionOverflow)?;
+        }
+        Ok(BlockUpdateResult {
+            revision: self.revision,
+            changed_chunks: (changed == Some(true))
+                .then_some(coordinate)
+                .into_iter()
+                .collect(),
+            ignored_unloaded_or_out_of_bounds: usize::from(changed.is_none()),
         })
     }
 

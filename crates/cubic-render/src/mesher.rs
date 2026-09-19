@@ -247,6 +247,8 @@ pub(crate) enum MeshError {
     FaceLimit { max: usize },
     #[error("chunk mesh index space overflowed")]
     IndexOverflow,
+    #[error("banner-pattern sprite `{texture}` is absent from its material atlas")]
+    BannerPatternSprite { texture: String },
 }
 
 #[cfg(test)]
@@ -333,6 +335,16 @@ pub(crate) fn mesh_chunk_with_debug(
                             .saturating_mul(16)
                         + i32::from(y);
                     let world_z = coordinate.z.saturating_mul(16) + i32::from(z);
+                    let banner_patterns = i16::try_from(world_y).ok().and_then(|world_y| {
+                        chunk
+                            .block_entities
+                            .iter()
+                            .find(|entity| {
+                                entity.local_x == x && entity.y == world_y && entity.local_z == z
+                            })
+                            .and_then(|entity| entity.data.as_ref())
+                            .map(|data| data.banner_patterns.as_slice())
+                    });
                     let full_cube_occlusion = if models.full_opaque_cube {
                         let mut occluded = [false; 6];
                         for direction in Direction::ALL {
@@ -437,6 +449,17 @@ pub(crate) fn mesh_chunk_with_debug(
                                 &mut mesh, chunks, geometry, resources, biomes, world_x, world_y,
                                 world_z, model, face,
                             )?;
+                        }
+                        if let Some(patterns) = banner_patterns {
+                            for face in resources
+                                .banner_pattern_faces(model, patterns)
+                                .map_err(|texture| MeshError::BannerPatternSprite { texture })?
+                            {
+                                push_model_face(
+                                    &mut mesh, chunks, geometry, resources, biomes, world_x,
+                                    world_y, world_z, model, &face,
+                                )?;
+                            }
                         }
                     }
                     if mesh.statistics.quads_emitted > quads_before {
@@ -634,6 +657,10 @@ fn push_model_face(
                 RenderLayer::Opaque => 0,
                 RenderLayer::Cutout => 1,
                 RenderLayer::Translucent | RenderLayer::LayeredTranslucent => 2,
+            } | if face.material == crate::block_resources::TextureMaterial::BannerPattern {
+                0x0100_0000
+            } else {
+                0
             },
         });
     }
@@ -3419,6 +3446,7 @@ mod tests {
                 max: [1.0, 1.0],
                 layer: RenderLayer::Opaque,
             },
+            material: crate::block_resources::TextureMaterial::Terrain,
             cullface: None,
             tint_index: None,
             tint_kind: TintKind::None,

@@ -3,12 +3,12 @@ use std::{
     sync::Arc,
 };
 
-use cubic_version::GameData;
+use cubic_version::{GameData, ShapeDataBox, shape_data_for};
 use thiserror::Error;
 
 use crate::{
-    BlockEnvironment, BlockEnvironmentProfile, DimensionGeometry, FluidKind, LoadedChunks,
-    RuntimeBlockStateId, SpecialSurface,
+    BlockCoordinates, BlockEnvironment, BlockEnvironmentProfile, DimensionGeometry, FluidKind,
+    LoadedChunks, RuntimeBlockStateId, SpecialSurface,
     collision_vanilla::{CollisionOffset, CollisionRuleSet},
 };
 
@@ -152,6 +152,9 @@ impl BlockCollisionProfile {
     #[must_use]
     pub fn from_game_data(data: &GameData) -> Self {
         let rules = CollisionRuleSet::for_version(&data.artifact().minecraft_version);
+        let generated = shape_data_for(&data.artifact().minecraft_version)
+            .ok()
+            .flatten();
         let environment = BlockEnvironmentProfile::from_game_data(data);
         let mut states = BTreeMap::new();
         let mut offsets = BTreeMap::new();
@@ -166,17 +169,30 @@ impl BlockCollisionProfile {
             for state in &block.states {
                 let id = RuntimeBlockStateId(state.state_id);
                 let semantic = environment.state(id);
-                states.insert(
-                    id,
-                    if semantic.scaffolding {
-                        CollisionShape::Empty
-                    } else {
-                        rules.shape(path, &state.properties)
-                    },
-                );
+                let generated_state = generated.as_ref().and_then(|data| {
+                    data.state(state.state_id).filter(|candidate| {
+                        candidate.block == block.identifier.as_str()
+                            && candidate.properties == state.properties
+                    })
+                });
+                let shape = if semantic.scaffolding {
+                    // Scaffolding collision is resolved from player movement
+                    // context, not a state-static voxel shape.
+                    CollisionShape::Empty
+                } else if let Some((data, generated_state)) =
+                    generated.as_ref().zip(generated_state)
+                {
+                    collision_shape_from_data(
+                        data.shape(generated_state.collision_shape)
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    rules.shape(path, &state.properties)
+                };
+                states.insert(id, shape);
                 offsets.insert(id, rules.offset(path));
                 slipperiness.insert(id, classify_slipperiness(environment.state(id).surface));
-                if !rules.has_verified_shape(path) {
+                if generated_state.is_none() {
                     approximate_states.insert(id);
                 }
             }
@@ -225,6 +241,31 @@ impl BlockCollisionProfile {
         self.states.get(&state).unwrap_or(&CollisionShape::FullCube)
     }
 
+    /// Reports whether an entity-sized box overlaps this state's exact
+    /// position-dependent collision geometry at one world cell.
+    #[must_use]
+    pub fn overlaps_block(
+        &self,
+        bounds: Aabb,
+        state: RuntimeBlockStateId,
+        position: BlockCoordinates,
+    ) -> bool {
+        let offset = self.offset(state, position.x, position.z);
+        let overlaps_box = |shape: Aabb| {
+            let world = shape.translated(
+                f64::from(position.x) + offset.x,
+                f64::from(position.y) + offset.y,
+                f64::from(position.z) + offset.z,
+            );
+            aabbs_overlap(bounds, world)
+        };
+        match self.shape(state) {
+            CollisionShape::Empty => false,
+            CollisionShape::FullCube => overlaps_box(full_cube_bounds()),
+            CollisionShape::Boxes(boxes) => boxes.iter().copied().any(overlaps_box),
+        }
+    }
+
     #[must_use]
     pub fn slipperiness(&self, state: RuntimeBlockStateId) -> f64 {
         self.slipperiness.get(&state).copied().unwrap_or(0.6)
@@ -262,6 +303,30 @@ impl BlockCollisionProfile {
     }
 }
 
+pub(crate) fn collision_shape_from_data(boxes: &[ShapeDataBox]) -> CollisionShape {
+    if boxes.is_empty() {
+        return CollisionShape::Empty;
+    }
+    if boxes.len() == 1 && boxes[0].0 == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+        return CollisionShape::FullCube;
+    }
+    CollisionShape::Boxes(
+        boxes
+            .iter()
+            .copied()
+            .map(|bounds| {
+                let min = bounds.min();
+                let max = bounds.max();
+                Aabb::new(
+                    Vec3d::new(min[0], min[1], min[2]),
+                    Vec3d::new(max[0], max[1], max[2]),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into(),
+    )
+}
+
 fn full_cube_bounds() -> Aabb {
     Aabb::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(1.0, 1.0, 1.0))
 }
@@ -296,7 +361,7 @@ fn classify_slipperiness(surface: SpecialSurface) -> f64 {
         SpecialSurface::Ice | SpecialSurface::PackedIce | SpecialSurface::FrostedIce => 0.98,
         SpecialSurface::BlueIce => 0.989,
         SpecialSurface::Slime => 0.8,
-        SpecialSurface::Ordinary | SpecialSurface::Honey => 0.6,
+        SpecialSurface::Ordinary | SpecialSurface::Honey | SpecialSurface::Bed => 0.6,
     }
 }
 
@@ -853,14 +918,20 @@ impl PlayerMovementState {
             && !scaffolding_after_move
             && (input.jump || (self.horizontal_collision && input.forward));
         let support_after_move = support_surface_at(self.bounding_box(), chunks, geometry, profile);
-        let mut slime_bounced = false;
+        let mut rebound = false;
         if (requested.y - applied.y).abs() > COLLISION_EPSILON {
             if requested.y < 0.0 && support_after_move == SpecialSurface::Slime && !input.sneak {
                 self.velocity.y = -requested.y;
-                slime_bounced = self.velocity.y >= 0.1;
+                rebound = self.velocity.y >= 0.1;
                 if self.velocity.y < 0.1 {
                     self.velocity.y = 0.0;
                 }
+            } else if requested.y < 0.0 && support_after_move == SpecialSurface::Bed && !input.sneak
+            {
+                // BedBlock.bounceUp reflects a LivingEntity's impact velocity
+                // at 0.6600000262260437. Sneaking suppresses the bounce.
+                self.velocity.y = -requested.y * 0.660_000_026_226_043_7;
+                rebound = self.velocity.y > 0.0;
             } else {
                 self.velocity.y = 0.0;
             }
@@ -917,14 +988,12 @@ impl PlayerMovementState {
         } else if environment.honey_side_contact && self.velocity.y < HONEY_SLIDE_SPEED {
             self.velocity.y = HONEY_SLIDE_SPEED;
             None
-        } else if slime_bounced {
+        } else if rebound {
             self.fall_distance = 0.0;
-            // SlimeBlock reflects a living entity's impact velocity exactly;
+            // Slime and bed callbacks replace the blocked impact velocity;
             // the enclosing air-travel step then applies normal gravity and
-            // drag, which is the source of vanilla's bounce decay. Entity.move
-            // has already established the landing state; bounceUp changes the
-            // velocity without clearing that one-tick on-ground value, so
-            // held Jump can select jumpFromGround on the following tick.
+            // drag. Entity.move has already established the one-tick landing
+            // state, which remains visible to the following movement tick.
             self.velocity.y = (self.velocity.y - GRAVITY) * VERTICAL_DRAG;
             None
         } else if self.on_ground {
@@ -1742,6 +1811,7 @@ mod tests {
         Chunk, ChunkCoordinate, ChunkLightSummary, ChunkSection, PalettedContainer, RuntimeBiomeId,
         collision_vanilla::{classify_shape, has_verified_shape},
     };
+    use cubic_version::MinecraftVersionId;
 
     fn geometry() -> DimensionGeometry {
         DimensionGeometry {
@@ -1752,6 +1822,47 @@ mod tests {
 
     fn boxes(values: &[Aabb]) -> CollisionShape {
         CollisionShape::Boxes(Arc::from(values))
+    }
+
+    fn assert_shape_matches_oracle(actual: &CollisionShape, expected: &[ShapeDataBox]) {
+        let actual = match actual {
+            CollisionShape::Empty => Vec::new(),
+            CollisionShape::FullCube => vec![Aabb {
+                min: Vec3d::new(0.0, 0.0, 0.0),
+                max: Vec3d::new(1.0, 1.0, 1.0),
+            }],
+            CollisionShape::Boxes(boxes) => boxes.to_vec(),
+        };
+        let expected = expected
+            .iter()
+            .copied()
+            .map(|bounds| Aabb {
+                min: Vec3d::new(bounds.0[0], bounds.0[1], bounds.0[2]),
+                max: Vec3d::new(bounds.0[3], bounds.0[4], bounds.0[5]),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generated_26_1_2_shape_adapter_has_zero_static_collision_or_outline_mismatches() {
+        let oracle = shape_data_for(&MinecraftVersionId::new("26.1.2").unwrap())
+            .unwrap()
+            .unwrap();
+        let mut static_collision_matches = 0_usize;
+        let mut outline_matches = 0_usize;
+        for state in oracle.states() {
+            if state.dynamic_context.is_none() {
+                let expected = oracle.shape(state.collision_shape).unwrap();
+                assert_shape_matches_oracle(&collision_shape_from_data(expected), expected);
+                static_collision_matches += 1;
+            }
+            let expected = oracle.shape(state.outline_shape).unwrap();
+            assert_shape_matches_oracle(&collision_shape_from_data(expected), expected);
+            outline_matches += 1;
+        }
+        assert_eq!(static_collision_matches, 29_828);
+        assert_eq!(outline_matches, 29_873);
     }
     fn section(value: RuntimeBlockStateId) -> ChunkSection {
         ChunkSection {
@@ -4125,6 +4236,51 @@ mod tests {
             .unwrap();
         assert_eq!(sneaking.velocity.y, 0.0);
         assert!(sneaking.on_ground);
+    }
+
+    #[test]
+    fn beds_apply_vanilla_living_entity_rebound_and_sneak_suppression() {
+        let (chunks, mut profile) = special_world(BlockEnvironment::default(), None);
+        profile.set_environment(BlockEnvironmentProfile::synthetic([(
+            RuntimeBlockStateId(1),
+            BlockEnvironment {
+                surface: SpecialSurface::Bed,
+                ..BlockEnvironment::default()
+            },
+        )]));
+        for incoming in [-0.1, -0.8] {
+            let mut state = PlayerMovementState::from_authoritative(
+                LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+                Vec3d::new(0.0, incoming, 0.0),
+            )
+            .unwrap();
+            state.on_ground = false;
+            state
+                .tick(MovementInput::default(), &chunks, geometry(), &profile)
+                .unwrap();
+            let expected = (-incoming * 0.660_000_026_226_043_7 - GRAVITY) * VERTICAL_DRAG;
+            assert!((state.velocity.y - expected).abs() < 1.0e-6);
+            assert!(state.on_ground);
+        }
+
+        let mut sneaking = PlayerMovementState::from_authoritative(
+            LocalPlayerPose::new(8.5, 1.0, 8.5, 0.0, 0.0),
+            Vec3d::new(0.0, -0.8, 0.0),
+        )
+        .unwrap();
+        sneaking.on_ground = false;
+        sneaking
+            .tick(
+                MovementInput {
+                    sneak: true,
+                    ..MovementInput::default()
+                },
+                &chunks,
+                geometry(),
+                &profile,
+            )
+            .unwrap();
+        assert_eq!(sneaking.velocity.y, 0.0);
     }
 
     #[test]

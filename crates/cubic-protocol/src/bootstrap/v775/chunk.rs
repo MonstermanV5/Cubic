@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{
     BitSetLimits, CodecError, CodecReader,
-    nbt::{NbtError, NbtLimits, NbtTag, decode_unnamed_network_tag},
+    nbt::{NbtCompound, NbtError, NbtLimits, NbtTag, decode_unnamed_network_tag},
 };
 
 pub const MAX_CHUNK_DATA_BYTES: usize = 2 * 1024 * 1024;
@@ -56,6 +56,8 @@ pub struct WireBlockEntity {
     pub local_z: u8,
     pub type_raw_id: u32,
     pub has_data: bool,
+    /// Bounded semantic NBT retained for block-entity-aware world rendering.
+    pub data: Option<NbtCompound>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -477,25 +479,24 @@ fn decode_block_entities(
         let type_raw_id = read_runtime_id(reader, "block entity type")?;
         let mut probe = reader.clone();
         let root_type = probe.read_u8()?;
-        let has_data = if root_type == 0 {
+        let data = if root_type == 0 {
             reader.read_u8()?;
-            false
+            None
         } else {
-            if !matches!(
-                decode_unnamed_network_tag(reader, NbtLimits::default())
-                    .map_err(ChunkDecodeError::Nbt)?,
-                NbtTag::Compound(_)
-            ) {
-                return Err(ChunkDecodeError::InvalidBlockEntityNbt);
+            match decode_unnamed_network_tag(reader, NbtLimits::default())
+                .map_err(ChunkDecodeError::Nbt)?
+            {
+                NbtTag::Compound(compound) => Some(compound),
+                _ => return Err(ChunkDecodeError::InvalidBlockEntityNbt),
             }
-            true
         };
         entities.push(WireBlockEntity {
             local_x: packed_xz >> 4,
             y,
             local_z: packed_xz & 0x0f,
             type_raw_id,
-            has_data,
+            has_data: data.is_some(),
+            data,
         });
     }
     Ok(entities)

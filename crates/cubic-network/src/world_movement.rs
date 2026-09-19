@@ -17,6 +17,7 @@ use thiserror::Error;
 const POSITION_EPSILON_SQUARED: f64 = 4.0e-8;
 const FORCED_POSITION_INTERVAL: u8 = 20;
 const MAX_INPUT_TRANSITIONS: usize = 64;
+const MAX_INVENTORY_COMMANDS: usize = 64;
 const SLOW_INPUT_PATH: Duration = Duration::from_millis(50);
 const FLIGHT_TOGGLE_WINDOW: Duration = Duration::from_millis(350);
 
@@ -43,6 +44,7 @@ struct ControlState {
     attack: bool,
     attack_changed: bool,
     use_presses: u8,
+    inventory_commands: VecDeque<InventoryCommand>,
 }
 
 #[derive(Debug, Default)]
@@ -59,6 +61,23 @@ struct ControlSample {
     attack: bool,
     attack_changed: bool,
     use_presses: u8,
+    inventory_commands: Vec<InventoryCommand>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InventoryCommand {
+    SelectHotbar(u8),
+    Click(cubic_world::ContainerClick),
+    Close(cubic_world::ContainerId),
+    CreativeSlot {
+        slot: cubic_world::SlotIndex,
+        stack: Option<cubic_world::ItemStack>,
+    },
+    CreativeCarried(Option<cubic_world::ItemStack>),
+    Button {
+        container: cubic_world::ContainerId,
+        button: u32,
+    },
 }
 
 /// UI-side movement endpoint. Held input and look deltas coalesce, while a
@@ -170,6 +189,20 @@ impl WorldControlHandle {
             state.use_presses = state.use_presses.saturating_add(1).min(8);
         }
     }
+
+    /// Enqueues an inventory action without ever discarding an older action.
+    /// Returns `false` when the bounded mailbox is unavailable or full so the
+    /// UI can report backpressure instead of silently desynchronizing clicks.
+    pub fn inventory_command(&self, command: InventoryCommand) -> bool {
+        let Ok(mut state) = self.0.lock() else {
+            return false;
+        };
+        if state.inventory_commands.len() == MAX_INVENTORY_COMMANDS {
+            return false;
+        }
+        state.inventory_commands.push_back(command);
+        true
+    }
 }
 
 impl WorldControlRunner {
@@ -190,6 +223,7 @@ impl WorldControlRunner {
             attack: state.attack,
             attack_changed: std::mem::take(&mut state.attack_changed),
             use_presses: std::mem::take(&mut state.use_presses),
+            inventory_commands: state.inventory_commands.drain(..).collect(),
         }
     }
 
@@ -286,6 +320,8 @@ pub(crate) struct WorldMovementController {
     flight_toggle: FlightToggleTracker,
     abilities: Option<v775::PlayerAbilities>,
     interaction: BlockInteractionTracker,
+    held_item: Option<cubic_version::MinecraftIdentifier>,
+    offhand_item: Option<cubic_version::MinecraftIdentifier>,
 }
 
 impl WorldMovementController {
@@ -309,6 +345,8 @@ impl WorldMovementController {
             flight_toggle: FlightToggleTracker::default(),
             abilities: None,
             interaction: BlockInteractionTracker::new(outlines),
+            held_item: None,
+            offhand_item: None,
         }
     }
 
@@ -407,9 +445,14 @@ impl WorldMovementController {
                 self.entity_id,
                 &flight_changes,
             )?;
-            let interaction =
-                self.interaction
-                    .tick(world, simulation.pose, &controls, &mut frames)?;
+            let interaction = self.interaction.tick(
+                world,
+                simulation.pose,
+                &controls,
+                self.held_item.as_ref(),
+                self.offhand_item.as_ref(),
+                &mut frames,
+            )?;
             return Ok(Some(MovementTick {
                 pose: simulation.pose,
                 velocity: simulation.velocity,
@@ -430,6 +473,7 @@ impl WorldMovementController {
                 target: interaction.target,
                 breaking: interaction.breaking,
                 prediction: interaction.prediction,
+                inventory_commands: controls.inventory_commands,
             }));
         }
         let result = simulation.tick(
@@ -451,9 +495,14 @@ impl WorldMovementController {
             self.entity_id,
             &flight_changes,
         )?;
-        let interaction = self
-            .interaction
-            .tick(world, simulation.pose, &controls, &mut frames)?;
+        let interaction = self.interaction.tick(
+            world,
+            simulation.pose,
+            &controls,
+            self.held_item.as_ref(),
+            self.offhand_item.as_ref(),
+            &mut frames,
+        )?;
         Ok(Some(MovementTick {
             pose: simulation.pose,
             velocity: simulation.velocity,
@@ -474,6 +523,7 @@ impl WorldMovementController {
             target: interaction.target,
             breaking: interaction.breaking,
             prediction: interaction.prediction,
+            inventory_commands: controls.inventory_commands,
         }))
     }
 
@@ -485,12 +535,53 @@ impl WorldMovementController {
         self.simulation.as_ref().map(|state| state.pose)
     }
 
-    pub(crate) fn acknowledge_interaction(&mut self, sequence: i32) {
-        self.interaction.acknowledge(sequence);
+    pub(crate) fn acknowledge_interaction(&mut self, sequence: i32) -> PredictionResolution {
+        self.interaction.acknowledge(sequence)
     }
 
-    pub(crate) fn reconcile_block_updates(&mut self, updates: &[BlockStateUpdate]) {
-        self.interaction.reconcile_block_updates(updates);
+    pub(crate) fn finish_prediction_resolution(
+        &mut self,
+        resolution: &PredictionResolution,
+    ) -> Option<LocalPlayerPose> {
+        let simulation = self.simulation.as_mut()?;
+        let bounds = simulation.bounding_box();
+        let rollback = resolution.rollbacks.iter().find(|prediction| {
+            self.collisions
+                .overlaps_block(bounds, prediction.server_state, prediction.position)
+        })?;
+        simulation.pose.x = rollback.player_position.x;
+        simulation.pose.y = rollback.player_position.y;
+        simulation.pose.z = rollback.player_position.z;
+        simulation.velocity = Vec3d::default();
+        simulation.horizontal_collision = false;
+        tracing::debug!(
+            target: "interaction::prediction",
+            sequence = rollback.sequence,
+            x = rollback.position.x,
+            y = rollback.position.y,
+            z = rollback.position.z,
+            player_x = simulation.pose.x,
+            player_y = simulation.pose.y,
+            player_z = simulation.pose.z,
+            "moved local player to the retained pre-prediction position after solid rollback"
+        );
+        Some(simulation.pose)
+    }
+
+    pub(crate) fn set_held_items(
+        &mut self,
+        main: Option<&cubic_world::ItemStack>,
+        offhand: Option<&cubic_world::ItemStack>,
+    ) {
+        self.held_item = main.map(|stack| stack.item.clone());
+        self.offhand_item = offhand.map(|stack| stack.item.clone());
+    }
+
+    pub(crate) fn reconcile_block_updates(
+        &mut self,
+        updates: &[BlockStateUpdate],
+    ) -> Vec<BlockStateUpdate> {
+        self.interaction.reconcile_block_updates(updates)
     }
 
     pub(crate) fn reconcile(
@@ -843,7 +934,7 @@ struct BlockInteractionTracker {
     destroy_delay: u8,
     next_sequence: i32,
     latest_acknowledged: Option<i32>,
-    predictions: VecDeque<BreakPrediction>,
+    predictions: VecDeque<BlockPrediction>,
 }
 
 #[derive(Clone, Debug)]
@@ -859,15 +950,22 @@ struct InteractionTick {
     prediction: Option<BlockStateUpdate>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BreakPrediction {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BlockPrediction {
     sequence: i32,
     position: BlockCoordinates,
-    previous: RuntimeBlockStateId,
+    server_state: RuntimeBlockStateId,
     expected: RuntimeBlockStateId,
+    player_position: Vec3d,
 }
 
-const MAX_BREAK_PREDICTIONS: usize = 32;
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PredictionResolution {
+    pub(crate) updates: Vec<BlockStateUpdate>,
+    rollbacks: Vec<BlockPrediction>,
+}
+
+const MAX_BLOCK_PREDICTIONS: usize = 32;
 
 const CREATIVE_DESTROY_DELAY_TICKS: u8 = 5;
 
@@ -891,7 +989,8 @@ impl BlockInteractionTracker {
         self.predictions.clear();
     }
 
-    fn acknowledge(&mut self, sequence: i32) {
+    fn acknowledge(&mut self, sequence: i32) -> PredictionResolution {
+        let mut resolution = PredictionResolution::default();
         if sequence >= 0
             && self
                 .latest_acknowledged
@@ -904,51 +1003,105 @@ impl BlockInteractionTracker {
                 .is_some_and(|prediction| prediction.sequence <= sequence)
             {
                 if let Some(prediction) = self.predictions.pop_front() {
-                    tracing::debug!(
-                        target: "interaction::prediction",
-                        sequence = prediction.sequence,
-                        x = prediction.position.x,
-                        y = prediction.position.y,
-                        z = prediction.position.z,
-                        "server acknowledged predicted block break"
-                    );
+                    resolution.updates.push(BlockStateUpdate {
+                        position: prediction.position,
+                        state: prediction.server_state,
+                    });
+                    if prediction.server_state != prediction.expected {
+                        resolution.rollbacks.push(prediction);
+                    }
+                    if prediction.server_state == prediction.expected {
+                        tracing::debug!(
+                            target: "interaction::prediction",
+                            sequence = prediction.sequence,
+                            x = prediction.position.x,
+                            y = prediction.position.y,
+                            z = prediction.position.z,
+                            server_state = prediction.server_state.0,
+                            "ACK resolved block prediction unchanged"
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "interaction::prediction",
+                            sequence = prediction.sequence,
+                            x = prediction.position.x,
+                            y = prediction.position.y,
+                            z = prediction.position.z,
+                            predicted_state = prediction.expected.0,
+                            server_state = prediction.server_state.0,
+                            "ACK rolled block prediction back to retained server state"
+                        );
+                    }
                 }
             }
         }
+        resolution
     }
 
-    fn reconcile_block_updates(&mut self, updates: &[BlockStateUpdate]) {
+    fn reconcile_block_updates(&mut self, updates: &[BlockStateUpdate]) -> Vec<BlockStateUpdate> {
+        let mut immediate = Vec::with_capacity(updates.len());
         for update in updates {
-            if let Some(index) = self
+            if let Some(prediction) = self
                 .predictions
-                .iter()
-                .position(|prediction| prediction.position == update.position)
-                && let Some(prediction) = self.predictions.remove(index)
+                .iter_mut()
+                .find(|prediction| prediction.position == update.position)
             {
-                if update.state == prediction.expected {
-                    tracing::debug!(
-                        target: "interaction::prediction",
-                        sequence = prediction.sequence,
-                        x = update.position.x,
-                        y = update.position.y,
-                        z = update.position.z,
-                        "authoritative block update confirmed predicted break"
-                    );
-                } else {
-                    tracing::debug!(
-                        target: "interaction::prediction",
-                        sequence = prediction.sequence,
-                        x = update.position.x,
-                        y = update.position.y,
-                        z = update.position.z,
-                        predicted_state = prediction.expected.0,
-                        authoritative_state = update.state.0,
-                        previous_state = prediction.previous.0,
-                        "authoritative block update rolled back predicted break"
-                    );
-                }
+                prediction.server_state = update.state;
+                tracing::debug!(
+                    target: "interaction::prediction",
+                    sequence = prediction.sequence,
+                    x = update.position.x,
+                    y = update.position.y,
+                    z = update.position.z,
+                    predicted_state = prediction.expected.0,
+                    server_state = update.state.0,
+                    "retained authoritative server state for pending block prediction"
+                );
+            } else {
+                immediate.push(*update);
             }
         }
+        immediate
+    }
+
+    fn register_prediction(
+        &mut self,
+        sequence: i32,
+        position: BlockCoordinates,
+        observed_server_state: RuntimeBlockStateId,
+        expected: RuntimeBlockStateId,
+        pose: LocalPlayerPose,
+    ) -> bool {
+        if let Some(index) = self
+            .predictions
+            .iter()
+            .position(|prediction| prediction.position == position)
+            && let Some(mut prediction) = self.predictions.remove(index)
+        {
+            prediction.sequence = sequence;
+            prediction.expected = expected;
+            self.predictions.push_back(prediction);
+            return true;
+        }
+        if self.predictions.len() == MAX_BLOCK_PREDICTIONS {
+            tracing::debug!(
+                target: "interaction::prediction",
+                sequence,
+                x = position.x,
+                y = position.y,
+                z = position.z,
+                "skipped local block prediction because the bounded tracker is full"
+            );
+            return false;
+        }
+        self.predictions.push_back(BlockPrediction {
+            sequence,
+            position,
+            server_state: observed_server_state,
+            expected,
+            player_position: Vec3d::new(pose.x, pose.y, pose.z),
+        });
+        true
     }
 
     fn tick(
@@ -956,6 +1109,8 @@ impl BlockInteractionTracker {
         world: &WorldState,
         pose: LocalPlayerPose,
         controls: &ControlSample,
+        held_item: Option<&cubic_version::MinecraftIdentifier>,
+        offhand_item: Option<&cubic_version::MinecraftIdentifier>,
         frames: &mut Vec<Vec<u8>>,
     ) -> Result<InteractionTick, MovementError> {
         let Some(session) = world.session() else {
@@ -983,8 +1138,11 @@ impl BlockInteractionTracker {
 
         if session.spawn_context.game_mode == GameMode::Creative {
             self.active_break = None;
-            if self.creative_attack_ready(controls.attack, target.is_some())
-                && let Some(target) = target.as_ref()
+            if self.creative_attack_ready(
+                controls.attack,
+                controls.attack_changed,
+                target.is_some(),
+            ) && let Some(target) = target.as_ref()
             {
                 let sequence = self.sequence();
                 frames.push(v775::encode_play_player_action(
@@ -1016,7 +1174,7 @@ impl BlockInteractionTracker {
                 if controls.attack
                     && self.active_break.is_none()
                     && let Some(target) = target.as_ref()
-                    && self.outlines.bare_hand_destroy_progress(target.state) > 0.0
+                    && self.outlines.destroy_progress(target.state, held_item) > 0.0
                 {
                     let sequence = self.sequence();
                     frames.push(v775::encode_play_player_action(
@@ -1032,7 +1190,7 @@ impl BlockInteractionTracker {
                 } else if controls.attack
                     && let Some(active) = self.active_break.as_mut()
                 {
-                    let completed = Self::advance_survival_break(&self.outlines, active);
+                    let completed = Self::advance_survival_break(&self.outlines, active, held_item);
                     if completed && let Some(completed) = self.active_break.take() {
                         let sequence = self.sequence();
                         frames.push(v775::encode_play_player_action(
@@ -1045,23 +1203,22 @@ impl BlockInteractionTracker {
                             position: completed.target.position,
                             state: air,
                         });
-                        if let Some(prediction) = prediction {
-                            if self.predictions.len() == MAX_BREAK_PREDICTIONS {
-                                self.predictions.pop_front();
-                            }
-                            self.predictions.push_back(BreakPrediction {
+                        if let Some(prediction) = prediction
+                            && self.register_prediction(
                                 sequence,
-                                position: prediction.position,
-                                previous: completed.target.state,
-                                expected: prediction.state,
-                            });
+                                prediction.position,
+                                completed.target.state,
+                                prediction.state,
+                                pose,
+                            )
+                        {
                             tracing::debug!(
                                 target: "interaction::prediction",
                                 sequence,
                                 x = prediction.position.x,
                                 y = prediction.position.y,
                                 z = prediction.position.z,
-                                previous_state = completed.target.state.0,
+                                server_state = completed.target.state.0,
                                 predicted_state = prediction.state.0,
                                 "applied completed local block-break prediction"
                             );
@@ -1073,9 +1230,23 @@ impl BlockInteractionTracker {
             }
         }
         for _ in 0..controls.use_presses {
+            // Vanilla evaluates MAIN_HAND then OFF_HAND and stops at the first
+            // consuming result. Cubic can currently prove consumption for a
+            // safely placeable main-hand block. Otherwise a present offhand is
+            // the usable hand; this avoids emitting two speculative actions.
+            let hand = select_interaction_hand(
+                held_item.is_some(),
+                offhand_item.is_some(),
+                held_item.is_some_and(|item| self.outlines.safe_placement_state(item).is_some()),
+            );
+            let used_item = match hand {
+                v775::InteractionHand::Main => held_item,
+                v775::InteractionHand::Off => offhand_item,
+            };
             if let Some(target) = target.as_ref() {
+                let sequence = self.sequence();
                 frames.push(v775::encode_play_use_item_on(
-                    v775::InteractionHand::Main,
+                    hand,
                     v775::BlockHit {
                         position: protocol_position(target.position)?,
                         face: protocol_face(target.face),
@@ -1085,18 +1256,49 @@ impl BlockInteractionTracker {
                         inside: target.distance == 0.0,
                         world_border_hit: false,
                     },
-                    self.sequence(),
+                    sequence,
                 )?);
+                if predicted_update.is_none()
+                    && let Some(item) = used_item
+                    && let Some(state) = self.outlines.safe_placement_state(item)
+                {
+                    let position = adjacent_position(target.position, target.face);
+                    if self
+                        .outlines
+                        .air_state()
+                        .is_some_and(|air| world_block_state(world, position) == Some(air))
+                    {
+                        let prediction = BlockStateUpdate { position, state };
+                        if self.register_prediction(
+                            sequence,
+                            position,
+                            self.outlines.air_state().unwrap_or(state),
+                            state,
+                            pose,
+                        ) {
+                            tracing::debug!(
+                                target: "interaction::prediction",
+                                sequence,
+                                x = position.x,
+                                y = position.y,
+                                z = position.z,
+                                predicted_state = state.0,
+                                item = %item,
+                                "applied safe property-free block placement prediction"
+                            );
+                            predicted_update = Some(prediction);
+                        }
+                    }
+                }
             } else {
                 frames.push(v775::encode_play_use_item(
-                    v775::InteractionHand::Main,
+                    hand,
                     self.sequence(),
                     pose.yaw,
                     pose.pitch,
                 )?);
             }
         }
-        let _ = controls.attack_changed;
         let breaking = self.active_break.as_ref().and_then(|active| {
             BlockBreakingOverlay::from_progress(
                 active.target.position,
@@ -1122,7 +1324,19 @@ impl BlockInteractionTracker {
         result
     }
 
-    fn creative_attack_ready(&mut self, attack: bool, has_target: bool) -> bool {
+    fn creative_attack_ready(
+        &mut self,
+        attack: bool,
+        attack_changed: bool,
+        has_target: bool,
+    ) -> bool {
+        if attack && attack_changed {
+            self.destroy_delay = CREATIVE_DESTROY_DELAY_TICKS;
+            return has_target;
+        }
+        if !attack {
+            return false;
+        }
         if self.destroy_delay > 0 {
             self.destroy_delay -= 1;
             return false;
@@ -1134,10 +1348,83 @@ impl BlockInteractionTracker {
         false
     }
 
-    fn advance_survival_break(outlines: &BlockOutlineProfile, active: &mut ActiveBreak) -> bool {
-        active.progress += outlines.bare_hand_destroy_progress(active.target.state);
+    fn advance_survival_break(
+        outlines: &BlockOutlineProfile,
+        active: &mut ActiveBreak,
+        held_item: Option<&cubic_version::MinecraftIdentifier>,
+    ) -> bool {
+        active.progress += outlines.destroy_progress(active.target.state, held_item);
         active.progress >= 1.0
     }
+}
+
+fn select_interaction_hand(
+    main_hand_present: bool,
+    off_hand_present: bool,
+    main_hand_consumes: bool,
+) -> v775::InteractionHand {
+    if off_hand_present && (!main_hand_present || !main_hand_consumes) {
+        v775::InteractionHand::Off
+    } else {
+        v775::InteractionHand::Main
+    }
+}
+
+const fn adjacent_position(position: BlockCoordinates, face: BlockFace) -> BlockCoordinates {
+    match face {
+        BlockFace::Down => BlockCoordinates {
+            x: position.x,
+            y: position.y - 1,
+            z: position.z,
+        },
+        BlockFace::Up => BlockCoordinates {
+            x: position.x,
+            y: position.y + 1,
+            z: position.z,
+        },
+        BlockFace::North => BlockCoordinates {
+            x: position.x,
+            y: position.y,
+            z: position.z - 1,
+        },
+        BlockFace::South => BlockCoordinates {
+            x: position.x,
+            y: position.y,
+            z: position.z + 1,
+        },
+        BlockFace::West => BlockCoordinates {
+            x: position.x - 1,
+            y: position.y,
+            z: position.z,
+        },
+        BlockFace::East => BlockCoordinates {
+            x: position.x + 1,
+            y: position.y,
+            z: position.z,
+        },
+    }
+}
+
+fn world_block_state(
+    world: &WorldState,
+    position: BlockCoordinates,
+) -> Option<RuntimeBlockStateId> {
+    let geometry = world.session()?.dimension_geometry;
+    let height = i32::try_from(geometry.height).ok()?;
+    if position.y < geometry.min_y || position.y >= geometry.min_y.checked_add(height)? {
+        return None;
+    }
+    let chunk = world.loaded_chunks().get(ChunkCoordinate::new(
+        position.x.div_euclid(16),
+        position.z.div_euclid(16),
+    ))?;
+    let section =
+        usize::try_from(position.y.div_euclid(16) - geometry.min_y.div_euclid(16)).ok()?;
+    chunk.sections.get(section)?.block(
+        u8::try_from(position.x.rem_euclid(16)).ok()?,
+        u8::try_from(position.y.rem_euclid(16)).ok()?,
+        u8::try_from(position.z.rem_euclid(16)).ok()?,
+    )
 }
 
 fn protocol_position(
@@ -1178,6 +1465,7 @@ pub(crate) struct MovementTick {
     pub(crate) target: Option<BlockTarget>,
     pub(crate) breaking: Option<BlockBreakingOverlay>,
     pub(crate) prediction: Option<BlockStateUpdate>,
+    pub(crate) inventory_commands: Vec<InventoryCommand>,
 }
 
 #[derive(Default)]
@@ -1558,6 +1846,29 @@ mod tests {
         assert_eq!(sample.transitions.len(), MAX_INPUT_TRANSITIONS);
         assert_eq!(sample.coalesced_transitions, 20);
         assert!(sample.input.right);
+    }
+
+    #[test]
+    fn inventory_action_mailbox_is_bounded_and_never_discards_older_clicks() {
+        let (handle, runner) = WorldControlHandle::new();
+        for slot in 0..MAX_INVENTORY_COMMANDS {
+            assert!(handle.inventory_command(InventoryCommand::SelectHotbar(
+                u8::try_from(slot % 9).unwrap()
+            )));
+        }
+        assert!(!handle.inventory_command(InventoryCommand::SelectHotbar(8)));
+        let sample = runner.take();
+        assert_eq!(sample.inventory_commands.len(), MAX_INVENTORY_COMMANDS);
+        assert_eq!(
+            sample.inventory_commands.first(),
+            Some(&InventoryCommand::SelectHotbar(0))
+        );
+        assert_eq!(
+            sample.inventory_commands.last(),
+            Some(&InventoryCommand::SelectHotbar(
+                u8::try_from((MAX_INVENTORY_COMMANDS - 1) % 9).unwrap()
+            ))
+        );
     }
 
     #[test]
@@ -2238,20 +2549,44 @@ mod tests {
     }
 
     #[test]
-    fn creative_destroy_delay_is_fixed_tick_based_and_target_changes_do_not_bypass_it() {
-        let mut tracker = BlockInteractionTracker::new(BlockOutlineProfile::synthetic([]));
-        assert!(tracker.creative_attack_ready(true, true));
-        for _ in 0..CREATIVE_DESTROY_DELAY_TICKS {
-            assert!(!tracker.creative_attack_ready(true, true));
-        }
-        assert!(tracker.creative_attack_ready(true, true));
+    fn use_hand_selection_gives_main_its_consuming_opportunity_then_offhand() {
+        assert_eq!(
+            select_interaction_hand(false, true, false),
+            v775::InteractionHand::Off
+        );
+        assert_eq!(
+            select_interaction_hand(true, true, false),
+            v775::InteractionHand::Off
+        );
+        assert_eq!(
+            select_interaction_hand(true, true, true),
+            v775::InteractionHand::Main
+        );
+        assert_eq!(
+            select_interaction_hand(true, false, false),
+            v775::InteractionHand::Main
+        );
+    }
 
-        // Release and target loss consume the existing delay; neither arms a
-        // fresh delay nor permits an immediate second block.
-        assert!(!tracker.creative_attack_ready(false, false));
-        assert!(!tracker.creative_attack_ready(true, true));
+    #[test]
+    fn creative_fresh_presses_are_immediate_while_held_continuation_uses_five_tick_delay() {
+        let mut tracker = BlockInteractionTracker::new(BlockOutlineProfile::synthetic([]));
+        assert!(tracker.creative_attack_ready(true, true, true));
+        for _ in 0..CREATIVE_DESTROY_DELAY_TICKS {
+            assert!(!tracker.creative_attack_ready(true, false, true));
+        }
+        assert!(tracker.creative_attack_ready(true, false, true));
+
+        // A release followed by a new press bypasses the continuation delay,
+        // exactly like a fresh vanilla startDestroyBlock invocation.
+        assert!(!tracker.creative_attack_ready(false, true, false));
+        assert!(tracker.creative_attack_ready(true, true, true));
+        assert!(tracker.creative_attack_ready(true, true, true));
+
+        // Target loss alone does not turn a held input into a fresh press.
+        assert!(!tracker.creative_attack_ready(true, false, false));
         tracker.reset();
-        assert!(tracker.creative_attack_ready(true, true));
+        assert!(tracker.creative_attack_ready(true, true, true));
     }
 
     #[test]
@@ -2269,12 +2604,14 @@ mod tests {
         for _ in 0..3 {
             assert!(!BlockInteractionTracker::advance_survival_break(
                 &profile,
-                &mut active
+                &mut active,
+                None,
             ));
         }
         assert!(BlockInteractionTracker::advance_survival_break(
             &profile,
-            &mut active
+            &mut active,
+            None,
         ));
 
         let mut blocked = ActiveBreak {
@@ -2284,57 +2621,199 @@ mod tests {
         for _ in 0..200 {
             assert!(!BlockInteractionTracker::advance_survival_break(
                 &profile,
-                &mut blocked
+                &mut blocked,
+                None,
             ));
         }
         assert_eq!(blocked.progress, 0.0);
     }
 
     #[test]
-    fn break_predictions_are_bounded_confirmed_and_reconciled_by_position() {
+    fn prediction_ack_restores_retained_server_state_without_an_authoritative_update() {
         let mut tracker = BlockInteractionTracker::new(BlockOutlineProfile::synthetic([]));
-        for sequence in 0..(MAX_BREAK_PREDICTIONS as i32 + 3) {
-            tracker.predictions.push_back(BreakPrediction {
+        let position = BlockCoordinates { x: 2, y: 64, z: -3 };
+        let pose = LocalPlayerPose::new(1.5, 64.0, -2.5, 0.0, 0.0);
+        assert!(tracker.register_prediction(
+            4,
+            position,
+            RuntimeBlockStateId(5),
+            RuntimeBlockStateId(0),
+            pose,
+        ));
+        let broken = tracker.acknowledge(4);
+        assert_eq!(
+            broken.updates,
+            vec![BlockStateUpdate {
+                position,
+                state: RuntimeBlockStateId(5),
+            }]
+        );
+        assert_eq!(broken.rollbacks.len(), 1);
+
+        assert!(tracker.register_prediction(
+            5,
+            position,
+            RuntimeBlockStateId(0),
+            RuntimeBlockStateId(8),
+            pose,
+        ));
+        let placed = tracker.acknowledge(5);
+        assert_eq!(placed.updates[0].state, RuntimeBlockStateId(0));
+        assert_eq!(placed.rollbacks.len(), 1);
+    }
+
+    #[test]
+    fn authoritative_prediction_state_is_retained_until_ack_and_always_wins() {
+        let mut tracker = BlockInteractionTracker::new(BlockOutlineProfile::synthetic([]));
+        let pose = LocalPlayerPose::new(0.5, 64.0, 0.5, 0.0, 0.0);
+        let matching = BlockCoordinates { x: 0, y: 64, z: 0 };
+        assert!(tracker.register_prediction(
+            7,
+            matching,
+            RuntimeBlockStateId(5),
+            RuntimeBlockStateId(0),
+            pose,
+        ));
+        let matching_immediate = tracker.reconcile_block_updates(&[BlockStateUpdate {
+            position: matching,
+            state: RuntimeBlockStateId(0),
+        }]);
+        assert!(matching_immediate.is_empty());
+        let resolution = tracker.acknowledge(7);
+        assert_eq!(resolution.updates[0].state, RuntimeBlockStateId(0));
+        assert!(resolution.rollbacks.is_empty());
+
+        let differing = BlockCoordinates { x: 1, y: 64, z: 0 };
+        assert!(tracker.register_prediction(
+            8,
+            differing,
+            RuntimeBlockStateId(5),
+            RuntimeBlockStateId(0),
+            pose,
+        ));
+        let differing_immediate = tracker.reconcile_block_updates(&[BlockStateUpdate {
+            position: differing,
+            state: RuntimeBlockStateId(9),
+        }]);
+        assert!(differing_immediate.is_empty());
+        let resolution = tracker.acknowledge(8);
+        assert_eq!(resolution.updates[0].state, RuntimeBlockStateId(9));
+        assert_eq!(resolution.rollbacks.len(), 1);
+
+        let unrelated = BlockStateUpdate {
+            position: BlockCoordinates { x: 2, y: 64, z: 0 },
+            state: RuntimeBlockStateId(11),
+        };
+        assert_eq!(
+            tracker.reconcile_block_updates(&[unrelated]),
+            vec![unrelated]
+        );
+    }
+
+    #[test]
+    fn repeated_position_prediction_keeps_original_server_baseline_and_latest_sequence() {
+        let mut tracker = BlockInteractionTracker::new(BlockOutlineProfile::synthetic([]));
+        let position = BlockCoordinates { x: -4, y: 70, z: 9 };
+        let original_pose = LocalPlayerPose::new(-5.0, 70.0, 9.5, 0.0, 0.0);
+        assert!(tracker.register_prediction(
+            10,
+            position,
+            RuntimeBlockStateId(5),
+            RuntimeBlockStateId(0),
+            original_pose,
+        ));
+        assert!(tracker.register_prediction(
+            12,
+            position,
+            RuntimeBlockStateId(0),
+            RuntimeBlockStateId(6),
+            LocalPlayerPose::new(-3.5, 70.0, 9.5, 0.0, 0.0),
+        ));
+        assert_eq!(tracker.predictions.len(), 1);
+        assert_eq!(tracker.predictions[0].server_state, RuntimeBlockStateId(5));
+        assert!(tracker.acknowledge(10).updates.is_empty());
+        let resolution = tracker.acknowledge(12);
+        assert_eq!(resolution.updates[0].state, RuntimeBlockStateId(5));
+        assert_eq!(
+            resolution.rollbacks[0].player_position,
+            Vec3d::new(-5.0, 70.0, 9.5)
+        );
+    }
+
+    #[test]
+    fn predictions_are_bounded_and_acknowledge_multiple_sequences_in_order() {
+        let mut tracker = BlockInteractionTracker::new(BlockOutlineProfile::synthetic([]));
+        let pose = LocalPlayerPose::new(0.0, 64.0, 0.0, 0.0, 0.0);
+        for sequence in 0..MAX_BLOCK_PREDICTIONS as i32 {
+            assert!(tracker.register_prediction(
                 sequence,
-                position: BlockCoordinates {
+                BlockCoordinates {
                     x: sequence,
                     y: 64,
-                    z: 0,
+                    z: 0
                 },
-                previous: RuntimeBlockStateId(5),
-                expected: RuntimeBlockStateId(0),
-            });
-            if tracker.predictions.len() > MAX_BREAK_PREDICTIONS {
-                tracker.predictions.pop_front();
-            }
+                RuntimeBlockStateId(5),
+                RuntimeBlockStateId(0),
+                pose,
+            ));
         }
-        assert_eq!(tracker.predictions.len(), MAX_BREAK_PREDICTIONS);
-
-        let confirmed = tracker.predictions[3];
-        tracker.reconcile_block_updates(&[BlockStateUpdate {
-            position: confirmed.position,
-            state: confirmed.expected,
-        }]);
-        assert!(
-            !tracker
-                .predictions
-                .iter()
-                .any(|prediction| prediction.position == confirmed.position)
+        assert!(!tracker.register_prediction(
+            MAX_BLOCK_PREDICTIONS as i32,
+            BlockCoordinates {
+                x: 100,
+                y: 64,
+                z: 0
+            },
+            RuntimeBlockStateId(5),
+            RuntimeBlockStateId(0),
+            pose,
+        ));
+        assert_eq!(tracker.acknowledge(7).updates.len(), 8);
+        assert_eq!(tracker.predictions.len(), MAX_BLOCK_PREDICTIONS - 8);
+        assert_eq!(
+            tracker.acknowledge(i32::MAX).updates.len(),
+            MAX_BLOCK_PREDICTIONS - 8
         );
+    }
 
-        let rolled_back = tracker.predictions[4];
-        tracker.reconcile_block_updates(&[BlockStateUpdate {
-            position: rolled_back.position,
-            state: rolled_back.previous,
-        }]);
-        assert!(
-            !tracker
-                .predictions
-                .iter()
-                .any(|prediction| prediction.position == rolled_back.position)
+    #[test]
+    fn solid_prediction_rollback_moves_an_embedded_player_to_the_saved_position() {
+        let solid = RuntimeBlockStateId(5);
+        let air = RuntimeBlockStateId(0);
+        let (controls, runner) = WorldControlHandle::new();
+        drop(controls);
+        let mut controller = WorldMovementController::new(
+            runner,
+            BlockCollisionProfile::synthetic([
+                (air, cubic_world::CollisionShape::Empty),
+                (solid, cubic_world::CollisionShape::FullCube),
+            ]),
+            BlockOutlineProfile::synthetic([]),
+            1,
         );
-
-        tracker.acknowledge(i32::MAX);
-        assert!(tracker.predictions.is_empty());
+        let position = BlockCoordinates { x: 0, y: 64, z: 0 };
+        let saved = LocalPlayerPose::new(-0.5, 64.0, 0.5, 10.0, 5.0);
+        assert!(
+            controller
+                .interaction
+                .register_prediction(1, position, solid, air, saved)
+        );
+        controller.simulation = Some(
+            PlayerMovementState::from_authoritative(
+                LocalPlayerPose::new(0.5, 64.0, 0.5, 30.0, 15.0),
+                Vec3d::new(0.2, 0.0, 0.0),
+            )
+            .unwrap(),
+        );
+        let resolution = controller.acknowledge_interaction(1);
+        let corrected = controller
+            .finish_prediction_resolution(&resolution)
+            .unwrap();
+        assert_eq!((corrected.x, corrected.y, corrected.z), (-0.5, 64.0, 0.5));
+        assert_eq!((corrected.yaw, corrected.pitch), (30.0, 15.0));
+        assert_eq!(
+            controller.simulation.as_ref().unwrap().velocity,
+            Vec3d::default()
+        );
     }
 }

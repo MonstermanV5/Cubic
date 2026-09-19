@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use cubic_version::MinecraftIdentifier;
 use thiserror::Error;
 
 pub const SECTION_BLOCK_COUNT: usize = 16 * 16 * 16;
@@ -157,6 +158,25 @@ pub struct BlockEntitySummary {
     pub local_z: u8,
     pub type_raw_id: u32,
     pub has_data: bool,
+    pub data: Option<BlockEntityData>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlockEntityData {
+    pub custom_name: Option<String>,
+    pub banner_patterns: Vec<BannerPatternLayer>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BannerPatternLayer {
+    pub pattern: BannerPattern,
+    pub dye_raw_id: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BannerPattern {
+    pub asset_id: MinecraftIdentifier,
+    pub translation_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -341,6 +361,41 @@ impl LoadedChunks {
             return false;
         };
         section.blocks.set(index, state)
+    }
+
+    pub(crate) fn update_block_entity(
+        &mut self,
+        coordinate: ChunkCoordinate,
+        local_x: u8,
+        y: i16,
+        local_z: u8,
+        type_raw_id: u32,
+        data: BlockEntityData,
+    ) -> Option<bool> {
+        let chunk = self.chunks.get_mut(&coordinate).map(Arc::make_mut)?;
+        if let Some(entity) = chunk
+            .block_entities
+            .iter_mut()
+            .find(|entity| entity.local_x == local_x && entity.y == y && entity.local_z == local_z)
+        {
+            let changed = entity.type_raw_id != type_raw_id
+                || entity.data.as_ref() != Some(&data)
+                || !entity.has_data;
+            entity.type_raw_id = type_raw_id;
+            entity.has_data = true;
+            entity.data = Some(data);
+            Some(changed)
+        } else {
+            chunk.block_entities.push(BlockEntitySummary {
+                local_x,
+                y,
+                local_z,
+                type_raw_id,
+                has_data: true,
+                data: Some(data),
+            });
+            Some(true)
+        }
     }
 }
 

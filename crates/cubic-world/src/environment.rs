@@ -34,6 +34,7 @@ pub enum SpecialSurface {
     FrostedIce,
     Slime,
     Honey,
+    Bed,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -172,6 +173,7 @@ impl EnvironmentRuleSet {
             "frosted_ice" => SpecialSurface::FrostedIce,
             "slime_block" => SpecialSurface::Slime,
             "honey_block" => SpecialSurface::Honey,
+            _ if path.ends_with("_bed") => SpecialSurface::Bed,
             _ => SpecialSurface::Ordinary,
         };
         BlockEnvironment {

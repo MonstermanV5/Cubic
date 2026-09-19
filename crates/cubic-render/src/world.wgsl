@@ -3,6 +3,7 @@ struct Camera { view_projection: mat4x4<f32> };
 @group(1) @binding(0) var block_atlas: texture_2d<f32>;
 @group(1) @binding(1) var block_sampler: sampler;
 @group(1) @binding(2) var cutout_block_sampler: sampler;
+@group(1) @binding(3) var banner_pattern_atlas: texture_2d<f32>;
 
 struct VertexInput { @location(0) position: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) tint: vec3<f32>, @location(3) layer: u32 };
 struct VertexOutput { @builtin(position) clip_position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) tint: vec3<f32>, @location(2) @interpolate(flat) layer: u32 };
@@ -22,14 +23,19 @@ struct VertexOutput { @builtin(position) clip_position: vec4<f32>, @location(0) 
     // domain. Cubic keeps an sRGB atlas and sRGB presentation surface, so
     // explicitly reconstruct that same encoded-domain product between the two
     // hardware transfer conversions.
-    // Sample outside control flow so implicit derivatives remain valid on all
-    // WebGPU backends; `layer` then selects the cutout coverage policy.
-    let filtered_sample = textureSample(block_atlas, block_sampler, input.uv);
-    let cutout_sample = textureSample(block_atlas, cutout_block_sampler, input.uv);
     let material_layer = input.layer & 0xffu;
+    let banner_material = (input.layer & 0x01000000u) != 0u;
     let debug_face = (input.layer >> 8u) & 0xffu;
     let debug_clipped = ((input.layer >> 16u) & 1u) != 0u;
-    let sampled = select(filtered_sample, cutout_sample, material_layer == 1u);
+    // Keep ordinary terrain's existing implicit-derivative sampling path.
+    // Explicit LOD for the rare banner branch permits a separate material
+    // without fetching the banner atlas for every terrain fragment.
+    let filtered_sample = textureSample(block_atlas, block_sampler, input.uv);
+    let cutout_sample = textureSample(block_atlas, cutout_block_sampler, input.uv);
+    var sampled = select(filtered_sample, cutout_sample, material_layer == 1u);
+    if banner_material {
+        sampled = textureSampleLevel(banner_pattern_atlas, cutout_block_sampler, input.uv, 0.0);
+    }
     if debug_face != 0u {
         var debug_color = vec3<f32>(1.0, 1.0, 1.0);
         switch debug_face {

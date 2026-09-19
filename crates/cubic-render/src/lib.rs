@@ -3,6 +3,7 @@
 mod block_resources;
 mod hud;
 mod mesher;
+mod model_part;
 mod world;
 
 pub use block_resources::{BlockResourceError, BlockResources, GuiSpriteData, TextureAtlasData};
@@ -88,6 +89,12 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Maximum texture edge accepted by the active graphics device.
+    #[must_use]
+    pub fn max_texture_side(&self) -> usize {
+        self.device.limits().max_texture_dimension_2d as usize
+    }
+
     /// Initializes a GPU device and a presentation surface for `window`.
     pub async fn new(window: Arc<Window>) -> Result<Self, RendererInitError> {
         let size = window.inner_size();

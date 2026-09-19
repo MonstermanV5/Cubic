@@ -103,6 +103,9 @@ pub struct WorldRenderUpdate {
     pub reset: bool,
     pub dimension: Option<String>,
     pub geometry: Option<DimensionGeometry>,
+    /// Current authoritative game mode used only to select presentation and
+    /// permitted inventory semantics (for example the Creative screen).
+    pub game_mode: Option<crate::GameMode>,
     pub biomes: Option<Arc<[RuntimeBiome]>>,
     pub pose: Option<RenderPoseSample>,
     /// Publication time used only for bounded input-to-frame diagnostics.
@@ -111,6 +114,9 @@ pub struct WorldRenderUpdate {
     pub pose_contains_jump: bool,
     pub target: Option<BlockTarget>,
     pub breaking: Option<BlockBreakingOverlay>,
+    /// Latest authoritative inventory snapshot. It coalesces independently of
+    /// terrain work and never contains protocol runtime IDs.
+    pub inventory: Option<crate::InventoryState>,
     pub chunks: Vec<ChunkRenderDelta>,
 }
 

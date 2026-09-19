@@ -142,6 +142,7 @@ pub(crate) struct ConnectedPlay {
     pub(crate) initial_login: v775::InitialPlayLogin,
     pub(crate) dimension_types: Vec<cubic_world::RuntimeDimensionType>,
     pub(crate) biomes: Vec<cubic_world::RuntimeBiome>,
+    pub(crate) banner_patterns: Vec<cubic_version::MinecraftIdentifier>,
     pub(crate) result: DevelopmentLoginResult,
 }
 
@@ -213,6 +214,7 @@ async fn connect_to_play_inner(
         initial_login: configuration.initial_login,
         dimension_types: configuration.dimension_types,
         biomes: configuration.biomes,
+        banner_patterns: configuration.banner_patterns,
         result: DevelopmentLoginResult {
             address: address.clone(),
             minecraft_version: profile.minecraft_version().clone(),
@@ -309,6 +311,7 @@ pub(crate) struct ConfigurationOutcome {
     pub(crate) initial_login: v775::InitialPlayLogin,
     pub(crate) dimension_types: Vec<cubic_world::RuntimeDimensionType>,
     pub(crate) biomes: Vec<cubic_world::RuntimeBiome>,
+    pub(crate) banner_patterns: Vec<cubic_version::MinecraftIdentifier>,
 }
 
 pub(crate) async fn run_configuration(
@@ -318,6 +321,7 @@ pub(crate) async fn run_configuration(
     let mut skipped_packets = 0_usize;
     let mut dimension_types = Vec::new();
     let mut biomes = Vec::new();
+    let mut banner_patterns = Vec::new();
     for _ in 0..=MAX_RECONFIGURATIONS_DURING_ACCEPTANCE {
         let phase = run_configuration_phase(connection, state).await?;
         skipped_packets = skipped_packets.saturating_add(phase.skipped_packets);
@@ -327,6 +331,9 @@ pub(crate) async fn run_configuration(
         if !phase.biomes.is_empty() {
             biomes = phase.biomes;
         }
+        if !phase.banner_patterns.is_empty() {
+            banner_patterns = phase.banner_patterns;
+        }
         match await_initial_play_login(connection, state).await? {
             PlayAcceptance::Login(initial_login) => {
                 return Ok(ConfigurationOutcome {
@@ -334,6 +341,7 @@ pub(crate) async fn run_configuration(
                     initial_login,
                     dimension_types,
                     biomes,
+                    banner_patterns,
                 });
             }
             PlayAcceptance::Reconfigure => {}
@@ -349,6 +357,7 @@ struct ConfigurationPhaseOutcome {
     skipped_packets: usize,
     dimension_types: Vec<cubic_world::RuntimeDimensionType>,
     biomes: Vec<cubic_world::RuntimeBiome>,
+    banner_patterns: Vec<cubic_version::MinecraftIdentifier>,
 }
 
 async fn run_configuration_phase(
@@ -358,6 +367,7 @@ async fn run_configuration_phase(
     let mut skipped_packets = 0_usize;
     let mut dimension_types = Vec::new();
     let mut biomes = Vec::new();
+    let mut banner_patterns = Vec::new();
     for _ in 0..MAX_CONFIGURATION_PACKETS {
         let frame = connection
             .read_frame("Configuration packet read")
@@ -386,6 +396,20 @@ async fn run_configuration_phase(
                     biomes = crate::world_adapter::biomes(entries).map_err(|error| {
                         DevelopmentLoginError::ConfigurationData(error.to_string())
                     })?;
+                } else if registry == "minecraft:banner_pattern" {
+                    banner_patterns = entries
+                        .into_iter()
+                        .map(|entry| {
+                            cubic_version::MinecraftIdentifier::new(entry.identifier).map_err(
+                                |_| {
+                                    DevelopmentLoginError::ConfigurationData(format!(
+                                        "invalid banner-pattern registry identifier {:?}",
+                                        entry.identifier
+                                    ))
+                                },
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                 }
             }
             ConfigurationClientbound::Disconnect { reason } => {
@@ -409,6 +433,7 @@ async fn run_configuration_phase(
                     skipped_packets,
                     dimension_types,
                     biomes,
+                    banner_patterns,
                 });
             }
             ConfigurationClientbound::KeepAlive { id } => {
@@ -574,6 +599,7 @@ async fn await_initial_play_login(
             | PlayClientbound::SetTime(_)
             | PlayClientbound::ChangeDifficulty { .. }
             | PlayClientbound::GameEvent { .. }
+            | PlayClientbound::EntityEvent { .. }
             | PlayClientbound::InitializeBorder(_)
             | PlayClientbound::Health { .. }
             | PlayClientbound::EntityData { .. }
@@ -585,6 +611,7 @@ async fn await_initial_play_login(
             | PlayClientbound::BlockUpdate(_)
             | PlayClientbound::SectionBlocksUpdate(_)
             | PlayClientbound::BlockChangedAck { .. }
+            | PlayClientbound::BlockEntityData(_)
             | PlayClientbound::Ignored { .. } => {}
         }
     }

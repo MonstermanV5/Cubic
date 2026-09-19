@@ -17,8 +17,8 @@ mod world_render;
 pub use address::{DEFAULT_MINECRAFT_PORT, ServerAddress, ServerAddressError};
 pub use chat_session::{
     ChatSessionError, ChatSessionHandle, ChatSessionOptions, ChatSessionRunner,
-    ChatSessionSendError, run_authenticated_chat_session, run_development_chat_session,
-    run_development_world_session,
+    ChatSessionSendError, InventoryProtocolProfile, run_authenticated_chat_session,
+    run_development_chat_session, run_development_world_session,
 };
 pub use development_login::{
     ConnectionState, DevelopmentLoginOptions, DevelopmentLoginResult, DevelopmentUsername,
@@ -30,5 +30,5 @@ pub use online_login::{
     authenticated_login,
 };
 pub use status::{ServerStatus, StatusQueryOptions, query_server_status};
-pub use world_movement::{WorldControlHandle, WorldControlRunner};
+pub use world_movement::{InventoryCommand, WorldControlHandle, WorldControlRunner};
 pub use world_render::{WorldRenderHandle, WorldRenderRunner};

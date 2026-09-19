@@ -9,12 +9,15 @@ use std::{
 };
 
 use cubic_render::{BlockResources, FrameStatus, Renderer, RendererInitError};
-use cubic_ui::{ChatMode, ChatSessionPort, PresentationModeController, SessionPresentationMode};
+use cubic_ui::{
+    ChatMode, ChatSessionPort, InventoryAction, InventoryOverlay, PresentationModeController,
+    SessionPresentationMode,
+};
 use cubic_world::{MovementInput, WorldRenderUpdate};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{DeviceEvent, ElementState, MouseButton, WindowEvent},
+    event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window, WindowId},
@@ -66,6 +69,31 @@ const MOUSE_SENSITIVITY_DEGREES_PER_PIXEL: f32 = 0.12;
 
 const fn world_presentation_active(mode: SessionPresentationMode) -> bool {
     matches!(mode, SessionPresentationMode::Play)
+}
+
+const fn gameplay_input_active(mode: SessionPresentationMode, inventory_visible: bool) -> bool {
+    matches!(mode, SessionPresentationMode::Play) && !inventory_visible
+}
+
+const fn inventory_toggle_consumed_by_gui(inventory_visible: bool, consumed: bool) -> bool {
+    inventory_visible && consumed
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InventoryInputTransition {
+    EnterGui,
+    LeaveGui,
+}
+
+const fn inventory_input_transition(
+    was_visible: bool,
+    visible: bool,
+) -> Option<InventoryInputTransition> {
+    match (was_visible, visible) {
+        (false, true) => Some(InventoryInputTransition::EnterGui),
+        (true, false) => Some(InventoryInputTransition::LeaveGui),
+        _ => None,
+    }
 }
 
 fn update_movement_key(input: &mut MovementInput, key: KeyCode, pressed: bool) -> bool {
@@ -165,6 +193,7 @@ pub trait WorldSessionPort {
     fn add_look_delta(&self, sequence: u64, yaw: f32, pitch: f32);
     fn set_attack(&self, pressed: bool);
     fn press_use(&self);
+    fn inventory_action(&self, action: InventoryAction);
     fn disconnect(&self);
 }
 
@@ -208,6 +237,8 @@ struct WorldApplication {
     cursor_captured: bool,
     pending_pose_presentation: Option<(Instant, Instant, bool)>,
     frame_rate: FrameRateCounter,
+    inventory: InventoryOverlay,
+    hotbar_scroll: ScrollAccumulator,
 }
 
 impl WorldApplication {
@@ -232,6 +263,8 @@ impl WorldApplication {
             cursor_captured: false,
             pending_pose_presentation: None,
             frame_rate: FrameRateCounter::default(),
+            inventory: InventoryOverlay::default(),
+            hotbar_scroll: ScrollAccumulator::default(),
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), StartupError> {
@@ -246,17 +279,44 @@ impl WorldApplication {
         );
         let mut renderer = pollster::block_on(Renderer::new(Arc::clone(&window)))
             .map_err(StartupError::InitializeRenderer)?;
+        let item_icons_by_scale = std::mem::take(&mut self.resources.item_icons_by_scale);
+        let inventory_sprites = std::mem::take(&mut self.resources.inventory_sprites);
+        let inventory_translations = std::mem::take(&mut self.resources.inventory_translations);
         renderer.enable_world(self.resources.clone());
         let context = egui::Context::default();
+        // Item atlases are installed before egui-winit's first RawInput. Give
+        // Context the same device-backed limit up front; its 2048 default is
+        // otherwise used by load_texture even when State later advertises 4096.
+        let max_texture_side = renderer.max_texture_side().min(4_096);
+        context.input_mut(|input| input.max_texture_side = max_texture_side);
         context.set_visuals(egui::Visuals::dark());
         install_chat_font_fallback(&context);
+        for (gui_scale, item_icons) in item_icons_by_scale {
+            self.inventory.install_icon_atlas(
+                &context,
+                gui_scale,
+                item_icons
+                    .into_iter()
+                    .map(|(identifier, icon)| (identifier, icon.width, icon.height, icon.rgba)),
+            );
+        }
+        for (identifier, sprite) in inventory_sprites {
+            self.inventory.install_screen_texture(
+                &context,
+                identifier,
+                sprite.width,
+                sprite.height,
+                sprite.rgba,
+            );
+        }
+        self.inventory.install_translations(inventory_translations);
         let egui = egui_winit::State::new(
             context,
             egui::ViewportId::ROOT,
             window.as_ref(),
             Some(window.scale_factor() as f32),
             None,
-            Some(4_096),
+            Some(max_texture_side),
         );
         self.window = Some(Arc::clone(&window));
         self.renderer = Some(renderer);
@@ -279,6 +339,14 @@ impl WorldApplication {
     fn integrate_world_updates(&mut self) -> bool {
         let mut changed = false;
         while let Some(update) = self.port.take_world_update() {
+            if let Some(inventory) = update.inventory.clone() {
+                let was_visible = self.inventory.visible();
+                self.inventory.replace(inventory);
+                self.synchronize_inventory_input_mode(was_visible);
+            }
+            if let Some(game_mode) = update.game_mode {
+                self.inventory.set_game_mode(game_mode);
+            }
             if let Some(published_at) = update.pose_published_at {
                 let observed_at = Instant::now();
                 if update.pose_contains_jump {
@@ -322,6 +390,20 @@ impl WorldApplication {
         self.port.reset_movement_input(self.input_sequence);
         self.port.set_attack(false);
         tracing::trace!(target: "movement::input", sequence = self.input_sequence, "platform recorded synthetic focus/control release");
+    }
+
+    fn synchronize_inventory_input_mode(&mut self, was_visible: bool) {
+        let visible = self.inventory.visible();
+        let Some(transition) = inventory_input_transition(was_visible, visible) else {
+            return;
+        };
+        self.clear_input();
+        self.inventory.cancel_pointer_gesture();
+        self.set_cursor_capture(
+            matches!(transition, InventoryInputTransition::LeaveGui)
+                && self.mode.mode() == SessionPresentationMode::Play,
+        );
+        self.request_redraw();
     }
 
     fn update_key(&mut self, key: KeyCode, pressed: bool) {
@@ -400,6 +482,9 @@ impl WorldApplication {
                 play_requested = self.chat.show_with_play_control(ui, true);
             }
             SessionPresentationMode::Play => {
+                for action in self.inventory.show(ui.ctx()) {
+                    self.port.inventory_action(action);
+                }
                 egui::Area::new(egui::Id::new("cubic-frame-rate"))
                     .anchor(egui::Align2::LEFT_TOP, [12.0, 12.0])
                     .interactable(false)
@@ -514,13 +599,14 @@ impl ApplicationHandler for WorldApplication {
             }
             WindowEvent::Focused(false) => {
                 self.clear_input();
+                self.inventory.cancel_pointer_gesture();
                 self.set_cursor_capture(false);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if self.mode.mode() == SessionPresentationMode::Play
+            } if gameplay_input_active(self.mode.mode(), self.inventory.visible())
                 && !egui_response.is_some_and(|response| response.consumed) =>
             {
                 if self.cursor_captured {
@@ -540,20 +626,75 @@ impl ApplicationHandler for WorldApplication {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,
                 ..
-            } if self.mode.mode() == SessionPresentationMode::Play
+            } if gameplay_input_active(self.mode.mode(), self.inventory.visible())
                 && self.cursor_captured
                 && !egui_response.is_some_and(|response| response.consumed) =>
             {
                 self.port.press_use();
+            }
+            WindowEvent::MouseWheel { delta, .. }
+                if gameplay_input_active(self.mode.mode(), self.inventory.visible()) =>
+            {
+                let (x, y) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
+                    // Winit reports touchpad scrolling in physical pixels. A
+                    // 120-pixel notch is the Windows reference quantum; the
+                    // accumulator retains all fractional movement.
+                    MouseScrollDelta::PixelDelta(position) => {
+                        (position.x / 120.0, position.y / 120.0)
+                    }
+                };
+                let [whole_x, whole_y] = self.hotbar_scroll.push(x, y);
+                let step = if whole_y != 0 { whole_y } else { -whole_x };
+                if step != 0 {
+                    let current = self.inventory.selected_hotbar_slot();
+                    let selected = next_hotbar_selection(step, current);
+                    self.inventory.select_hotbar_local(selected);
+                    self.port
+                        .inventory_action(InventoryAction::SelectHotbar(selected));
+                    self.request_redraw();
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.mode.mode() == SessionPresentationMode::Play
                     && let PhysicalKey::Code(code) = event.physical_key
                 {
                     if code == KeyCode::Escape && event.state == ElementState::Pressed {
-                        self.clear_input();
-                        self.set_cursor_capture(false);
-                    } else {
+                        if self.inventory.visible() {
+                            let was_visible = true;
+                            if let Some(action) = self.inventory.close() {
+                                self.port.inventory_action(action);
+                            }
+                            self.synchronize_inventory_input_mode(was_visible);
+                        } else {
+                            self.clear_input();
+                            self.set_cursor_capture(false);
+                        }
+                    } else if code == KeyCode::KeyE
+                        && event.state == ElementState::Pressed
+                        && !inventory_toggle_consumed_by_gui(
+                            self.inventory.visible(),
+                            egui_response.is_some_and(|response| response.consumed),
+                        )
+                    {
+                        let was_visible = self.inventory.visible();
+                        if was_visible {
+                            if let Some(action) = self.inventory.close() {
+                                self.port.inventory_action(action);
+                            }
+                        } else {
+                            self.inventory.toggle_player_inventory();
+                        }
+                        self.synchronize_inventory_input_mode(was_visible);
+                    } else if event.state == ElementState::Pressed
+                        && let Some(slot) = hotbar_key(code)
+                    {
+                        if !self.inventory.visible() {
+                            self.inventory.select_hotbar_local(slot);
+                            self.port
+                                .inventory_action(InventoryAction::SelectHotbar(slot));
+                        }
+                    } else if !self.inventory.visible() {
                         self.update_key(code, event.state == ElementState::Pressed);
                     }
                 }
@@ -650,7 +791,7 @@ impl ApplicationHandler for WorldApplication {
         _device_id: winit::event::DeviceId,
         event: DeviceEvent,
     ) {
-        if self.mode.mode() == SessionPresentationMode::Play
+        if gameplay_input_active(self.mode.mode(), self.inventory.visible())
             && self.cursor_captured
             && let DeviceEvent::MouseMotion { delta: (x, y) } = event
         {
@@ -675,6 +816,50 @@ impl ApplicationHandler for WorldApplication {
         self.chat.disconnect();
         tracing::info!("Cubic Play/Chat session stopped cleanly");
     }
+}
+
+const fn hotbar_key(code: KeyCode) -> Option<u8> {
+    match code {
+        KeyCode::Digit1 => Some(0),
+        KeyCode::Digit2 => Some(1),
+        KeyCode::Digit3 => Some(2),
+        KeyCode::Digit4 => Some(3),
+        KeyCode::Digit5 => Some(4),
+        KeyCode::Digit6 => Some(5),
+        KeyCode::Digit7 => Some(6),
+        KeyCode::Digit8 => Some(7),
+        KeyCode::Digit9 => Some(8),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Default)]
+struct ScrollAccumulator {
+    x: f64,
+    y: f64,
+}
+
+impl ScrollAccumulator {
+    fn push(&mut self, x: f64, y: f64) -> [i32; 2] {
+        if self.x != 0.0 && x.signum() != self.x.signum() {
+            self.x = 0.0;
+        }
+        if self.y != 0.0 && y.signum() != self.y.signum() {
+            self.y = 0.0;
+        }
+        self.x += x;
+        self.y += y;
+        let whole = [self.x as i32, self.y as i32];
+        self.x -= f64::from(whole[0]);
+        self.y -= f64::from(whole[1]);
+        whole
+    }
+}
+
+fn next_hotbar_selection(scroll: i32, current: u8) -> u8 {
+    let direction = scroll.signum();
+    let next = (i32::from(current) - direction).rem_euclid(9);
+    u8::try_from(next).unwrap_or(current)
 }
 
 const FPS_SAMPLE_WINDOW: Duration = Duration::from_millis(500);
@@ -1155,6 +1340,53 @@ mod tests {
             update_movement_key(&mut input, KeyCode::KeyW, true);
         }
         assert_eq!(input, MovementInput::default());
+    }
+
+    #[test]
+    fn every_inventory_screen_suspends_gameplay_input_until_closed() {
+        assert!(gameplay_input_active(SessionPresentationMode::Play, false));
+        assert!(!gameplay_input_active(SessionPresentationMode::Play, true));
+        assert!(!gameplay_input_active(SessionPresentationMode::Chat, false));
+        assert!(!gameplay_input_active(SessionPresentationMode::Chat, true));
+        assert_eq!(
+            inventory_input_transition(false, true),
+            Some(InventoryInputTransition::EnterGui)
+        );
+        assert_eq!(
+            inventory_input_transition(true, false),
+            Some(InventoryInputTransition::LeaveGui)
+        );
+        assert_eq!(inventory_input_transition(false, false), None);
+        assert_eq!(inventory_input_transition(true, true), None);
+    }
+
+    #[test]
+    fn focused_inventory_editor_consumes_inventory_toggle_key() {
+        assert!(inventory_toggle_consumed_by_gui(true, true));
+        assert!(!inventory_toggle_consumed_by_gui(true, false));
+        assert!(!inventory_toggle_consumed_by_gui(false, true));
+    }
+
+    #[test]
+    fn hotbar_scroll_matches_vanilla_fraction_sign_reset_direction_and_wrap() {
+        let mut scroll = ScrollAccumulator::default();
+        assert_eq!(scroll.push(0.0, 0.4), [0, 0]);
+        assert_eq!(scroll.push(0.0, 0.6), [0, 1]);
+        assert_eq!(next_hotbar_selection(1, 0), 8);
+        assert_eq!(next_hotbar_selection(-1, 8), 0);
+        assert_eq!(next_hotbar_selection(5, 4), 3);
+
+        assert_eq!(scroll.push(0.0, 0.75), [0, 0]);
+        // Reversing direction discards the old fractional remainder before
+        // accumulating the new direction, matching ScrollWheelHandler.
+        assert_eq!(scroll.push(0.0, -0.5), [0, 0]);
+        assert_eq!(scroll.push(0.0, -0.5), [0, -1]);
+
+        let mut horizontal = ScrollAccumulator::default();
+        let [whole_x, whole_y] = horizontal.push(1.0, 0.0);
+        let step = if whole_y != 0 { whole_y } else { -whole_x };
+        assert_eq!(next_hotbar_selection(step, 0), 1);
+        assert!(!gameplay_input_active(SessionPresentationMode::Play, true));
     }
 
     #[test]

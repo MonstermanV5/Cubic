@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use cubic_version::GameData;
+use cubic_version::{GameData, MinecraftIdentifier, shape_data_for};
 use thiserror::Error;
 
 use crate::{
@@ -68,6 +68,9 @@ impl BlockReach {
 pub struct BlockOutlineProfile {
     states: BTreeMap<RuntimeBlockStateId, CollisionShape>,
     bare_hand_destroy_progress: BTreeMap<RuntimeBlockStateId, f32>,
+    block_paths: BTreeMap<RuntimeBlockStateId, String>,
+    rules: crate::collision_vanilla::CollisionRuleSet,
+    placeable_blocks: BTreeMap<MinecraftIdentifier, RuntimeBlockStateId>,
     air_state: Option<RuntimeBlockStateId>,
 }
 
@@ -77,12 +80,17 @@ impl BlockOutlineProfile {
         let rules = crate::collision_vanilla::CollisionRuleSet::for_version(
             &data.artifact().minecraft_version,
         );
+        let generated = shape_data_for(&data.artifact().minecraft_version)
+            .ok()
+            .flatten();
         let collision = BlockCollisionProfile::from_game_data(data);
         let visual = BlockVisualProfile::from_game_data(data)
             .unwrap_or_else(|_| BlockVisualProfile::from_air_states([]));
         let mut states = BTreeMap::new();
         let mut bare_hand_destroy_progress = BTreeMap::new();
+        let mut block_paths = BTreeMap::new();
         let mut air_state = None;
+        let mut placeable_blocks = BTreeMap::new();
         for block in &data.artifact().blocks {
             let path = block
                 .identifier
@@ -98,6 +106,22 @@ impl BlockOutlineProfile {
                 }
                 let shape = if visual.is_air(id) {
                     CollisionShape::Empty
+                } else if let Some((generated, state_shape)) =
+                    generated.as_ref().and_then(|generated| {
+                        generated
+                            .state(state.state_id)
+                            .filter(|candidate| {
+                                candidate.block == block.identifier.as_str()
+                                    && candidate.properties == state.properties
+                            })
+                            .map(|state| (generated, state))
+                    })
+                {
+                    crate::movement::collision_shape_from_data(
+                        generated
+                            .shape(state_shape.outline_shape)
+                            .unwrap_or_default(),
+                    )
                 } else {
                     match collision.shape(id) {
                         CollisionShape::Empty if collision.environment(id).fluid.is_some() => {
@@ -108,11 +132,21 @@ impl BlockOutlineProfile {
                 };
                 states.insert(id, shape);
                 bare_hand_destroy_progress.insert(id, rules.bare_hand_destroy_progress(path));
+                block_paths.insert(id, path.to_owned());
+            }
+            if block.properties.is_empty() && data.item(&block.identifier).is_some() {
+                placeable_blocks.insert(
+                    block.identifier.clone(),
+                    RuntimeBlockStateId(block.default_state_id),
+                );
             }
         }
         Self {
             states,
             bare_hand_destroy_progress,
+            block_paths,
+            rules,
+            placeable_blocks,
             air_state,
         }
     }
@@ -124,6 +158,9 @@ impl BlockOutlineProfile {
         Self {
             states: states.into_iter().collect(),
             bare_hand_destroy_progress: BTreeMap::new(),
+            block_paths: BTreeMap::new(),
+            rules: crate::collision_vanilla::CollisionRuleSet::Conservative,
+            placeable_blocks: BTreeMap::new(),
             air_state: None,
         }
     }
@@ -141,6 +178,9 @@ impl BlockOutlineProfile {
         Self {
             states: shapes,
             bare_hand_destroy_progress: progress,
+            block_paths: BTreeMap::new(),
+            rules: crate::collision_vanilla::CollisionRuleSet::Conservative,
+            placeable_blocks: BTreeMap::new(),
             air_state: None,
         }
     }
@@ -158,15 +198,47 @@ impl BlockOutlineProfile {
             .unwrap_or(0.0)
     }
 
+    #[must_use]
+    pub fn destroy_progress(
+        &self,
+        state: RuntimeBlockStateId,
+        held_item: Option<&MinecraftIdentifier>,
+    ) -> f32 {
+        self.block_paths.get(&state).map_or_else(
+            || self.bare_hand_destroy_progress(state),
+            |path| {
+                self.rules
+                    .destroy_progress(path, held_item.map(MinecraftIdentifier::as_str))
+            },
+        )
+    }
+
     /// Exact-version default air state used for safe completed-break prediction.
     #[must_use]
     pub const fn air_state(&self) -> Option<RuntimeBlockStateId> {
         self.air_state
     }
 
+    /// Returns a generated default state only when the stable item identity is
+    /// also a property-free block. Directional/property-driven placement stays
+    /// server-authoritative rather than guessing a state.
+    #[must_use]
+    pub fn safe_placement_state(&self, item: &MinecraftIdentifier) -> Option<RuntimeBlockStateId> {
+        self.placeable_blocks.get(item).copied()
+    }
+
     #[cfg(test)]
     pub fn set_synthetic_air_state(&mut self, state: RuntimeBlockStateId) {
         self.air_state = Some(state);
+    }
+
+    #[cfg(test)]
+    pub fn set_synthetic_placeable(
+        &mut self,
+        item: MinecraftIdentifier,
+        state: RuntimeBlockStateId,
+    ) {
+        self.placeable_blocks.insert(item, state);
     }
 }
 
@@ -568,6 +640,17 @@ mod tests {
             ),
             Err(RaycastError::ZeroDirection)
         ));
+    }
+
+    #[test]
+    fn placement_prediction_requires_an_exact_property_free_item_mapping() {
+        let stone = MinecraftIdentifier::new("minecraft:stone").unwrap();
+        let stairs = MinecraftIdentifier::new("minecraft:oak_stairs").unwrap();
+        let state = RuntimeBlockStateId(7);
+        let mut profile = BlockOutlineProfile::synthetic([]);
+        profile.set_synthetic_placeable(stone.clone(), state);
+        assert_eq!(profile.safe_placement_state(&stone), Some(state));
+        assert_eq!(profile.safe_placement_state(&stairs), None);
     }
 
     #[test]

@@ -249,7 +249,7 @@ fn valid_standalone_light_update_is_summarized() {
 }
 
 #[test]
-fn block_entity_compound_is_bounded_and_summarized() {
+fn block_entity_compound_is_bounded_and_retained() {
     let mut packet = CodecWriter::new();
     packet.write_var_int(0x2d);
     packet.write_i32(0);
@@ -282,4 +282,5 @@ fn block_entity_compound_is_bounded_and_summarized() {
     );
     assert_eq!(chunk.block_entities[0].y, -12);
     assert!(chunk.block_entities[0].has_data);
+    assert!(chunk.block_entities[0].data.as_ref().unwrap().is_empty());
 }

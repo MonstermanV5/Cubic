@@ -8,23 +8,30 @@ mod chunk;
 mod collision_vanilla;
 mod environment;
 mod interaction;
+mod inventory;
 mod model;
 mod movement;
 mod render;
 mod state;
 
 pub use chunk::{
-    BlockEntitySummary, Chunk, ChunkCoordinate, ChunkLightSummary, ChunkSection, ChunkStoreError,
-    ChunkSummary, HeightmapData, LightLayerData, LoadedChunks, MAX_BLOCK_ENTITIES_PER_CHUNK,
-    MAX_CHUNK_SECTIONS, MAX_HEIGHTMAP_LONGS, MAX_HEIGHTMAPS, MAX_LOADED_CHUNKS, PaletteForm,
-    PalettedContainer, RuntimeBiomeId, RuntimeBlockStateId, SECTION_BIOME_COUNT,
-    SECTION_BLOCK_COUNT,
+    BannerPattern, BannerPatternLayer, BlockEntityData, BlockEntitySummary, Chunk, ChunkCoordinate,
+    ChunkLightSummary, ChunkSection, ChunkStoreError, ChunkSummary, HeightmapData, LightLayerData,
+    LoadedChunks, MAX_BLOCK_ENTITIES_PER_CHUNK, MAX_CHUNK_SECTIONS, MAX_HEIGHTMAP_LONGS,
+    MAX_HEIGHTMAPS, MAX_LOADED_CHUNKS, PaletteForm, PalettedContainer, RuntimeBiomeId,
+    RuntimeBlockStateId, SECTION_BIOME_COUNT, SECTION_BLOCK_COUNT,
 };
 pub use environment::{
     BlockEnvironment, BlockEnvironmentProfile, FluidKind, FluidState, SpecialSurface,
 };
 pub use interaction::{
     BlockFace, BlockOutlineProfile, BlockReach, BlockTarget, RaycastError, raycast_blocks,
+};
+pub use inventory::{
+    ClickOutcome, ComponentPatch, ComponentValue, ContainerClick, ContainerClickKind, ContainerId,
+    ContainerState, InventoryError, InventoryState, ItemStack, MAX_COMPONENT_BYTES,
+    MAX_COMPONENTS_PER_STACK, MAX_CONTAINER_SLOTS, MenuIdentity, PLAYER_CONTAINER_ID,
+    PLAYER_INVENTORY_SLOTS, SlotIndex,
 };
 
 pub use model::{

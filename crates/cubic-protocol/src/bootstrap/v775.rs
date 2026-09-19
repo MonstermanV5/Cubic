@@ -6,9 +6,22 @@
 use thiserror::Error;
 
 mod chunk;
+mod inventory;
 pub use chunk::{
     ChunkDecodeError, LevelChunkWithLight, LightUpdate, WireBlockEntity, WireChunkSection,
     WireHeightmap, WireLightData, WirePalettedContainer,
+};
+pub use inventory::{
+    BannerPatternHolder, BannerPatternLayer, BannerPatternLayers, ClientboundContainerClose,
+    ClientboundContainerSetContent, ClientboundContainerSetData, ClientboundContainerSetSlot,
+    ClientboundInventoryPacket, ClientboundOpenScreen, ClientboundSetHeldSlot,
+    ComponentPatch as WireComponentPatch, InventoryCodecError, ItemStack as WireItemStack,
+    ItemStackProfile, MAX_BANNER_PATTERN_LAYERS, ServerboundContainerClick, ServerboundHashedStack,
+    creative_slot_packet_id, decode_container_close, decode_container_set_content,
+    decode_container_set_slot, decode_creative_banner_pattern_layers, decode_inventory_clientbound,
+    decode_open_screen, decode_set_held_slot, encode_container_click,
+    encode_play_container_button_click, encode_play_container_click, encode_play_container_close,
+    encode_play_set_carried_item, encode_play_set_creative_slot,
 };
 
 use crate::{
@@ -94,6 +107,7 @@ const PLAY_CHAT_ACKNOWLEDGEMENT_ID: i32 = 0x06;
 const PLAY_CHAT_MESSAGE_ID: i32 = 0x09;
 const PLAY_CHAT_SESSION_UPDATE_ID: i32 = 0x0a;
 const PLAY_CHUNK_BATCH_RECEIVED_ID: i32 = 0x0b;
+const PLAY_CLIENT_COMMAND_ID: i32 = 0x0c;
 const PLAY_CLIENT_TICK_END_ID: i32 = 0x0d;
 const PLAY_CLIENT_INFORMATION_ID: i32 = 0x0e;
 const PLAY_ACKNOWLEDGE_CONFIGURATION_ID: i32 = 0x10;
@@ -117,12 +131,14 @@ const PLAY_USE_ITEM_ID: i32 = 0x43;
 
 const PLAY_CHANGE_DIFFICULTY_ID: i32 = 0x0a;
 const PLAY_BLOCK_CHANGED_ACK_ID: i32 = 0x04;
+const PLAY_BLOCK_ENTITY_DATA_ID: i32 = 0x06;
 const PLAY_BLOCK_UPDATE_ID: i32 = 0x08;
 const PLAY_CHUNK_BATCH_FINISHED_ID: i32 = 0x0b;
 const PLAY_CHUNK_BATCH_START_ID: i32 = 0x0c;
 const PLAY_COOKIE_REQUEST_ID: i32 = 0x15;
 const PLAY_CUSTOM_PAYLOAD_ID: i32 = 0x18;
 const PLAY_GAME_EVENT_ID: i32 = 0x26;
+const PLAY_ENTITY_EVENT_ID: i32 = 0x22;
 const PLAY_FORGET_LEVEL_CHUNK_ID: i32 = 0x25;
 const PLAY_INITIALIZE_BORDER_ID: i32 = 0x2b;
 const PLAY_LEVEL_CHUNK_WITH_LIGHT_ID: i32 = 0x2d;
@@ -172,14 +188,92 @@ pub const fn packet_identity_cross_checks() -> &'static [PacketIdentityCheck] {
         PacketIdentityCheck {
             state: Play,
             direction: C,
+            identity: "minecraft:container_close",
+            id: inventory::CONTAINER_CLOSE_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:container_set_content",
+            id: inventory::CONTAINER_SET_CONTENT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:container_set_data",
+            id: inventory::CONTAINER_SET_DATA_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:container_set_slot",
+            id: inventory::CONTAINER_SET_SLOT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:open_screen",
+            id: inventory::OPEN_SCREEN_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:set_held_slot",
+            id: inventory::SET_HELD_SLOT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:container_button_click",
+            id: inventory::SERVERBOUND_CONTAINER_BUTTON_CLICK_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:container_click",
+            id: inventory::SERVERBOUND_CONTAINER_CLICK_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:container_close",
+            id: inventory::SERVERBOUND_CONTAINER_CLOSE_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:set_carried_item",
+            id: inventory::SERVERBOUND_SET_CARRIED_ITEM_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:set_creative_mode_slot",
+            id: inventory::SERVERBOUND_SET_CREATIVE_SLOT_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
             identity: "minecraft:block_update",
             id: PLAY_BLOCK_UPDATE_ID as u32,
         },
         PacketIdentityCheck {
             state: Play,
             direction: C,
+            identity: "minecraft:block_entity_data",
+            id: PLAY_BLOCK_ENTITY_DATA_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
             identity: "minecraft:block_changed_ack",
             id: PLAY_BLOCK_CHANGED_ACK_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: C,
+            identity: "minecraft:entity_event",
+            id: PLAY_ENTITY_EVENT_ID as u32,
         },
         PacketIdentityCheck {
             state: Play,
@@ -354,6 +448,12 @@ pub const fn packet_identity_cross_checks() -> &'static [PacketIdentityCheck] {
             direction: S,
             identity: "minecraft:chunk_batch_received",
             id: PLAY_CHUNK_BATCH_RECEIVED_ID as u32,
+        },
+        PacketIdentityCheck {
+            state: Play,
+            direction: S,
+            identity: "minecraft:client_command",
+            id: PLAY_CLIENT_COMMAND_ID as u32,
         },
         PacketIdentityCheck {
             state: Play,
@@ -861,6 +961,7 @@ pub enum PlayClientbound {
     BlockChangedAck {
         sequence: i32,
     },
+    BlockEntityData(BlockEntityData),
     Login(InitialPlayLogin),
     KeepAlive {
         id: i64,
@@ -882,6 +983,10 @@ pub enum PlayClientbound {
     GameEvent {
         event: u8,
         value: f32,
+    },
+    EntityEvent {
+        entity_id: i32,
+        event: u8,
     },
     InitializeBorder(InitializeBorder),
     ChunkBatchFinished {
@@ -971,6 +1076,13 @@ pub struct BlockUpdate {
     pub y: i32,
     pub z: i32,
     pub state_id: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockEntityData {
+    pub position: crate::BlockPosition,
+    pub type_raw_id: u32,
+    pub data: NbtCompound,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1191,6 +1303,8 @@ pub enum BootstrapProtocolError {
     Codec(#[from] CodecError),
     #[error("malformed bounded NBT disconnect reason")]
     Nbt(#[source] NbtError),
+    #[error("Block Entity Data NBT root is not a compound")]
+    InvalidBlockEntityNbt,
     #[error(transparent)]
     Chunk(#[from] ChunkDecodeError),
     #[error("unexpected packet ID {id} in {state} state")]
@@ -1464,6 +1578,23 @@ pub fn decode_play_clientbound(
             require_consumed(&reader, "Block Changed Ack")?;
             Ok(PlayClientbound::BlockChangedAck { sequence })
         }
+        PLAY_BLOCK_ENTITY_DATA_ID => {
+            let position = reader.read_block_position()?;
+            let type_raw_id =
+                nonnegative_u32(reader.read_var_int()?, "Block Entity Data type registry ID")?;
+            let data = match decode_unnamed_network_tag(&mut reader, NbtLimits::default())
+                .map_err(BootstrapProtocolError::Nbt)?
+            {
+                NbtTag::Compound(compound) => compound,
+                _ => return Err(BootstrapProtocolError::InvalidBlockEntityNbt),
+            };
+            require_consumed(&reader, "Block Entity Data")?;
+            Ok(PlayClientbound::BlockEntityData(BlockEntityData {
+                position,
+                type_raw_id,
+                data,
+            }))
+        }
         INITIAL_PLAY_LOGIN_ID => decode_initial_play_login(&mut reader).map(PlayClientbound::Login),
         PLAY_CHANGE_DIFFICULTY_ID => {
             let difficulty = reader.read_var_int()?;
@@ -1540,6 +1671,12 @@ pub fn decode_play_clientbound(
             let value = reader.read_f32()?;
             require_consumed(&reader, "Game Event")?;
             Ok(PlayClientbound::GameEvent { event, value })
+        }
+        PLAY_ENTITY_EVENT_ID => {
+            let entity_id = reader.read_i32()?;
+            let event = reader.read_u8()?;
+            require_consumed(&reader, "Entity Event")?;
+            Ok(PlayClientbound::EntityEvent { entity_id, event })
         }
         PLAY_INITIALIZE_BORDER_ID => {
             decode_initialize_border(&mut reader).map(PlayClientbound::InitializeBorder)
@@ -2208,6 +2345,14 @@ pub fn encode_play_chunk_batch_received(
 /// Ends one protocol-775 client tick. The current packet has no payload.
 pub fn encode_play_client_tick_end() -> Result<Vec<u8>, BootstrapProtocolError> {
     packet_without_payload(PLAY_CLIENT_TICK_END_ID)
+}
+
+/// Requests the normal vanilla respawn action after the death screen.
+pub fn encode_play_perform_respawn() -> Result<Vec<u8>, BootstrapProtocolError> {
+    let mut writer = CodecWriter::new();
+    writer.write_var_int(PLAY_CLIENT_COMMAND_ID);
+    writer.write_var_int(0);
+    frame(writer)
 }
 
 pub fn encode_play_client_information(

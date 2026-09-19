@@ -70,6 +70,15 @@ pub struct ChatSessionRunner {
     presentation_mode: Arc<AtomicU8>,
 }
 
+#[derive(Clone, Debug)]
+pub struct InventoryProtocolProfile(v775::ItemStackProfile);
+
+impl InventoryProtocolProfile {
+    pub fn from_game_data(data: &cubic_version::GameData) -> Result<Self, ChatSessionError> {
+        Ok(Self(v775::ItemStackProfile::from_game_data(data)?))
+    }
+}
+
 impl ChatSessionHandle {
     #[must_use]
     pub fn bounded(options: &ChatSessionOptions) -> (Self, ChatSessionRunner) {
@@ -180,6 +189,8 @@ pub enum ChatSessionError {
     SecureChat(String),
     #[error(transparent)]
     Protocol(#[from] v775::BootstrapProtocolError),
+    #[error("inventory protocol failed: {0}")]
+    InventoryProtocol(#[from] v775::InventoryCodecError),
     #[error("persistent Play transport failed: {0}")]
     Transport(String),
     #[error("the system clock is before the Unix epoch")]
@@ -192,8 +203,12 @@ pub enum ChatSessionError {
     WorldAdapter(String),
     #[error("world state update failed: {0}")]
     WorldState(#[from] cubic_world::WorldError),
+    #[error("inventory state update failed: {0}")]
+    InventoryState(#[from] cubic_world::InventoryError),
     #[error("local player movement failed: {0}")]
     Movement(String),
+    #[error("inventory action failed: {0}")]
+    InventoryAction(String),
     #[error(
         "commands are not supported in Phase 8 because signable command arguments are not available"
     )]
@@ -222,6 +237,7 @@ pub async fn run_development_chat_session(
         connected.initial_login,
         connected.dimension_types,
         connected.biomes,
+        None,
         None,
         None,
     )
@@ -262,6 +278,7 @@ pub async fn run_authenticated_chat_session<J: MinecraftSessionJoiner>(
         connected.biomes,
         None,
         None,
+        None,
     )
     .await
 }
@@ -277,8 +294,11 @@ pub async fn run_development_world_session(
     controls: WorldControlRunner,
     collisions: BlockCollisionProfile,
     outlines: cubic_world::BlockOutlineProfile,
+    inventory_profile: InventoryProtocolProfile,
 ) -> Result<(), ChatSessionError> {
     let mut connected = connect_to_play(address, username, &options.login).await?;
+    let mut inventory_profile = inventory_profile.0;
+    inventory_profile.install_banner_patterns(connected.banner_patterns)?;
     run_play_session(
         &mut connected.connection,
         ChatSecurity::UnsignedDevelopment,
@@ -286,6 +306,7 @@ pub async fn run_development_world_session(
         connected.initial_login,
         connected.dimension_types,
         connected.biomes,
+        Some(inventory_profile),
         Some(render),
         Some((controls, collisions, outlines)),
     )
@@ -306,6 +327,278 @@ enum RenderPoseAuthority {
 const LOW_HEALTH_THRESHOLD: f32 = 6.0;
 const DANGEROUS_AIR_THRESHOLD: i32 = 60;
 const LARGE_DISPLACEMENT_THRESHOLD_SQUARED: f64 = 64.0;
+#[derive(Clone, Copy, Debug, Default)]
+struct InitialRespawnRecovery {
+    received_chunk: bool,
+    requested: bool,
+}
+
+impl InitialRespawnRecovery {
+    fn observe_chunk(&mut self) {
+        self.received_chunk = true;
+    }
+
+    fn request_if_initially_dead(&mut self, health: f32, world_mode: bool) -> bool {
+        if health <= 0.0 && world_mode && !self.received_chunk && !self.requested {
+            self.requested = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn semantic_stack(stack: v775::WireItemStack) -> Result<cubic_world::ItemStack, ChatSessionError> {
+    let fingerprints = stack.components.hashes;
+    let added = stack
+        .components
+        .added
+        .into_iter()
+        .map(|(identifier, bytes)| {
+            let value = match identifier.as_str() {
+                "minecraft:max_stack_size"
+                | "minecraft:max_damage"
+                | "minecraft:damage"
+                | "minecraft:repair_cost"
+                | "minecraft:enchantable" => {
+                    let mut reader = cubic_protocol::CodecReader::new(&bytes);
+                    let value = reader
+                        .read_var_int()
+                        .map_err(v775::InventoryCodecError::from)?;
+                    if reader.remaining() != 0 {
+                        return Err(ChatSessionError::InventoryAction(
+                            "primitive item component has trailing data".to_owned(),
+                        ));
+                    }
+                    cubic_world::ComponentValue::VarInt(value)
+                }
+                "minecraft:unbreakable"
+                | "minecraft:creative_slot_lock"
+                | "minecraft:intangible_projectile"
+                | "minecraft:glider" => cubic_world::ComponentValue::Unit,
+                "minecraft:enchantment_glint_override" if bytes.len() == 1 => {
+                    cubic_world::ComponentValue::Bool(
+                        bytes.first().is_some_and(|value| *value != 0),
+                    )
+                }
+                "minecraft:item_model" => {
+                    let mut reader = cubic_protocol::CodecReader::new(&bytes);
+                    let value = reader
+                        .read_string(cubic_protocol::StringLimits::new(256, 1_024))
+                        .map_err(v775::InventoryCodecError::from)?
+                        .to_owned();
+                    if reader.remaining() != 0 {
+                        return Err(ChatSessionError::InventoryAction(
+                            "item model component has trailing data".to_owned(),
+                        ));
+                    }
+                    cubic_world::ComponentValue::Text(value)
+                }
+                "minecraft:custom_name" | "minecraft:item_name" => {
+                    cubic_world::ComponentValue::RichText {
+                        plain: project_component_text(&bytes)?,
+                        wire: bytes,
+                    }
+                }
+                "minecraft:lore" => cubic_world::ComponentValue::Lore {
+                    lines: project_component_lore(&bytes)?,
+                    wire: bytes,
+                },
+                "minecraft:block_state" => cubic_world::ComponentValue::StringMap {
+                    values: decode_string_map(&bytes)?,
+                    wire: bytes,
+                },
+                _ => cubic_world::ComponentValue::Opaque(bytes),
+            };
+            Ok((identifier, value))
+        })
+        .collect::<Result<_, ChatSessionError>>()?;
+    Ok(cubic_world::ItemStack::new(
+        stack.item,
+        stack.count,
+        cubic_world::ComponentPatch {
+            added,
+            removed: stack.components.removed,
+            fingerprints,
+        },
+    )?)
+}
+
+fn decode_string_map(
+    bytes: &[u8],
+) -> Result<std::collections::BTreeMap<String, String>, ChatSessionError> {
+    let mut reader = cubic_protocol::CodecReader::new(bytes);
+    let count = usize::try_from(
+        reader
+            .read_var_int()
+            .map_err(v775::InventoryCodecError::from)?,
+    )
+    .ok()
+    .filter(|count| *count <= 64)
+    .ok_or_else(|| {
+        ChatSessionError::InventoryAction(
+            "block-state component property count is invalid".to_owned(),
+        )
+    })?;
+    let mut values = std::collections::BTreeMap::new();
+    for _ in 0..count {
+        let key = reader
+            .read_string(cubic_protocol::StringLimits::new(128, 512))
+            .map_err(v775::InventoryCodecError::from)?
+            .to_owned();
+        let value = reader
+            .read_string(cubic_protocol::StringLimits::new(128, 512))
+            .map_err(v775::InventoryCodecError::from)?
+            .to_owned();
+        if values.insert(key, value).is_some() {
+            return Err(ChatSessionError::InventoryAction(
+                "block-state component has a duplicate property".to_owned(),
+            ));
+        }
+    }
+    if reader.remaining() != 0 {
+        return Err(ChatSessionError::InventoryAction(
+            "block-state component has trailing data".to_owned(),
+        ));
+    }
+    Ok(values)
+}
+
+fn project_component_text(bytes: &[u8]) -> Result<String, ChatSessionError> {
+    let value = cubic_protocol::nbt::decode_unnamed_network_tag_complete(
+        bytes,
+        cubic_protocol::nbt::NbtLimits::default(),
+    )
+    .map_err(v775::InventoryCodecError::from)?;
+    let mut output = String::new();
+    project_tooltip_text(&value, &mut output, 0);
+    output.truncate(256);
+    Ok(output)
+}
+
+fn project_component_lore(bytes: &[u8]) -> Result<Vec<String>, ChatSessionError> {
+    let mut reader = cubic_protocol::CodecReader::new(bytes);
+    let count = usize::try_from(
+        reader
+            .read_var_int()
+            .map_err(v775::InventoryCodecError::from)?,
+    )
+    .map_err(|_| ChatSessionError::InventoryAction("negative lore line count".to_owned()))?;
+    if count > 64 {
+        return Err(ChatSessionError::InventoryAction(
+            "lore line count exceeds its presentation bound".to_owned(),
+        ));
+    }
+    let mut lines = Vec::with_capacity(count);
+    for _ in 0..count {
+        let value = cubic_protocol::nbt::decode_unnamed_network_tag(
+            &mut reader,
+            cubic_protocol::nbt::NbtLimits::default(),
+        )
+        .map_err(v775::InventoryCodecError::from)?;
+        let mut line = String::new();
+        project_tooltip_text(&value, &mut line, 0);
+        line.truncate(256);
+        lines.push(line);
+    }
+    if reader.remaining() != 0 {
+        return Err(ChatSessionError::InventoryAction(
+            "lore component has trailing data".to_owned(),
+        ));
+    }
+    Ok(lines)
+}
+
+fn project_tooltip_text(value: &cubic_protocol::nbt::NbtTag, output: &mut String, depth: usize) {
+    if depth >= 16 || output.len() >= 256 {
+        return;
+    }
+    use cubic_protocol::nbt::NbtTag;
+    match value {
+        NbtTag::String(value) => output.push_str(&value.to_string_lossy()),
+        NbtTag::List(values) => {
+            for value in values.elements() {
+                project_tooltip_text(value, output, depth + 1);
+            }
+        }
+        NbtTag::Compound(compound) => {
+            if let Some(value) = compound.get_str("text") {
+                project_tooltip_text(value, output, depth + 1);
+            }
+            if let Some(value) = compound.get_str("translate")
+                && output.is_empty()
+            {
+                project_tooltip_text(value, output, depth + 1);
+            }
+            if let Some(NbtTag::List(extra)) = compound.get_str("extra") {
+                for value in extra.elements() {
+                    project_tooltip_text(value, output, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+    if output.len() > 256 {
+        output.truncate(256);
+    }
+}
+
+fn semantic_optional_stack(
+    stack: Option<v775::WireItemStack>,
+) -> Result<Option<cubic_world::ItemStack>, ChatSessionError> {
+    stack.map(semantic_stack).transpose()
+}
+
+fn apply_inventory_packet(
+    inventory: &mut cubic_world::InventoryState,
+    packet: v775::ClientboundInventoryPacket,
+) -> Result<(), ChatSessionError> {
+    use v775::ClientboundInventoryPacket as Packet;
+    match packet {
+        Packet::OpenScreen(packet) => {
+            inventory.open_container(cubic_world::ContainerState::new(
+                cubic_world::ContainerId(packet.container_id),
+                cubic_world::MenuIdentity::Menu(packet.menu),
+                packet.title_plain_text,
+                0,
+            )?)?;
+        }
+        Packet::Close(packet) => {
+            if inventory.open().is_some() {
+                inventory.close_container(cubic_world::ContainerId(packet.container_id))?;
+            }
+        }
+        Packet::SetContent(packet) => {
+            let slots = packet
+                .items
+                .into_iter()
+                .map(semantic_optional_stack)
+                .collect::<Result<Vec<_>, _>>()?;
+            inventory.replace_content(
+                cubic_world::ContainerId(packet.container_id),
+                packet.state_id,
+                slots,
+                semantic_optional_stack(packet.carried)?,
+            )?;
+        }
+        Packet::SetSlot(packet) => {
+            inventory.set_slot(
+                cubic_world::ContainerId(packet.container_id),
+                packet.state_id,
+                cubic_world::SlotIndex(packet.slot),
+                semantic_optional_stack(packet.item)?,
+            )?;
+        }
+        Packet::SetData(packet) => {
+            inventory
+                .container_mut(cubic_world::ContainerId(packet.container_id))?
+                .properties
+                .insert(packet.property, packet.value);
+        }
+        Packet::SetHeldSlot(packet) => inventory.set_selected_hotbar_slot(packet.slot)?,
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 struct SessionSafetyTracker {
@@ -412,6 +705,7 @@ fn publish_reset(
         session.spawn_context.dimension.to_string(),
         session.dimension_geometry,
         Arc::from(world.biomes()),
+        session.spawn_context.game_mode,
     );
     publish_authoritative_pose(Some(render), world, pose_authority);
 }
@@ -424,6 +718,7 @@ async fn run_play_session(
     initial_login: v775::InitialPlayLogin,
     dimension_types: Vec<cubic_world::RuntimeDimensionType>,
     biomes: Vec<cubic_world::RuntimeBiome>,
+    mut inventory_profile: Option<v775::ItemStackProfile>,
     render: Option<WorldRenderRunner>,
     movement: Option<(
         WorldControlRunner,
@@ -445,6 +740,12 @@ async fn run_play_session(
     publish_reset(&render, &world, pose_authority);
     tracing::info!(target: "world", summary = %world.summary(), "entered authoritative world state");
     runner.event(ChatEvent::Connected);
+    let mut inventory = cubic_world::InventoryState::new();
+    if inventory_profile.is_some()
+        && let Some(render) = &render
+    {
+        render.inventory(inventory.clone());
+    }
 
     let information = v775::encode_play_client_information(&ClientInformation::default())?;
     connection
@@ -458,6 +759,7 @@ async fn run_play_session(
 
     let mut salt_counter = 0_i64;
     let mut sent_player_loaded = false;
+    let mut initial_respawn = InitialRespawnRecovery::default();
     let mut safety = SessionSafetyTracker::default();
     let mut movement = movement.map(|(controls, collisions, outlines)| {
         WorldMovementController::new(controls, collisions, outlines, player_entity_id)
@@ -468,7 +770,7 @@ async fn run_play_session(
     loop {
         tokio::select! {
             scheduled = movement_ticks.tick(), if movement.is_some() => {
-                service_movement_tick(connection, &mut movement, &mut world, &render, scheduled).await?;
+                service_movement_tick(connection, &mut movement, &mut world, &mut inventory, inventory_profile.as_ref(), &render, scheduled).await?;
             }
             command = runner.commands.recv() => {
                 match command {
@@ -500,6 +802,15 @@ async fn run_play_session(
                 };
                 let decode_started = std::time::Instant::now();
                 let frame_bytes = frame.len();
+                if let Some(profile) = &inventory_profile
+                    && let Some(packet) = v775::decode_inventory_clientbound(&frame, profile)?
+                {
+                    apply_inventory_packet(&mut inventory, packet)?;
+                    if let Some(render) = &render {
+                        render.inventory(inventory.clone());
+                    }
+                    continue;
+                }
                 let packet = if v775::classify_play_decode_work(&frame)? == v775::PlayDecodeWork::ChunkHeavy {
                     let mut decode = tokio::task::spawn_blocking(move || v775::decode_play_clientbound(&frame));
                     loop {
@@ -509,7 +820,7 @@ async fn run_play_session(
                                     .map_err(|_| ChatSessionError::Movement("bounded chunk decode worker stopped unexpectedly".to_owned()))??;
                             }
                             scheduled = movement_ticks.tick(), if movement.is_some() => {
-                                service_movement_tick(connection, &mut movement, &mut world, &render, scheduled).await?;
+                                service_movement_tick(connection, &mut movement, &mut world, &mut inventory, inventory_profile.as_ref(), &render, scheduled).await?;
                             }
                         }
                     }
@@ -520,7 +831,7 @@ async fn run_play_session(
                 if decode_elapsed > std::time::Duration::from_millis(50) {
                     tracing::debug!(target: "movement::latency", ?decode_elapsed, frame_bytes, "completed slow Play packet decode without starving movement ticks");
                 }
-                let packet = match crate::world_adapter::adapt_chunk_packet(packet) {
+                let packet = match crate::world_adapter::adapt_chunk_packet(packet)? {
                     crate::world_adapter::ChunkAdaptation::Load(chunk) => {
                         let coordinate = chunk.coordinate;
                         let semantic_started = std::time::Instant::now();
@@ -572,10 +883,12 @@ async fn run_play_session(
                     crate::world_adapter::ChunkAdaptation::Blocks(updates) => {
                         let update_count = updates.len();
                         let semantic_started = std::time::Instant::now();
-                        if let Some(controller) = &mut movement {
-                            controller.reconcile_block_updates(&updates);
-                        }
-                        let result = world.apply_block_updates(&updates)?;
+                        let immediate_updates = if let Some(controller) = &mut movement {
+                            controller.reconcile_block_updates(&updates)
+                        } else {
+                            updates
+                        };
+                        let result = world.apply_block_updates(&immediate_updates)?;
                         let semantic_elapsed = semantic_started.elapsed();
                         let publication_started = std::time::Instant::now();
                         let mut publication_lock_wait = std::time::Duration::ZERO;
@@ -606,6 +919,32 @@ async fn run_play_session(
                         }
                         continue;
                     }
+                    crate::world_adapter::ChunkAdaptation::BlockEntity {
+                        position,
+                        type_raw_id,
+                        data,
+                    } => {
+                        let result =
+                            world.apply_block_entity_update(position, type_raw_id, data)?;
+                        if let Some(render) = &render {
+                            for coordinate in &result.changed_chunks {
+                                if let Some(chunk) = world.loaded_chunks().get_shared(*coordinate) {
+                                    let _ = render.load(chunk);
+                                }
+                            }
+                        }
+                        tracing::debug!(
+                            target: "world::block_entity",
+                            x = position.x,
+                            y = position.y,
+                            z = position.z,
+                            type_raw_id,
+                            changed_chunks = result.changed_chunks.len(),
+                            ignored = result.ignored_unloaded_or_out_of_bounds,
+                            "applied bounded block-entity update"
+                        );
+                        continue;
+                    }
                     crate::world_adapter::ChunkAdaptation::Other(packet) => packet,
                 };
                 let world_event = match (&packet, &movement) {
@@ -633,6 +972,9 @@ async fn run_play_session(
                 };
                 if let Some(event) = world_event {
                     let transition = world.apply(event)?;
+                    if let (Some(render), Some(session)) = (&render, world.session()) {
+                        render.game_mode(session.spawn_context.game_mode);
+                    }
                     if transition.reset != cubic_world::ResetScope::None {
                         publish_reset(&render, &world, pose_authority);
                         if let Some(controller) = &mut movement {
@@ -650,7 +992,26 @@ async fn run_play_session(
                     }
                     PlayClientbound::BlockChangedAck { sequence } => {
                         if let Some(controller) = &mut movement {
-                            controller.acknowledge_interaction(sequence);
+                            let resolution = controller.acknowledge_interaction(sequence);
+                            if !resolution.updates.is_empty() {
+                                let result = world.apply_block_updates(&resolution.updates)?;
+                                if let Some(render) = &render {
+                                    for coordinate in result.changed_chunks {
+                                        if let Some(chunk) = world.loaded_chunks().get_shared(coordinate) {
+                                            render.load(chunk);
+                                        }
+                                    }
+                                }
+                                if let Some(pose) = controller.finish_prediction_resolution(&resolution)
+                                    && let Some(render) = &render
+                                {
+                                    render.pose_discontinuity(
+                                        pose,
+                                        std::time::Instant::now(),
+                                        controller.presentation_look(),
+                                    );
+                                }
+                            }
                         }
                     }
                     PlayClientbound::Ping { id } => {
@@ -705,10 +1066,25 @@ async fn run_play_session(
                         }
                     }
                     PlayClientbound::PlayerAbilities(abilities) => {
+                        inventory.set_instant_build(abilities.instant_build);
+                        if let Some(render) = &render {
+                            render.inventory(inventory.clone());
+                        }
                         if let Some(controller) = &mut movement {
                             controller
                                 .apply_abilities(abilities)
                                 .map_err(|error| ChatSessionError::Movement(error.to_string()))?;
+                        }
+                    }
+                    PlayClientbound::EntityEvent { entity_id, event } => {
+                        let current_player_entity_id = world
+                            .session()
+                            .map_or(player_entity_id, |session| session.player_entity_id);
+                        if entity_id == current_player_entity_id && (24..=28).contains(&event) {
+                            inventory.set_permission_level(event - 24);
+                            if let Some(render) = &render {
+                                render.inventory(inventory.clone());
+                            }
                         }
                     }
                     PlayClientbound::ChunkBatchFinished { .. } => {
@@ -719,8 +1095,10 @@ async fn run_play_session(
                         }
                     }
                     PlayClientbound::ChunkBatchStart => {}
-                    PlayClientbound::LevelChunkWithLight(_)
-                    | PlayClientbound::ForgetLevelChunk { .. }
+                    PlayClientbound::LevelChunkWithLight(_) => {
+                        initial_respawn.observe_chunk();
+                    }
+                    PlayClientbound::ForgetLevelChunk { .. }
                     | PlayClientbound::LightUpdate(_)
                     | PlayClientbound::BlockUpdate(_)
                     | PlayClientbound::SectionBlocksUpdate(_) => {}
@@ -810,6 +1188,10 @@ async fn run_play_session(
                         return Ok(());
                     }
                     PlayClientbound::Health { health } => {
+                        if initial_respawn.request_if_initially_dead(health, movement.is_some()) {
+                            tracing::info!(target: "world::player", "requesting respawn for an initially dead World Mode player");
+                            write(connection, v775::encode_play_perform_respawn()?, "Play Perform Respawn write").await?;
+                        }
                         for event in safety.health_alerts(health) {
                             runner.critical(event);
                         }
@@ -826,6 +1208,7 @@ async fn run_play_session(
                         }
                     }
                     PlayClientbound::Login(_)
+                    | PlayClientbound::BlockEntityData(_)
                     | PlayClientbound::Respawn(_)
                     | PlayClientbound::SetDefaultSpawnPosition(_)
                     | PlayClientbound::SetTime(_)
@@ -850,6 +1233,9 @@ async fn run_play_session(
                         write(connection, v775::encode_client_information(&ClientInformation::default())?, "Reconfiguration Client Information write").await?;
                         let mut state = ConnectionState::Configuration;
                         let configuration = run_configuration(connection, &mut state).await?;
+                        if let Some(profile) = &mut inventory_profile {
+                            profile.install_banner_patterns(configuration.banner_patterns)?;
+                        }
                         world.apply(WorldEvent::RuntimeDimensionTypes(configuration.dimension_types))?;
                         world.apply(WorldEvent::RuntimeBiomes(configuration.biomes))?;
                         world.apply(crate::world_adapter::initial_world_event(configuration.initial_login)?)?;
@@ -876,6 +1262,8 @@ async fn service_movement_tick(
     connection: &mut crate::connection::MinecraftConnection,
     movement: &mut Option<WorldMovementController>,
     world: &mut WorldState,
+    inventory: &mut cubic_world::InventoryState,
+    inventory_profile: Option<&v775::ItemStackProfile>,
     render: &Option<WorldRenderRunner>,
     scheduled: tokio::time::Instant,
 ) -> Result<(), ChatSessionError> {
@@ -890,6 +1278,7 @@ async fn service_movement_tick(
         );
     }
     let tick = if let Some(controller) = movement {
+        controller.set_held_items(inventory.held_item(), inventory.offhand_item());
         controller
             .tick(world)
             .map_err(|error| ChatSessionError::Movement(error.to_string()))?
@@ -931,6 +1320,15 @@ async fn service_movement_tick(
         for frame in tick.frames {
             write(connection, frame, "Play movement write").await?;
         }
+        if let Some(profile) = inventory_profile {
+            let had_inventory_commands = !tick.inventory_commands.is_empty();
+            for command in tick.inventory_commands {
+                service_inventory_command(connection, inventory, profile, command).await?;
+            }
+            if had_inventory_commands && let Some(render) = render {
+                render.inventory(inventory.clone());
+            }
+        }
         tracing::trace!(
             target: "movement",
             x = tick.pose.x,
@@ -962,6 +1360,178 @@ async fn service_movement_tick(
         tracing::debug!(target: "movement::latency", ?elapsed, "movement tick execution exceeded its 50 ms budget");
     }
     Ok(())
+}
+
+async fn service_inventory_command(
+    connection: &mut crate::connection::MinecraftConnection,
+    inventory: &mut cubic_world::InventoryState,
+    profile: &v775::ItemStackProfile,
+    command: crate::InventoryCommand,
+) -> Result<(), ChatSessionError> {
+    let frame = match command {
+        crate::InventoryCommand::SelectHotbar(slot) => {
+            inventory.set_selected_hotbar_slot(slot)?;
+            v775::encode_play_set_carried_item(slot)?
+        }
+        crate::InventoryCommand::Close(container) => {
+            inventory.close_container(container)?;
+            v775::encode_play_container_close(container.0)?
+        }
+        crate::InventoryCommand::Button { container, button } => {
+            v775::encode_play_container_button_click(container.0, button)?
+        }
+        crate::InventoryCommand::CreativeSlot { slot, stack } => {
+            inventory.set_creative_slot(slot, stack.clone())?;
+            let wire = stack.as_ref().map(wire_stack).transpose()?;
+            let frame = v775::encode_play_set_creative_slot(slot.0, wire.as_ref(), profile)?;
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let summary = wire
+                    .as_ref()
+                    .map(|stack| profile.creative_stack_wire_summary(stack))
+                    .transpose()?
+                    .unwrap_or_else(|| "empty".to_owned());
+                tracing::debug!(
+                    target: "inventory",
+                    packet = "minecraft:set_creative_mode_slot",
+                    packet_id = v775::creative_slot_packet_id(),
+                    slot = slot.0,
+                    frame_bytes = frame.len(),
+                    stack = %summary,
+                    "sending Creative Slot"
+                );
+            }
+            frame
+        }
+        crate::InventoryCommand::CreativeCarried(stack) => {
+            inventory.set_carried(stack);
+            return Ok(());
+        }
+        crate::InventoryCommand::Click(click) => {
+            let mode = match click.kind {
+                cubic_world::ContainerClickKind::Pickup => 0,
+                cubic_world::ContainerClickKind::QuickMove => 1,
+                cubic_world::ContainerClickKind::Swap => 2,
+                cubic_world::ContainerClickKind::Clone => 3,
+                cubic_world::ContainerClickKind::Throw => 4,
+                cubic_world::ContainerClickKind::QuickCraft => 5,
+                cubic_world::ContainerClickKind::PickupAll => 6,
+            };
+            let outcome = match inventory.apply_click(click) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::debug!(target: "inventory", %error, "ignored stale or invalid local inventory action");
+                    return Ok(());
+                }
+            };
+            let changed_slots = outcome
+                .changed_slots
+                .into_iter()
+                .map(|(slot, stack)| Ok((slot.0, hashed_stack(stack.as_ref())?)))
+                .collect::<Result<_, ChatSessionError>>();
+            let carried = hashed_stack(outcome.carried.as_ref());
+            let (changed_slots, carried) = match (changed_slots, carried) {
+                (Ok(changed_slots), Ok(carried)) => (changed_slots, carried),
+                (Err(error), _) | (_, Err(error)) => {
+                    tracing::debug!(
+                        target: "inventory",
+                        %error,
+                        "sending a server-authoritative click fingerprint while retaining bounded local prediction"
+                    );
+                    (std::collections::BTreeMap::new(), None)
+                }
+            };
+            v775::encode_play_container_click(
+                &v775::ServerboundContainerClick {
+                    container_id: click.container.0,
+                    state_id: click.state_id,
+                    slot: click.slot.0,
+                    button: click.button,
+                    mode,
+                    changed_slots,
+                    carried,
+                },
+                profile,
+            )?
+        }
+    };
+    write(connection, frame, "Play inventory action write").await
+}
+
+fn wire_stack(stack: &cubic_world::ItemStack) -> Result<v775::WireItemStack, ChatSessionError> {
+    let mut banner_patterns = None;
+    let added = stack
+        .components
+        .added
+        .iter()
+        .map(|(identifier, value)| {
+            let bytes = match value {
+                cubic_world::ComponentValue::Unit => Vec::new(),
+                cubic_world::ComponentValue::VarInt(value) => {
+                    let mut writer = cubic_protocol::CodecWriter::new();
+                    writer.write_var_int(*value);
+                    writer.into_inner()
+                }
+                cubic_world::ComponentValue::Bool(value) => vec![u8::from(*value)],
+                cubic_world::ComponentValue::Text(value) => {
+                    let mut writer = cubic_protocol::CodecWriter::new();
+                    writer
+                        .write_string(value, cubic_protocol::StringLimits::new(32_767, 98_301))
+                        .map_err(v775::InventoryCodecError::from)?;
+                    writer.into_inner()
+                }
+                cubic_world::ComponentValue::RichText { wire, .. }
+                | cubic_world::ComponentValue::Lore { wire, .. }
+                | cubic_world::ComponentValue::StringMap { wire, .. } => wire.clone(),
+                cubic_world::ComponentValue::RegistryEncoded {
+                    wire,
+                    source_registry,
+                } => {
+                    if identifier.as_str() != "minecraft:banner_patterns" {
+                        return Err(ChatSessionError::InventoryAction(
+                            "unsupported registry-encoded Creative component".to_owned(),
+                        ));
+                    }
+                    banner_patterns = Some(v775::decode_creative_banner_pattern_layers(
+                        wire,
+                        source_registry,
+                    )?);
+                    wire.clone()
+                }
+                cubic_world::ComponentValue::Opaque(value) => value.clone(),
+            };
+            Ok((identifier.clone(), bytes))
+        })
+        .collect::<Result<_, ChatSessionError>>()?;
+    Ok(v775::WireItemStack {
+        item: stack.item.clone(),
+        count: stack.count,
+        components: v775::WireComponentPatch {
+            added,
+            removed: stack.components.removed.clone(),
+            hashes: stack.components.fingerprints.clone(),
+            banner_patterns,
+        },
+    })
+}
+
+fn hashed_stack(
+    stack: Option<&cubic_world::ItemStack>,
+) -> Result<Option<v775::ServerboundHashedStack>, ChatSessionError> {
+    let Some(stack) = stack else {
+        return Ok(None);
+    };
+    if stack.components.fingerprints.len() != stack.components.added.len() {
+        return Err(ChatSessionError::InventoryAction(
+            "click prediction for this component-bearing item requires a generated dynamic-codec hash"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(v775::ServerboundHashedStack {
+        item: stack.item.clone(),
+        count: stack.count,
+        added_component_hashes: stack.components.fingerprints.clone(),
+        removed_components: stack.components.removed.clone(),
+    }))
 }
 
 async fn send_chat(
@@ -1147,7 +1717,7 @@ mod tests {
     use std::{str::FromStr, time::Duration};
 
     use cubic_auth::AuthError;
-    use cubic_protocol::{CodecReader, FrameDecoder, FrameLimits, split_raw_packet};
+    use cubic_protocol::{CodecReader, CodecWriter, FrameDecoder, FrameLimits, split_raw_packet};
     use tokio::{
         io::AsyncReadExt,
         net::{TcpListener, TcpStream},
@@ -1160,6 +1730,181 @@ mod tests {
     };
 
     struct SyntheticCertificate;
+
+    #[test]
+    fn initial_dead_world_player_requests_exactly_one_respawn_before_chunks() {
+        let mut recovery = InitialRespawnRecovery::default();
+        assert!(!recovery.request_if_initially_dead(20.0, true));
+        assert!(recovery.request_if_initially_dead(0.0, true));
+        assert!(!recovery.request_if_initially_dead(0.0, true));
+
+        let mut chat_mode = InitialRespawnRecovery::default();
+        assert!(!chat_mode.request_if_initially_dead(0.0, false));
+
+        let mut already_loaded = InitialRespawnRecovery::default();
+        already_loaded.observe_chunk();
+        assert!(!already_loaded.request_if_initially_dead(0.0, true));
+    }
+
+    #[test]
+    fn authoritative_inventory_packets_drive_stable_player_and_menu_state() {
+        let mut inventory = cubic_world::InventoryState::new();
+        let menu = cubic_version::MinecraftIdentifier::new("minecraft:generic_9x1").unwrap();
+        apply_inventory_packet(
+            &mut inventory,
+            v775::ClientboundInventoryPacket::OpenScreen(v775::ClientboundOpenScreen {
+                container_id: 2,
+                menu: menu.clone(),
+                title_nbt: vec![8, 0, 0, 5, 67, 104, 101, 115, 116],
+                title_plain_text: "Chest".to_owned(),
+            }),
+        )
+        .unwrap();
+        let wire_stack = v775::WireItemStack {
+            item: cubic_version::MinecraftIdentifier::new("minecraft:stone").unwrap(),
+            count: 7,
+            components: v775::WireComponentPatch::default(),
+        };
+        let mut items = vec![None; 45];
+        items[36] = Some(wire_stack);
+        apply_inventory_packet(
+            &mut inventory,
+            v775::ClientboundInventoryPacket::SetContent(v775::ClientboundContainerSetContent {
+                container_id: 2,
+                state_id: 4,
+                items,
+                carried: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(inventory.open().unwrap().title, "Chest");
+        assert_eq!(
+            inventory.open().unwrap().menu,
+            cubic_world::MenuIdentity::Menu(menu)
+        );
+        assert_eq!(
+            inventory.held_item().unwrap().item.as_str(),
+            "minecraft:stone"
+        );
+        assert_eq!(inventory.held_item().unwrap().count, 7);
+    }
+
+    #[test]
+    fn semantic_stack_decodes_transmitted_item_model_override() {
+        let mut writer = CodecWriter::new();
+        writer
+            .write_string(
+                "minecraft:diamond",
+                cubic_protocol::StringLimits::new(256, 1_024),
+            )
+            .unwrap();
+        let component = cubic_version::MinecraftIdentifier::new("minecraft:item_model").unwrap();
+        let wire = v775::WireItemStack {
+            item: cubic_version::MinecraftIdentifier::new("minecraft:stone").unwrap(),
+            count: 1,
+            components: v775::WireComponentPatch {
+                added: BTreeMap::from([(component, writer.into_inner())]),
+                ..v775::WireComponentPatch::default()
+            },
+        };
+        let stack = semantic_stack(wire).unwrap();
+        assert_eq!(
+            stack.effective_item_model_owned().unwrap().as_str(),
+            "minecraft:diamond"
+        );
+    }
+
+    #[test]
+    fn creative_registry_bytes_retain_source_mapping_until_connection_encode() {
+        let banner_component =
+            cubic_version::MinecraftIdentifier::new("minecraft:banner_patterns").unwrap();
+        let stack = cubic_world::ItemStack::new(
+            cubic_version::MinecraftIdentifier::new("minecraft:white_banner").unwrap(),
+            1,
+            cubic_world::ComponentPatch {
+                added: BTreeMap::from([(
+                    banner_component.clone(),
+                    cubic_world::ComponentValue::RegistryEncoded {
+                        wire: vec![1, 2, 15],
+                        source_registry: vec![
+                            cubic_version::MinecraftIdentifier::new("minecraft:base").unwrap(),
+                            cubic_version::MinecraftIdentifier::new("minecraft:creeper").unwrap(),
+                        ],
+                    },
+                )]),
+                ..cubic_world::ComponentPatch::default()
+            },
+        )
+        .unwrap();
+        let wire = wire_stack(&stack).unwrap();
+        assert_eq!(
+            wire.components.added.get(&banner_component),
+            Some(&vec![1, 2, 15])
+        );
+        assert!(matches!(
+            wire.components.banner_patterns.unwrap().layers.as_slice(),
+            [v775::BannerPatternLayer {
+                pattern: v775::BannerPatternHolder::Reference(id),
+                dye_raw_id: 15
+            }] if id.as_str() == "minecraft:creeper"
+        ));
+    }
+
+    #[test]
+    fn semantic_tooltip_components_preserve_their_exact_wire_encoding() {
+        use cubic_protocol::nbt::{NbtLimits, NbtString, NbtTag, encode_unnamed_network_tag};
+
+        let encode_text = |value: &str| {
+            encode_unnamed_network_tag(
+                &NbtTag::String(NbtString::from(value)),
+                NbtLimits::default(),
+            )
+            .unwrap()
+        };
+        let custom_name = encode_text("Named item");
+        let first_lore = encode_text("First line");
+        let second_lore = encode_text("Second line");
+        let mut lore_writer = CodecWriter::new();
+        lore_writer.write_var_int(2);
+        lore_writer.write_bytes(&first_lore);
+        lore_writer.write_bytes(&second_lore);
+        let lore = lore_writer.into_inner();
+
+        let custom_name_id =
+            cubic_version::MinecraftIdentifier::new("minecraft:custom_name").unwrap();
+        let lore_id = cubic_version::MinecraftIdentifier::new("minecraft:lore").unwrap();
+        let wire = v775::WireItemStack {
+            item: cubic_version::MinecraftIdentifier::new("minecraft:diamond_sword").unwrap(),
+            count: 1,
+            components: v775::WireComponentPatch {
+                added: BTreeMap::from([
+                    (custom_name_id.clone(), custom_name.clone()),
+                    (lore_id.clone(), lore.clone()),
+                ]),
+                ..v775::WireComponentPatch::default()
+            },
+        };
+
+        let semantic = semantic_stack(wire).unwrap();
+        assert!(matches!(
+            semantic.components.added.get(&custom_name_id),
+            Some(cubic_world::ComponentValue::RichText { plain, wire })
+                if plain == "Named item" && wire == &custom_name
+        ));
+        assert!(matches!(
+            semantic.components.added.get(&lore_id),
+            Some(cubic_world::ComponentValue::Lore { lines, wire })
+                if lines == &["First line".to_owned(), "Second line".to_owned()]
+                    && wire == &lore
+        ));
+
+        let encoded = wire_stack(&semantic).unwrap();
+        assert_eq!(
+            encoded.components.added.get(&custom_name_id),
+            Some(&custom_name)
+        );
+        assert_eq!(encoded.components.added.get(&lore_id), Some(&lore));
+    }
 
     impl ChatCertificate for SyntheticCertificate {
         fn public_key_der(&self) -> &[u8] {
@@ -1391,6 +2136,7 @@ mod tests {
                 dimension_types(),
                 vec![],
                 None,
+                None,
                 Some((
                     control_runner,
                     BlockCollisionProfile::synthetic([]),
@@ -1509,6 +2255,7 @@ mod tests {
                 initial_login(),
                 dimension_types(),
                 vec![],
+                None,
                 None,
                 None,
             )

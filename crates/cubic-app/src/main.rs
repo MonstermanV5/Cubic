@@ -642,7 +642,14 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
     };
     let collisions = cubic_world::BlockCollisionProfile::from_game_data(&data);
     let outlines = cubic_world::BlockOutlineProfile::from_game_data(&data);
-    tracing::info!(version = %version, blockstates = resources.blockstate_count, models = resources.model_count, textures = resources.texture_count, atlas_width = resources.atlas.width, atlas_height = resources.atlas.height, atlas_bytes = resources.atlas.rgba.len(), fallbacks = resources.fallback_count, "vanilla block resources prepared");
+    let inventory_profile = match cubic_network::InventoryProtocolProfile::from_game_data(&data) {
+        Ok(profile) => profile,
+        Err(error) => {
+            tracing::error!(%error, "could not prepare versioned item-stack profile");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(version = %version, blockstates = resources.blockstate_count, models = resources.model_count, textures = resources.texture_count, atlas_width = resources.atlas.width, atlas_height = resources.atlas.height, atlas_bytes = resources.atlas.rgba.len(), fallbacks = resources.fallback_count, item_registered = resources.item_icon_audit.registered, item_resolved = resources.item_icon_audit.resolved, item_fallback = resources.item_icon_audit.fallback, item_static_simplification = resources.item_icon_audit.static_simplification, item_missing = resources.item_icon_audit.missing_resource, item_unsupported = resources.item_icon_audit.unsupported_model, item_renderer_classes = ?resources.item_icon_audit.renderer_classes, "vanilla block and GUI item resources prepared");
     let options = ChatSessionOptions::default();
     let (chat_handle, chat_runner) = ChatSessionHandle::bounded(&options);
     chat_handle.set_presentation_mode(cubic_core::SessionPresentationMode::Play);
@@ -667,6 +674,7 @@ fn run_world(address: ServerAddress, username: DevelopmentUsername) -> ExitCode 
                         control_runner,
                         collisions,
                         outlines,
+                        inventory_profile,
                     )) {
                         tracing::error!(%error, "World Mode network task stopped");
                     }
@@ -741,6 +749,32 @@ impl cubic_platform::WorldSessionPort for NetworkWorldPort {
 
     fn press_use(&self) {
         self.controls.press_use();
+    }
+
+    fn inventory_action(&self, action: cubic_ui::InventoryAction) {
+        let command = match action {
+            cubic_ui::InventoryAction::SelectHotbar(slot) => {
+                cubic_network::InventoryCommand::SelectHotbar(slot)
+            }
+            cubic_ui::InventoryAction::Click(click) => {
+                cubic_network::InventoryCommand::Click(click)
+            }
+            cubic_ui::InventoryAction::Close(container) => {
+                cubic_network::InventoryCommand::Close(container)
+            }
+            cubic_ui::InventoryAction::CreativeSlot { slot, stack } => {
+                cubic_network::InventoryCommand::CreativeSlot { slot, stack }
+            }
+            cubic_ui::InventoryAction::CreativeCarried(stack) => {
+                cubic_network::InventoryCommand::CreativeCarried(stack)
+            }
+        };
+        if !self.controls.inventory_command(command) {
+            tracing::warn!(
+                target: "inventory",
+                "inventory action was rejected because the bounded control mailbox is full"
+            );
+        }
     }
 }
 

@@ -55,6 +55,18 @@ impl<'a> CodecReader<'a> {
         self.input.len() - self.position
     }
 
+    /// Returns bytes consumed since a previously observed cursor position.
+    pub fn consumed_since(&self, start: usize) -> Result<&'a [u8], CodecError> {
+        self.input
+            .get(start..self.position)
+            .ok_or(CodecError::ValueOutOfRange {
+                context: "reader cursor snapshot",
+                value: start as i128,
+                min: 0,
+                max: self.position as i128,
+            })
+    }
+
     /// Returns all unread bytes without copying and advances to the end.
     pub fn read_remaining(&mut self) -> &'a [u8] {
         let remaining = self.input.get(self.position..).unwrap_or_default();

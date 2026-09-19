@@ -2,6 +2,31 @@ use cubic_protocol::{
     CodecReader, CodecWriter, FrameDecoder, FrameLimits, StringLimits, bootstrap::v775,
 };
 
+#[test]
+fn block_entity_data_matches_independent_protocol_775_vector() {
+    // Packet 0x06, packed BlockPos (0, 0, 0), block-entity type raw ID 3,
+    // followed by an unnamed empty compound (TAG_Compound, TAG_End).
+    let decoded = v775::decode_play_clientbound(&[
+        0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x0a, 0x00,
+    ])
+    .unwrap();
+    let v775::PlayClientbound::BlockEntityData(update) = decoded else {
+        panic!("expected Block Entity Data")
+    };
+    assert_eq!(
+        (
+            update.position.x(),
+            update.position.y(),
+            update.position.z()
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(update.type_raw_id, 3);
+    assert!(update.data.is_empty());
+
+    assert!(v775::decode_play_clientbound(&[0x06, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0]).is_err());
+}
+
 fn body(frame: &[u8]) -> Vec<u8> {
     let mut decoder = FrameDecoder::new(FrameLimits::new(2_097_151, 4 * 1024 * 1024).unwrap());
     decoder.push(frame).unwrap();
@@ -78,6 +103,10 @@ fn movement_and_input_packets_match_independent_protocol_775_vectors() {
         vec![0x28, 0x00]
     );
     assert_eq!(body(&v775::encode_play_client_tick_end().unwrap()), [0x0d]);
+    assert_eq!(
+        body(&v775::encode_play_perform_respawn().unwrap()),
+        [0x0c, 0x00]
+    );
 }
 
 #[test]
@@ -120,11 +149,39 @@ fn interaction_packets_match_independent_protocol_775_vectors() {
         .unwrap(),
         expected_use_on
     );
+    let mut expected_offhand_use_on = expected_use_on.clone();
+    expected_offhand_use_on[2] = 0x01;
+    assert_eq!(
+        v775::encode_play_use_item_on(
+            v775::InteractionHand::Off,
+            v775::BlockHit {
+                position,
+                face: v775::BlockFace::East,
+                location_x: 0.25,
+                location_y: 0.5,
+                location_z: 0.75,
+                inside: false,
+                world_border_hit: false,
+            },
+            7,
+        )
+        .unwrap(),
+        expected_offhand_use_on
+    );
 
     assert_eq!(
         v775::encode_play_use_item(v775::InteractionHand::Main, 9, 90.0, -30.0).unwrap(),
         [
             vec![0x0b, 0x43, 0x00, 0x09],
+            90.0_f32.to_be_bytes().to_vec(),
+            (-30.0_f32).to_be_bytes().to_vec(),
+        ]
+        .concat()
+    );
+    assert_eq!(
+        v775::encode_play_use_item(v775::InteractionHand::Off, 9, 90.0, -30.0).unwrap(),
+        [
+            vec![0x0b, 0x43, 0x01, 0x09],
             90.0_f32.to_be_bytes().to_vec(),
             (-30.0_f32).to_be_bytes().to_vec(),
         ]
@@ -309,6 +366,19 @@ fn current_low_precision_entity_motion_vector_decodes_without_legacy_shorts() {
     };
     assert_eq!((zero.delta_x, zero.delta_y, zero.delta_z), (0.0, 0.0, 0.0));
     assert!(v775::decode_play_clientbound(&[0x65, 0x07, 0x01]).is_err());
+}
+
+#[test]
+fn entity_event_uses_fixed_entity_id_and_retains_permission_status() {
+    let packet = [0x22, 0x00, 0x00, 0x00, 0x07, 26];
+    assert_eq!(
+        v775::decode_play_clientbound(&packet).unwrap(),
+        v775::PlayClientbound::EntityEvent {
+            entity_id: 7,
+            event: 26,
+        }
+    );
+    assert!(v775::decode_play_clientbound(&packet[..5]).is_err());
 }
 
 #[test]

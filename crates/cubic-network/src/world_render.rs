@@ -16,12 +16,14 @@ struct Mailbox {
     reset: bool,
     dimension: Option<String>,
     geometry: Option<DimensionGeometry>,
+    game_mode: Option<cubic_world::GameMode>,
     biomes: Option<Arc<[cubic_world::RuntimeBiome]>>,
     pose: Option<RenderPoseSample>,
     pose_published_at: Option<Instant>,
     pose_contains_jump: bool,
     target: Option<cubic_world::BlockTarget>,
     breaking: Option<cubic_world::BlockBreakingOverlay>,
+    inventory: Option<cubic_world::InventoryState>,
     chunks: BTreeMap<ChunkCoordinate, ChunkRenderDelta>,
     waker: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -56,12 +58,14 @@ impl WorldRenderHandle {
         let reset = std::mem::take(&mut mailbox.reset);
         let dimension = mailbox.dimension.clone();
         let geometry = mailbox.geometry;
+        let game_mode = mailbox.game_mode;
         let biomes = mailbox.biomes.clone();
         let pose = mailbox.pose.take();
         let pose_published_at = mailbox.pose_published_at.take();
         let pose_contains_jump = std::mem::take(&mut mailbox.pose_contains_jump);
         let target = mailbox.target.clone();
         let breaking = mailbox.breaking;
+        let inventory = mailbox.inventory.take();
         let chunks = std::mem::take(&mut mailbox.chunks);
         drop(mailbox);
         Some(WorldRenderUpdate {
@@ -69,12 +73,14 @@ impl WorldRenderHandle {
             reset,
             dimension,
             geometry,
+            game_mode,
             biomes,
             pose,
             pose_published_at,
             pose_contains_jump,
             target,
             breaking,
+            inventory,
             chunks: chunks.into_values().collect(),
         })
     }
@@ -95,12 +101,14 @@ impl WorldRenderRunner {
         dimension: String,
         geometry: DimensionGeometry,
         biomes: Arc<[cubic_world::RuntimeBiome]>,
+        game_mode: cubic_world::GameMode,
     ) {
         let waker = if let Ok(mut mailbox) = self.0.lock() {
             mailbox.generation = mailbox.generation.wrapping_add(1);
             mailbox.reset = true;
             mailbox.dimension = Some(dimension);
             mailbox.geometry = Some(geometry);
+            mailbox.game_mode = Some(game_mode);
             mailbox.biomes = Some(biomes);
             mailbox.pose = None;
             mailbox.pose_published_at = None;
@@ -108,6 +116,35 @@ impl WorldRenderRunner {
             mailbox.target = None;
             mailbox.breaking = None;
             mailbox.chunks.clear();
+            mailbox.dirty = true;
+            mailbox.waker.clone()
+        } else {
+            None
+        };
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    pub fn inventory(&self, inventory: cubic_world::InventoryState) {
+        let waker = if let Ok(mut mailbox) = self.0.lock() {
+            mailbox.inventory = Some(inventory);
+            mailbox.dirty = true;
+            mailbox.waker.clone()
+        } else {
+            None
+        };
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    pub fn game_mode(&self, game_mode: cubic_world::GameMode) {
+        let waker = if let Ok(mut mailbox) = self.0.lock() {
+            if mailbox.game_mode == Some(game_mode) {
+                return;
+            }
+            mailbox.game_mode = Some(game_mode);
             mailbox.dirty = true;
             mailbox.waker.clone()
         } else {
@@ -280,6 +317,7 @@ mod tests {
                 height: 16,
             },
             Arc::from([]),
+            cubic_world::GameMode::Survival,
         );
         let coordinate = ChunkCoordinate::new(2, -3);
         runner.load(chunk(coordinate, 1));
@@ -318,6 +356,7 @@ mod tests {
                 height: 384,
             },
             Arc::from([]),
+            cubic_world::GameMode::Survival,
         );
         let update = handle.take_update().unwrap();
         assert!(update.reset);
@@ -384,6 +423,7 @@ mod tests {
                 height: 16,
             },
             Arc::from([]),
+            cubic_world::GameMode::Survival,
         );
         assert_eq!(wakes.load(Ordering::Relaxed), 2);
     }

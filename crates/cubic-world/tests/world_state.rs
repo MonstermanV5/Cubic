@@ -1,14 +1,15 @@
 use cubic_version::MinecraftIdentifier;
 use cubic_world::{
-    AuthoritativeRotation, BlockCollisionProfile, BlockCoordinates, BlockStateUpdate, Chunk,
-    ChunkCoordinate, ChunkLightSummary, ChunkSection, ClockState, CollisionShape, Difficulty,
-    DimensionGeometry, DimensionTypeReference, EnterWorld, GameMode, LocalPlayerPose,
-    MAX_BLOCK_UPDATES_PER_EVENT, MAX_KNOWN_DIMENSIONS, MAX_RUNTIME_REGISTRIES,
-    MAX_RUNTIME_REGISTRY_ENTRIES, MAX_WORLD_CLOCKS, PalettedContainer, PlayerMovementState,
-    PlayerPositionUpdate, PlayerRotationUpdate, RelativeTransformFlags, ResetScope, Respawn,
-    RespawnRotation, RuntimeBiomeId, RuntimeBlockStateId, RuntimeDimensionType,
-    RuntimeRegistrySnapshot, RuntimeRegistrySummary, SpawnContext, SpawnPoint, Vec3d, WorldBorder,
-    WorldError, WorldEvent, WorldLifecycle, WorldState, WorldTime,
+    AuthoritativeRotation, BannerPattern, BannerPatternLayer, BlockCollisionProfile,
+    BlockCoordinates, BlockEntityData, BlockStateUpdate, Chunk, ChunkCoordinate, ChunkLightSummary,
+    ChunkSection, ClockState, CollisionShape, Difficulty, DimensionGeometry,
+    DimensionTypeReference, EnterWorld, GameMode, LocalPlayerPose, MAX_BLOCK_UPDATES_PER_EVENT,
+    MAX_KNOWN_DIMENSIONS, MAX_RUNTIME_REGISTRIES, MAX_RUNTIME_REGISTRY_ENTRIES, MAX_WORLD_CLOCKS,
+    PalettedContainer, PlayerMovementState, PlayerPositionUpdate, PlayerRotationUpdate,
+    RelativeTransformFlags, ResetScope, Respawn, RespawnRotation, RuntimeBiomeId,
+    RuntimeBlockStateId, RuntimeDimensionType, RuntimeRegistrySnapshot, RuntimeRegistrySummary,
+    SpawnContext, SpawnPoint, Vec3d, WorldBorder, WorldError, WorldEvent, WorldLifecycle,
+    WorldState, WorldTime,
 };
 
 fn id(value: &str) -> MinecraftIdentifier {
@@ -244,6 +245,59 @@ fn live_block_updates_mutate_loaded_palette_storage_at_negative_chunk_edges() {
             .iter()
             .any(|candidate| candidate.state == Some(RuntimeBlockStateId(1)))
     );
+}
+
+#[test]
+fn block_entity_updates_are_copy_on_write_and_revisioned() {
+    let mut state = active();
+    state.apply(WorldEvent::LoadChunk(sample_chunk())).unwrap();
+    let coordinate = ChunkCoordinate::new(-3, 4);
+    let before = state.loaded_chunks().get_shared(coordinate).unwrap();
+    let revision = state.revision();
+    let data = BlockEntityData {
+        custom_name: None,
+        banner_patterns: vec![BannerPatternLayer {
+            pattern: BannerPattern {
+                asset_id: id("minecraft:creeper"),
+                translation_key: None,
+            },
+            dye_raw_id: 14,
+        }],
+    };
+    let position = BlockCoordinates {
+        x: -48,
+        y: -64,
+        z: 64,
+    };
+
+    let changed = state
+        .apply_block_entity_update(position, 7, data.clone())
+        .unwrap();
+    assert_eq!(changed.changed_chunks, vec![coordinate]);
+    assert_eq!(state.revision(), revision + 1);
+    assert!(before.block_entities.is_empty());
+    assert_eq!(
+        state
+            .loaded_chunks()
+            .get(coordinate)
+            .unwrap()
+            .block_entities[0]
+            .data,
+        Some(data.clone())
+    );
+
+    let unchanged = state.apply_block_entity_update(position, 7, data).unwrap();
+    assert!(unchanged.changed_chunks.is_empty());
+    assert_eq!(state.revision(), revision + 1);
+
+    let ignored = state
+        .apply_block_entity_update(
+            BlockCoordinates { x: 0, y: 0, z: 0 },
+            7,
+            BlockEntityData::default(),
+        )
+        .unwrap();
+    assert_eq!(ignored.ignored_unloaded_or_out_of_bounds, 1);
 }
 
 #[test]

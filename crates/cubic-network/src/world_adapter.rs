@@ -6,13 +6,13 @@ use cubic_protocol::bootstrap::v775::{
 };
 use cubic_version::MinecraftIdentifier;
 use cubic_world::{
-    AuthoritativeRotation, BlockCoordinates, BlockEntitySummary, BlockStateUpdate, Chunk,
-    ChunkCoordinate, ChunkLightSummary, ChunkSection, ClockState, Difficulty, DimensionGeometry,
-    DimensionTypeReference, EnterWorld, GameMode, GrassColorModifier, HeightmapData,
-    LastDeathLocation, LightLayerData, PalettedContainer, PlayerPositionUpdate,
-    RelativeTransformFlags, Respawn, RespawnRotation, RuntimeBiome, RuntimeBiomeId,
-    RuntimeBlockStateId, RuntimeDimensionType, SpawnContext, SpawnPoint, WorldBorder, WorldEvent,
-    WorldTime,
+    AuthoritativeRotation, BannerPattern, BannerPatternLayer, BlockCoordinates, BlockEntityData,
+    BlockEntitySummary, BlockStateUpdate, Chunk, ChunkCoordinate, ChunkLightSummary, ChunkSection,
+    ClockState, Difficulty, DimensionGeometry, DimensionTypeReference, EnterWorld, GameMode,
+    GrassColorModifier, HeightmapData, LastDeathLocation, LightLayerData, PalettedContainer,
+    PlayerPositionUpdate, RelativeTransformFlags, Respawn, RespawnRotation, RuntimeBiome,
+    RuntimeBiomeId, RuntimeBlockStateId, RuntimeDimensionType, SpawnContext, SpawnPoint,
+    WorldBorder, WorldEvent, WorldTime,
 };
 use thiserror::Error;
 
@@ -41,6 +41,11 @@ pub(crate) enum WorldAdapterError {
     InvalidBiomeField {
         registry: &'static str,
         entry: String,
+        path: &'static str,
+        reason: &'static str,
+    },
+    #[error("invalid protocol-775 banner block entity at {path}: {reason}")]
+    InvalidBannerBlockEntity {
         path: &'static str,
         reason: &'static str,
     },
@@ -312,13 +317,20 @@ pub(crate) enum ChunkAdaptation {
         light: ChunkLightSummary,
     },
     Blocks(Vec<BlockStateUpdate>),
+    BlockEntity {
+        position: BlockCoordinates,
+        type_raw_id: u32,
+        data: BlockEntityData,
+    },
     Other(v775::PlayClientbound),
 }
 
-pub(crate) fn adapt_chunk_packet(packet: v775::PlayClientbound) -> ChunkAdaptation {
-    match packet {
+pub(crate) fn adapt_chunk_packet(
+    packet: v775::PlayClientbound,
+) -> Result<ChunkAdaptation, WorldAdapterError> {
+    Ok(match packet {
         v775::PlayClientbound::LevelChunkWithLight(chunk) => {
-            ChunkAdaptation::Load(semantic_chunk(chunk))
+            ChunkAdaptation::Load(semantic_chunk(chunk)?)
         }
         v775::PlayClientbound::ForgetLevelChunk { x, z } => {
             ChunkAdaptation::Unload(ChunkCoordinate::new(x, z))
@@ -356,8 +368,17 @@ pub(crate) fn adapt_chunk_packet(packet: v775::PlayClientbound) -> ChunkAdaptati
                     .collect(),
             )
         }
+        v775::PlayClientbound::BlockEntityData(update) => ChunkAdaptation::BlockEntity {
+            position: BlockCoordinates {
+                x: update.position.x(),
+                y: update.position.y(),
+                z: update.position.z(),
+            },
+            type_raw_id: update.type_raw_id,
+            data: semantic_block_entity(&update.data)?,
+        },
         other => ChunkAdaptation::Other(other),
-    }
+    })
 }
 
 pub(crate) fn initial_world_event(
@@ -420,8 +441,8 @@ pub(crate) fn play_world_event(
     Ok(event)
 }
 
-fn semantic_chunk(chunk: v775::LevelChunkWithLight) -> Chunk {
-    Chunk {
+fn semantic_chunk(chunk: v775::LevelChunkWithLight) -> Result<Chunk, WorldAdapterError> {
+    Ok(Chunk {
         coordinate: ChunkCoordinate::new(chunk.x, chunk.z),
         sections: chunk.sections.into_iter().map(semantic_section).collect(),
         heightmaps: chunk
@@ -435,16 +456,169 @@ fn semantic_chunk(chunk: v775::LevelChunkWithLight) -> Chunk {
         block_entities: chunk
             .block_entities
             .into_iter()
-            .map(|entity| BlockEntitySummary {
-                local_x: entity.local_x,
-                y: entity.y,
-                local_z: entity.local_z,
-                type_raw_id: entity.type_raw_id,
-                has_data: entity.has_data,
+            .map(|entity| {
+                let data = entity
+                    .data
+                    .as_ref()
+                    .map(semantic_block_entity)
+                    .transpose()?;
+                Ok(BlockEntitySummary {
+                    local_x: entity.local_x,
+                    y: entity.y,
+                    local_z: entity.local_z,
+                    type_raw_id: entity.type_raw_id,
+                    has_data: entity.has_data,
+                    data,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, WorldAdapterError>>()?,
         light: semantic_light(chunk.light),
+    })
+}
+
+fn semantic_block_entity(
+    compound: &cubic_protocol::nbt::NbtCompound,
+) -> Result<BlockEntityData, WorldAdapterError> {
+    let custom_name = match compound.get_str("CustomName") {
+        None => None,
+        Some(cubic_protocol::nbt::NbtTag::String(value)) => Some(value.to_string_lossy()),
+        Some(_) => {
+            return Err(WorldAdapterError::InvalidBannerBlockEntity {
+                path: "CustomName",
+                reason: "expected an NBT string component",
+            });
+        }
+    };
+    let banner_patterns = match compound.get_str("patterns") {
+        None => Vec::new(),
+        Some(cubic_protocol::nbt::NbtTag::List(list)) => {
+            if list.len() > v775::MAX_BANNER_PATTERN_LAYERS {
+                return Err(WorldAdapterError::InvalidBannerBlockEntity {
+                    path: "patterns",
+                    reason: "pattern layer count exceeds the bounded limit",
+                });
+            }
+            list.elements()
+                .iter()
+                .map(semantic_banner_pattern_layer)
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        Some(_) => {
+            return Err(WorldAdapterError::InvalidBannerBlockEntity {
+                path: "patterns",
+                reason: "expected an NBT list",
+            });
+        }
+    };
+    Ok(BlockEntityData {
+        custom_name,
+        banner_patterns,
+    })
+}
+
+fn semantic_banner_pattern_layer(
+    value: &cubic_protocol::nbt::NbtTag,
+) -> Result<BannerPatternLayer, WorldAdapterError> {
+    use cubic_protocol::nbt::NbtTag;
+    let NbtTag::Compound(layer) = value else {
+        return Err(WorldAdapterError::InvalidBannerBlockEntity {
+            path: "patterns[]",
+            reason: "expected a compound layer",
+        });
+    };
+    let pattern = match layer.get_str("pattern") {
+        Some(NbtTag::String(identifier)) => BannerPattern {
+            asset_id: identifier_value(identifier, "patterns[].pattern")?,
+            translation_key: None,
+        },
+        Some(NbtTag::Compound(direct)) => {
+            let asset = direct.get_string("asset_id").ok_or(
+                WorldAdapterError::InvalidBannerBlockEntity {
+                    path: "patterns[].pattern.asset_id",
+                    reason: "direct pattern asset identifier is missing",
+                },
+            )?;
+            let translation = direct.get_string("translation_key").ok_or(
+                WorldAdapterError::InvalidBannerBlockEntity {
+                    path: "patterns[].pattern.translation_key",
+                    reason: "direct pattern translation key is missing",
+                },
+            )?;
+            let translation = translation.to_string_lossy();
+            if translation.len() > 256 {
+                return Err(WorldAdapterError::InvalidBannerBlockEntity {
+                    path: "patterns[].pattern.translation_key",
+                    reason: "direct pattern translation key exceeds its bound",
+                });
+            }
+            BannerPattern {
+                asset_id: identifier_value(asset, "patterns[].pattern.asset_id")?,
+                translation_key: Some(translation),
+            }
+        }
+        _ => {
+            return Err(WorldAdapterError::InvalidBannerBlockEntity {
+                path: "patterns[].pattern",
+                reason: "expected a registry identifier or direct pattern compound",
+            });
+        }
+    };
+    let color = layer
+        .get_string("color")
+        .map(|value| value.to_string_lossy())
+        .ok_or(WorldAdapterError::InvalidBannerBlockEntity {
+            path: "patterns[].color",
+            reason: "dye color name is missing",
+        })?;
+    let dye_raw_id = dye_raw_id(&color).ok_or(WorldAdapterError::InvalidBannerBlockEntity {
+        path: "patterns[].color",
+        reason: "dye color name is invalid",
+    })?;
+    Ok(BannerPatternLayer {
+        pattern,
+        dye_raw_id,
+    })
+}
+
+fn identifier_value(
+    value: &cubic_protocol::nbt::NbtString,
+    path: &'static str,
+) -> Result<MinecraftIdentifier, WorldAdapterError> {
+    let value = value.to_string_lossy();
+    if value.len() > 256 {
+        return Err(WorldAdapterError::InvalidBannerBlockEntity {
+            path,
+            reason: "identifier exceeds its bound",
+        });
     }
+    MinecraftIdentifier::new(value).map_err(|_| WorldAdapterError::InvalidBannerBlockEntity {
+        path,
+        reason: "identifier is invalid",
+    })
+}
+
+fn dye_raw_id(value: &str) -> Option<u8> {
+    [
+        "white",
+        "orange",
+        "magenta",
+        "light_blue",
+        "yellow",
+        "lime",
+        "pink",
+        "gray",
+        "light_gray",
+        "cyan",
+        "purple",
+        "blue",
+        "brown",
+        "green",
+        "red",
+        "black",
+    ]
+    .iter()
+    .position(|name| *name == value)
+    .and_then(|index| u8::try_from(index).ok())
 }
 
 fn semantic_section(section: v775::WireChunkSection) -> ChunkSection {
@@ -926,7 +1100,7 @@ mod tests {
             block_entities: Vec::new(),
             light: v775::WireLightData::default(),
         });
-        let ChunkAdaptation::Load(chunk) = adapt_chunk_packet(packet) else {
+        let ChunkAdaptation::Load(chunk) = adapt_chunk_packet(packet).unwrap() else {
             panic!("expected semantic chunk")
         };
         assert_eq!(chunk.coordinate, ChunkCoordinate::new(-8, 3));
@@ -946,6 +1120,7 @@ mod tests {
                 z: 32,
                 state_id: 91,
             }))
+            .unwrap()
         else {
             panic!("expected semantic block update")
         };
@@ -981,7 +1156,8 @@ mod tests {
                     },
                 ],
             }),
-        ) else {
+        )
+        .unwrap() else {
             panic!("expected semantic section updates")
         };
         assert_eq!(
@@ -1001,6 +1177,67 @@ mod tests {
             }
         );
         assert_eq!(section[1].state, RuntimeBlockStateId(2));
+    }
+
+    #[test]
+    fn chunk_and_live_banner_block_entities_share_bounded_semantics() {
+        use cubic_protocol::nbt::{NbtCompound, NbtList, NbtTag, NbtTagType};
+
+        let mut direct = NbtCompound::new();
+        direct.insert("asset_id".into(), nbt_string("minecraft:creeper"));
+        direct.insert(
+            "translation_key".into(),
+            nbt_string("block.minecraft.banner.creeper.red"),
+        );
+        let mut reference_layer = NbtCompound::new();
+        reference_layer.insert("pattern".into(), nbt_string("minecraft:border"));
+        reference_layer.insert("color".into(), nbt_string("white"));
+        let mut direct_layer = NbtCompound::new();
+        direct_layer.insert("pattern".into(), NbtTag::Compound(direct));
+        direct_layer.insert("color".into(), nbt_string("red"));
+        let mut data = NbtCompound::new();
+        data.insert(
+            "patterns".into(),
+            NbtTag::List(
+                NbtList::new(
+                    NbtTagType::Compound,
+                    vec![
+                        NbtTag::Compound(reference_layer),
+                        NbtTag::Compound(direct_layer),
+                    ],
+                )
+                .unwrap(),
+            ),
+        );
+
+        let expected = semantic_block_entity(&data).unwrap();
+        assert_eq!(expected.banner_patterns.len(), 2);
+        assert_eq!(
+            expected.banner_patterns[0].pattern.asset_id.as_str(),
+            "minecraft:border"
+        );
+        assert_eq!(expected.banner_patterns[0].dye_raw_id, 0);
+        assert_eq!(
+            expected.banner_patterns[1].pattern.asset_id.as_str(),
+            "minecraft:creeper"
+        );
+        assert_eq!(expected.banner_patterns[1].dye_raw_id, 14);
+
+        let ChunkAdaptation::BlockEntity { data: live, .. } = adapt_chunk_packet(
+            v775::PlayClientbound::BlockEntityData(v775::BlockEntityData {
+                position: cubic_protocol::BlockPosition::new(-1, 70, 16).unwrap(),
+                type_raw_id: 7,
+                data: data.clone(),
+            }),
+        )
+        .unwrap() else {
+            panic!("expected live block entity")
+        };
+        assert_eq!(live, expected);
+
+        let mut malformed = NbtCompound::new();
+        malformed.insert("patterns".into(), NbtTag::Int(1));
+        assert!(semantic_block_entity(&malformed).is_err());
     }
 
     #[test]

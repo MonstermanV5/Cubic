@@ -81,6 +81,7 @@ pub(crate) struct WorldRenderer {
     camera_bind_group: BindGroup,
     atlas_bind_group: BindGroup,
     atlas_texture: Texture,
+    _banner_atlas_texture: Texture,
     animations: Vec<TextureAnimationRuntime>,
     animation_started: Instant,
     depth: DepthTarget,
@@ -204,6 +205,42 @@ impl WorldRenderer {
         resources.atlas.rgba.clear();
         resources.atlas.rgba.shrink_to_fit();
         let atlas_view = atlas_texture.create_view(&TextureViewDescriptor::default());
+        let banner_atlas_texture = device.create_texture(&TextureDescriptor {
+            label: Some("Cubic vanilla banner-pattern atlas"),
+            size: Extent3d {
+                width: resources.banner_atlas.width,
+                height: resources.banner_atlas.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &banner_atlas_texture,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            &resources.banner_atlas.rgba,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(resources.banner_atlas.width * 4),
+                rows_per_image: Some(resources.banner_atlas.height),
+            },
+            Extent3d {
+                width: resources.banner_atlas.width,
+                height: resources.banner_atlas.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        resources.banner_atlas.rgba.clear();
+        resources.banner_atlas.rgba.shrink_to_fit();
+        let banner_atlas_view = banner_atlas_texture.create_view(&TextureViewDescriptor::default());
         let atlas_sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("Cubic pixel-art block sampler"),
             mag_filter: ATLAS_MAG_FILTER,
@@ -250,6 +287,16 @@ impl WorldRenderer {
                     ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let atlas_bind_group = device.create_bind_group(&BindGroupDescriptor {
@@ -267,6 +314,10 @@ impl WorldRenderer {
                 BindGroupEntry {
                     binding: 2,
                     resource: BindingResource::Sampler(&cutout_atlas_sampler),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::TextureView(&banner_atlas_view),
                 },
             ],
         });
@@ -602,6 +653,7 @@ impl WorldRenderer {
             camera_bind_group,
             atlas_bind_group,
             atlas_texture,
+            _banner_atlas_texture: banner_atlas_texture,
             animations,
             animation_started: Instant::now(),
             depth: DepthTarget::new(device, width, height),

@@ -710,13 +710,17 @@ name = "cubic-ui"
 version = "0.1.0"
 dependencies = [
  "cubic-core",
+ "cubic-version",
+ "cubic-world",
  "egui",
+ "tracing",
 ]
 
 [[package]]
 name = "cubic-version"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

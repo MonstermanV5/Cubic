@@ -94,14 +94,26 @@ impl CollisionRuleSet {
     /// the baseline speed/tool-correctness inputs without changing the break
     /// state machine.
     pub(crate) fn bare_hand_destroy_progress(self, path: &str) -> f32 {
+        self.destroy_progress(path, None)
+    }
+
+    pub(crate) fn destroy_progress(self, path: &str, held_item: Option<&str>) -> f32 {
         let Some((hardness, requires_correct_tool)) = destroy_properties(path) else {
             return 0.0;
         };
         if hardness < 0.0 {
             return 0.0;
         }
-        let divisor = if requires_correct_tool { 100.0 } else { 30.0 };
-        1.0 / hardness / divisor
+        let tool = held_item.and_then(tool_properties);
+        let effective = tool.is_some_and(|tool| tool_effective_for(tool.kind, path));
+        let correct = !requires_correct_tool || effective;
+        let speed = if effective {
+            tool.map_or(1.0, |tool| tool.speed)
+        } else {
+            1.0
+        };
+        let divisor = if correct { 30.0 } else { 100.0 };
+        speed / hardness / divisor
     }
 
     pub(crate) fn offset(self, path: &str) -> CollisionOffset {
@@ -113,11 +125,88 @@ impl CollisionRuleSet {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn has_verified_shape(self, path: &str) -> bool {
         matches!(self, Self::Java26_1_2) && has_verified_shape(path)
     }
 }
 
+#[derive(Clone, Copy)]
+struct ToolProperties {
+    kind: ToolKind,
+    speed: f32,
+}
+
+#[derive(Clone, Copy)]
+enum ToolKind {
+    Pickaxe,
+    Axe,
+    Shovel,
+    Hoe,
+    Shears,
+}
+
+fn tool_properties(identifier: &str) -> Option<ToolProperties> {
+    let path = identifier
+        .split_once(':')
+        .map_or(identifier, |(_, path)| path);
+    let kind = if path.ends_with("_pickaxe") {
+        ToolKind::Pickaxe
+    } else if path.ends_with("_axe") {
+        ToolKind::Axe
+    } else if path.ends_with("_shovel") {
+        ToolKind::Shovel
+    } else if path.ends_with("_hoe") {
+        ToolKind::Hoe
+    } else if path == "shears" {
+        ToolKind::Shears
+    } else {
+        return None;
+    };
+    let speed = if path.starts_with("wooden_") {
+        2.0
+    } else if path.starts_with("stone_") {
+        4.0
+    } else if path.starts_with("iron_") {
+        6.0
+    } else if path.starts_with("diamond_") {
+        8.0
+    } else if path.starts_with("netherite_") {
+        9.0
+    } else if path.starts_with("golden_") {
+        12.0
+    } else if matches!(kind, ToolKind::Shears) {
+        15.0
+    } else {
+        1.0
+    };
+    Some(ToolProperties { kind, speed })
+}
+
+fn tool_effective_for(kind: ToolKind, path: &str) -> bool {
+    match kind {
+        ToolKind::Pickaxe => {
+            matches!(path, "stone" | "cobblestone")
+                || path.contains("ore")
+                || path.contains("copper")
+                || path.contains("iron")
+                || path.contains("gold")
+                || path.contains("brick")
+                || path.contains("anvil")
+        }
+        ToolKind::Axe => {
+            path.ends_with("_planks") || path.ends_with("_log") || path.ends_with("_wood")
+        }
+        ToolKind::Shovel => matches!(
+            path,
+            "dirt" | "sand" | "clay" | "gravel" | "grass_block" | "podzol" | "mycelium"
+        ),
+        ToolKind::Hoe => path.ends_with("_leaves") || path.contains("wart_block"),
+        ToolKind::Shears => path.ends_with("_leaves"),
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn has_verified_shape(path: &str) -> bool {
     plant_collision_family(path).is_some()
         || path.ends_with("_slab")
@@ -458,6 +547,7 @@ fn chorus_plant_shape(properties: &BTreeMap<String, String>) -> CollisionShape {
     boxes(values)
 }
 
+#[cfg(test)]
 fn is_verified_block_entity_shape(path: &str) -> bool {
     matches!(
         path,
@@ -1671,14 +1761,17 @@ mod tests {
         assert!(
             matches!(profile.shape(RuntimeBlockStateId(7)), CollisionShape::Boxes(values) if values[0].max.y == 14.0 / 16.0)
         );
-        assert!(!profile.is_approximate(RuntimeBlockStateId(1)));
-        assert!(!profile.is_approximate(RuntimeBlockStateId(7)));
+        // This deliberately sparse synthetic report reuses live 26.1.2 IDs
+        // for unrelated states. The profile must not mislabel its legacy
+        // fallback classifications as oracle-exact.
+        assert!(profile.is_approximate(RuntimeBlockStateId(1)));
+        assert!(profile.is_approximate(RuntimeBlockStateId(7)));
         for state in 8..=11 {
             assert_eq!(
                 profile.shape(RuntimeBlockStateId(state)),
                 &CollisionShape::Empty
             );
-            assert!(!profile.is_approximate(RuntimeBlockStateId(state)));
+            assert!(profile.is_approximate(RuntimeBlockStateId(state)));
         }
     }
 
@@ -1887,6 +1980,26 @@ mod tests {
         assert_eq!(
             rules.bare_hand_destroy_progress("unknown_future_block"),
             0.0
+        );
+    }
+
+    #[test]
+    fn exact_version_held_tools_accelerate_matching_blocks_without_changing_bare_hand() {
+        let rules = CollisionRuleSet::Java26_1_2;
+        assert!((rules.destroy_progress("stone", None) - 1.0 / 150.0).abs() < f32::EPSILON);
+        assert!(
+            (rules.destroy_progress("stone", Some("minecraft:diamond_pickaxe")) - 8.0 / 1.5 / 30.0)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (rules.destroy_progress("dirt", Some("minecraft:iron_shovel")) - 6.0 / 0.5 / 30.0)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (rules.destroy_progress("stone", Some("minecraft:diamond_axe")) - 1.0 / 150.0).abs()
+                < f32::EPSILON
         );
     }
 }
