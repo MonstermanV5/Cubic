@@ -732,6 +732,7 @@ dependencies = [
 name = "cubic-world"
 version = "0.1.0"
 dependencies = [
+ "cubic-core",
  "cubic-version",
  "thiserror 2.0.20",
 ]

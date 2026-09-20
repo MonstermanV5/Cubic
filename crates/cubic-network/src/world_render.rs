@@ -5,8 +5,8 @@ use std::{
 };
 
 use cubic_world::{
-    Chunk, ChunkCoordinate, ChunkRenderDelta, DimensionGeometry, LocalPlayerPose, RenderLookSample,
-    RenderPoseSample, WorldRenderUpdate,
+    Chunk, ChunkCoordinate, ChunkRenderDelta, DimensionGeometry, EntityRenderDelta,
+    LocalPlayerPose, RenderLookSample, RenderPoseSample, WorldRenderUpdate,
 };
 
 #[derive(Default)]
@@ -25,6 +25,8 @@ struct Mailbox {
     breaking: Option<cubic_world::BlockBreakingOverlay>,
     inventory: Option<cubic_world::InventoryState>,
     chunks: BTreeMap<ChunkCoordinate, ChunkRenderDelta>,
+    entities: BTreeMap<i32, EntityRenderDelta>,
+    entity_replacement: Option<BTreeMap<i32, cubic_world::Entity>>,
     waker: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -67,6 +69,16 @@ impl WorldRenderHandle {
         let breaking = mailbox.breaking;
         let inventory = mailbox.inventory.take();
         let chunks = std::mem::take(&mut mailbox.chunks);
+        let entities = if let Some(replacement) = mailbox.entity_replacement.take() {
+            mailbox.entities.clear();
+            vec![EntityRenderDelta::ReplaceAll(
+                replacement.into_values().collect(),
+            )]
+        } else {
+            std::mem::take(&mut mailbox.entities)
+                .into_values()
+                .collect()
+        };
         drop(mailbox);
         Some(WorldRenderUpdate {
             generation,
@@ -81,6 +93,7 @@ impl WorldRenderHandle {
             target,
             breaking,
             inventory,
+            entities,
             chunks: chunks.into_values().collect(),
         })
     }
@@ -96,6 +109,50 @@ impl WorldRenderHandle {
 }
 
 impl WorldRenderRunner {
+    pub fn entity(&self, delta: EntityRenderDelta, authoritative: &cubic_world::EntityStore) {
+        let id = match &delta {
+            EntityRenderDelta::Upsert(entity) => entity.id,
+            EntityRenderDelta::Remove(id) => *id,
+            EntityRenderDelta::ReplaceAll(_) => return,
+        };
+        let waker = if let Ok(mut mailbox) = self.0.lock() {
+            if let Some(replacement) = &mut mailbox.entity_replacement {
+                match delta {
+                    EntityRenderDelta::Upsert(entity) => {
+                        replacement.insert(id, entity);
+                    }
+                    EntityRenderDelta::Remove(_) => {
+                        replacement.remove(&id);
+                    }
+                    EntityRenderDelta::ReplaceAll(_) => {}
+                }
+            } else if mailbox.entities.len() < cubic_world::MAX_REMOTE_ENTITIES
+                || mailbox.entities.contains_key(&id)
+            {
+                mailbox.entities.insert(id, delta);
+            } else {
+                // Render deltas are disposable, but authoritative state is not.
+                // A bounded full snapshot guarantees no stale ghost survives a
+                // stalled renderer and any later updates continue coalescing.
+                mailbox.entities.clear();
+                mailbox.entity_replacement = Some(
+                    authoritative
+                        .snapshot(0)
+                        .into_iter()
+                        .map(|(_, entity, _)| (entity.id, entity.clone()))
+                        .collect(),
+                );
+            }
+            mailbox.dirty = true;
+            mailbox.waker.clone()
+        } else {
+            None
+        };
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
     pub fn reset(
         &self,
         dimension: String,
@@ -116,6 +173,8 @@ impl WorldRenderRunner {
             mailbox.target = None;
             mailbox.breaking = None;
             mailbox.chunks.clear();
+            mailbox.entities.clear();
+            mailbox.entity_replacement = None;
             mailbox.dirty = true;
             mailbox.waker.clone()
         } else {
@@ -281,6 +340,62 @@ impl WorldRenderRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entity_delta_coalesces_and_reset_discards_old_generation() {
+        let (mut handle, runner) = WorldRenderHandle::new();
+        let authoritative = cubic_world::EntityStore::default();
+        runner.entity(EntityRenderDelta::Remove(5), &authoritative);
+        runner.entity(EntityRenderDelta::Remove(5), &authoritative);
+        assert_eq!(
+            handle.take_update().unwrap().entities,
+            vec![EntityRenderDelta::Remove(5)]
+        );
+        runner.entity(EntityRenderDelta::Remove(9), &authoritative);
+        runner.reset(
+            "minecraft:overworld".to_owned(),
+            cubic_world::DimensionGeometry {
+                min_y: -64,
+                height: 384,
+            },
+            Arc::from([]),
+            cubic_world::GameMode::Survival,
+        );
+        assert!(handle.take_update().unwrap().entities.is_empty());
+    }
+
+    #[test]
+    fn stalled_renderer_entity_delta_overflow_resynchronizes_from_authority() {
+        let (mut handle, runner) = WorldRenderHandle::new();
+        let mut authoritative = cubic_world::EntityStore::default();
+        for id in 0..cubic_world::MAX_REMOTE_ENTITIES as i32 {
+            runner.entity(EntityRenderDelta::Remove(id), &authoritative);
+        }
+        let entity = cubic_world::Entity {
+            id: 10_000,
+            uuid: [1; 16],
+            entity_type: "minecraft:cow".into(),
+            authoritative: cubic_world::EntityTransform {
+                position: cubic_world::Vec3d::new(1.0, 2.0, 3.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                head_yaw: 0.0,
+            },
+            velocity: cubic_world::Vec3d::new(0.0, 0.0, 0.0),
+            spawn_data: 0,
+            metadata: BTreeMap::new(),
+            attributes: BTreeMap::new(),
+        };
+        authoritative.spawn(entity.clone(), 0).unwrap();
+        runner.entity(EntityRenderDelta::Upsert(entity), &authoritative);
+        let update = handle.take_update().unwrap();
+        assert_eq!(update.entities.len(), 1);
+        assert!(matches!(
+            &update.entities[0],
+            EntityRenderDelta::ReplaceAll(entities) if entities.len() == 1 && entities[0].id == 10_000
+        ));
+        assert!(handle.take_update().is_none());
+    }
     use cubic_world::{
         ChunkLightSummary, ChunkSection, PalettedContainer, RuntimeBiomeId, RuntimeBlockStateId,
     };

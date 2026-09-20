@@ -477,11 +477,29 @@ impl WorldApplication {
         let mut play_requested = false;
         let mut chat_requested = false;
         let fps = self.frame_rate.frames_per_second();
+        let entity_labels = if mode == SessionPresentationMode::Play {
+            renderer.world_entity_labels()
+        } else {
+            Vec::new()
+        };
         let mut output = context.run_ui(input, |ui| match mode {
             SessionPresentationMode::Chat => {
                 play_requested = self.chat.show_with_play_control(ui, true);
             }
             SessionPresentationMode::Play => {
+                let points_per_pixel = 1.0 / ui.ctx().pixels_per_point();
+                for (id, entity_type, x, y) in &entity_labels {
+                    egui::Area::new(egui::Id::new(("cubic-entity-label", id)))
+                        .fixed_pos([x * points_per_pixel, y * points_per_pixel])
+                        .interactable(false)
+                        .show(ui.ctx(), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{entity_type}  #{id}"))
+                                    .monospace()
+                                    .background_color(egui::Color32::from_black_alpha(180)),
+                            );
+                        });
+                }
                 for action in self.inventory.show(ui.ctx()) {
                     self.port.inventory_action(action);
                 }

@@ -249,6 +249,13 @@ impl Renderer {
             .map_or_else(WorldRenderStats::default, WorldRenderer::stats)
     }
 
+    #[must_use]
+    pub fn world_entity_labels(&self) -> Vec<(i32, String, f32, f32)> {
+        self.world_renderer.as_ref().map_or_else(Vec::new, |world| {
+            world.entity_labels(self.size.width, self.size.height)
+        })
+    }
+
     pub fn render_world(&mut self) -> Result<FrameStatus, RenderError> {
         if self.out_of_memory.load(Ordering::Acquire) {
             return Err(RenderError::OutOfMemory);
@@ -412,6 +419,7 @@ impl Renderer {
                 ..Default::default()
             });
             world.draw_destroy_overlay(&mut pass);
+            world.draw_entity_boxes(&mut pass);
             world.draw_selection(&mut pass);
         }
         if let Some(crosshair) = &self.crosshair_renderer {
@@ -520,6 +528,7 @@ impl Renderer {
                 ..Default::default()
             });
             world.draw_destroy_overlay(&mut pass);
+            world.draw_entity_boxes(&mut pass);
             world.draw_selection(&mut pass);
         }
         self.queue.submit([encoder.finish()]);

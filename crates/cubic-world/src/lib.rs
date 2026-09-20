@@ -6,6 +6,7 @@
 
 mod chunk;
 mod collision_vanilla;
+mod entity;
 mod environment;
 mod interaction;
 mod inventory;
@@ -20,6 +21,11 @@ pub use chunk::{
     LoadedChunks, MAX_BLOCK_ENTITIES_PER_CHUNK, MAX_CHUNK_SECTIONS, MAX_HEIGHTMAP_LONGS,
     MAX_HEIGHTMAPS, MAX_LOADED_CHUNKS, PaletteForm, PalettedContainer, RuntimeBiomeId,
     RuntimeBlockStateId, SECTION_BIOME_COUNT, SECTION_BLOCK_COUNT,
+};
+pub use entity::{
+    Entity, EntityAttribute, EntityAttributeModifier, EntityError, EntityHandle,
+    EntityMetadataParticle, EntityMetadataParticleData, EntityMetadataProfile, EntityMetadataValue,
+    EntityStore, EntityTransform, MAX_REMOTE_ENTITIES,
 };
 pub use environment::{
     BlockEnvironment, BlockEnvironmentProfile, FluidKind, FluidState, SpecialSurface,
@@ -50,7 +56,7 @@ pub use movement::{
 };
 pub use render::{
     BlockBreakingOverlay, BlockVisualProfile, ChunkRenderDelta, DESTROY_STAGE_COUNT,
-    RenderLookSample, RenderPoseSample, WorldRenderUpdate,
+    EntityRenderDelta, RenderLookSample, RenderPoseSample, WorldRenderUpdate,
 };
 pub use state::{
     BlockUpdateResult, MAX_BLOCK_UPDATES_PER_EVENT, MAX_KNOWN_DIMENSIONS, MAX_RUNTIME_REGISTRIES,

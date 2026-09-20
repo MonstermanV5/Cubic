@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU8, AtomicUsize, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use cubic_auth::{AuthenticatedMinecraftAccount, MinecraftSessionJoiner, PlayerCertificate};
@@ -16,7 +16,11 @@ use cubic_protocol::{
     bootstrap::v775::{self, ClientInformation, PlayClientbound, TextComponent},
     nbt::{NbtCompound, NbtTag},
 };
-use cubic_world::{BlockCollisionProfile, Vec3d, WorldEvent, WorldState};
+use cubic_world::{
+    BlockCollisionProfile, Entity, EntityAttribute, EntityAttributeModifier,
+    EntityMetadataParticle, EntityMetadataParticleData, EntityMetadataProfile, EntityMetadataValue,
+    EntityTransform, Vec3d, WorldEvent, WorldState,
+};
 use rand_core_06::{OsRng, RngCore};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -71,11 +75,17 @@ pub struct ChatSessionRunner {
 }
 
 #[derive(Clone, Debug)]
-pub struct InventoryProtocolProfile(v775::ItemStackProfile);
+pub struct InventoryProtocolProfile {
+    items: v775::ItemStackProfile,
+    entities: v775::EntityTypeProfile,
+}
 
 impl InventoryProtocolProfile {
     pub fn from_game_data(data: &cubic_version::GameData) -> Result<Self, ChatSessionError> {
-        Ok(Self(v775::ItemStackProfile::from_game_data(data)?))
+        Ok(Self {
+            items: v775::ItemStackProfile::from_game_data(data)?,
+            entities: v775::EntityTypeProfile::from_game_data(data),
+        })
     }
 }
 
@@ -203,6 +213,8 @@ pub enum ChatSessionError {
     WorldAdapter(String),
     #[error("world state update failed: {0}")]
     WorldState(#[from] cubic_world::WorldError),
+    #[error("entity state update failed: {0}")]
+    EntityState(#[from] cubic_world::EntityError),
     #[error("inventory state update failed: {0}")]
     InventoryState(#[from] cubic_world::InventoryError),
     #[error("local player movement failed: {0}")]
@@ -237,6 +249,7 @@ pub async fn run_development_chat_session(
         connected.initial_login,
         connected.dimension_types,
         connected.biomes,
+        None,
         None,
         None,
         None,
@@ -279,6 +292,7 @@ pub async fn run_authenticated_chat_session<J: MinecraftSessionJoiner>(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -297,8 +311,10 @@ pub async fn run_development_world_session(
     inventory_profile: InventoryProtocolProfile,
 ) -> Result<(), ChatSessionError> {
     let mut connected = connect_to_play(address, username, &options.login).await?;
-    let mut inventory_profile = inventory_profile.0;
-    inventory_profile.install_banner_patterns(connected.banner_patterns)?;
+    let mut items = inventory_profile.items;
+    let mut entity_types = inventory_profile.entities;
+    entity_types.install_connection_registries(connected.entity_registries);
+    items.install_banner_patterns(connected.banner_patterns)?;
     run_play_session(
         &mut connected.connection,
         ChatSecurity::UnsignedDevelopment,
@@ -306,9 +322,10 @@ pub async fn run_development_world_session(
         connected.initial_login,
         connected.dimension_types,
         connected.biomes,
-        Some(inventory_profile),
+        Some(items),
         Some(render),
         Some((controls, collisions, outlines)),
+        Some(entity_types),
     )
     .await
 }
@@ -422,6 +439,193 @@ fn semantic_stack(stack: v775::WireItemStack) -> Result<cubic_world::ItemStack, 
             fingerprints,
         },
     )?)
+}
+
+fn metadata_position(position: cubic_protocol::BlockPosition) -> [i32; 3] {
+    [position.x(), position.y(), position.z()]
+}
+
+fn metadata_component(
+    component: TextComponent,
+) -> Result<(String, StructuredText, Vec<u8>), ChatSessionError> {
+    let wire = cubic_protocol::nbt::encode_unnamed_network_tag(
+        &component.value,
+        cubic_protocol::nbt::NbtLimits::default(),
+    )
+    .map_err(v775::InventoryCodecError::from)?;
+    Ok((component.plain_text, structured(&component.value), wire))
+}
+
+fn semantic_particle(
+    particle: v775::EntityWireParticle,
+) -> Result<EntityMetadataParticle, ChatSessionError> {
+    use v775::EntityWireParticleData as Wire;
+    let data = match particle.data {
+        Wire::None => EntityMetadataParticleData::None,
+        Wire::BlockState {
+            id,
+            block,
+            properties,
+        } => EntityMetadataParticleData::BlockState {
+            id,
+            block,
+            properties,
+        },
+        Wire::Float(value) => EntityMetadataParticleData::Float(value),
+        Wire::Int(value) => EntityMetadataParticleData::Int(value),
+        Wire::ColorAndFloat { color, amount } => {
+            EntityMetadataParticleData::ColorAndFloat { color, amount }
+        }
+        Wire::Dust { color, scale } => EntityMetadataParticleData::Dust { color, scale },
+        Wire::DustTransition { from, to, scale } => {
+            EntityMetadataParticleData::DustTransition { from, to, scale }
+        }
+        Wire::Item(stack) => EntityMetadataParticleData::Item(semantic_stack(stack)?),
+        Wire::VibrationBlock {
+            position,
+            arrival_ticks,
+        } => EntityMetadataParticleData::VibrationBlock {
+            position: metadata_position(position),
+            arrival_ticks,
+        },
+        Wire::VibrationEntity {
+            entity_id,
+            y_offset,
+            arrival_ticks,
+        } => EntityMetadataParticleData::VibrationEntity {
+            entity_id,
+            y_offset,
+            arrival_ticks,
+        },
+        Wire::Trail {
+            target,
+            color,
+            duration,
+        } => EntityMetadataParticleData::Trail {
+            target,
+            color,
+            duration,
+        },
+    };
+    Ok(EntityMetadataParticle {
+        kind: particle.kind,
+        data,
+    })
+}
+
+fn semantic_metadata(
+    value: v775::EntityWireMetadataValue,
+) -> Result<EntityMetadataValue, ChatSessionError> {
+    use v775::EntityWireMetadataValue as Wire;
+    Ok(match value {
+        Wire::Byte(value) => EntityMetadataValue::Byte(value),
+        Wire::Integer(value) => EntityMetadataValue::Integer(value),
+        Wire::Long(value) => EntityMetadataValue::Long(value),
+        Wire::Float(value) => EntityMetadataValue::Float(value),
+        Wire::String(value) => EntityMetadataValue::String(value),
+        Wire::Component(value) => {
+            let (plain, structured, wire) = metadata_component(value)?;
+            EntityMetadataValue::Component {
+                plain,
+                structured,
+                wire,
+            }
+        }
+        Wire::OptionalComponent(value) => {
+            EntityMetadataValue::OptionalComponent(value.map(metadata_component).transpose()?)
+        }
+        Wire::ItemStack(value) => {
+            EntityMetadataValue::ItemStack(value.map(semantic_stack).transpose()?)
+        }
+        Wire::Boolean(value) => EntityMetadataValue::Boolean(value),
+        Wire::Rotations(value) => EntityMetadataValue::Rotations(value),
+        Wire::BlockPos(value) => EntityMetadataValue::BlockPos(metadata_position(value)),
+        Wire::OptionalBlockPos(value) => {
+            EntityMetadataValue::OptionalBlockPos(value.map(metadata_position))
+        }
+        Wire::Direction(value) => EntityMetadataValue::Direction(value),
+        Wire::LivingEntityReference(value) => EntityMetadataValue::LivingEntityReference(value),
+        Wire::BlockState {
+            id,
+            block,
+            properties,
+        } => EntityMetadataValue::BlockState {
+            id,
+            block,
+            properties,
+        },
+        Wire::OptionalBlockState(value) => EntityMetadataValue::OptionalBlockState(value),
+        Wire::Particle(value) => EntityMetadataValue::Particle(semantic_particle(value)?),
+        Wire::Particles(values) => EntityMetadataValue::Particles(
+            values
+                .into_iter()
+                .map(semantic_particle)
+                .collect::<Result<_, _>>()?,
+        ),
+        Wire::VillagerData {
+            kind,
+            profession,
+            level,
+        } => EntityMetadataValue::VillagerData {
+            kind,
+            profession,
+            level,
+        },
+        Wire::OptionalUnsignedInt(value) => EntityMetadataValue::OptionalUnsignedInt(value),
+        Wire::Pose { ordinal, name } => EntityMetadataValue::Pose {
+            ordinal,
+            name: name.to_owned(),
+        },
+        Wire::RegistryHolder {
+            serializer_id,
+            registry,
+            identifier,
+        } => EntityMetadataValue::RegistryHolder {
+            serializer_id,
+            registry: registry.to_owned(),
+            identifier,
+        },
+        Wire::GlobalPos(value) => EntityMetadataValue::GlobalPos(
+            value.map(|(dimension, position)| (dimension, metadata_position(position))),
+        ),
+        Wire::DirectPainting {
+            width,
+            height,
+            asset,
+            title,
+            author,
+        } => EntityMetadataValue::DirectPainting {
+            width,
+            height,
+            asset,
+            title: title.map(metadata_component).transpose()?,
+            author: author.map(metadata_component).transpose()?,
+        },
+        Wire::EnumState {
+            serializer_id,
+            ordinal,
+            name,
+        } => EntityMetadataValue::EnumState {
+            serializer_id,
+            ordinal,
+            name: name.to_owned(),
+        },
+        Wire::Vector3(value) => EntityMetadataValue::Vector3(value),
+        Wire::Quaternion(value) => EntityMetadataValue::Quaternion(value),
+        Wire::ResolvableProfile(v775::EntityWireProfile {
+            name,
+            uuid,
+            properties,
+            skin,
+            slim,
+        }) => EntityMetadataValue::ResolvableProfile(EntityMetadataProfile {
+            name,
+            uuid,
+            properties,
+            skin,
+            slim,
+        }),
+    })
 }
 
 fn decode_string_map(
@@ -725,6 +929,7 @@ async fn run_play_session(
         BlockCollisionProfile,
         cubic_world::BlockOutlineProfile,
     )>,
+    mut entity_types: Option<v775::EntityTypeProfile>,
 ) -> Result<(), ChatSessionError> {
     let player_entity_id = initial_login.player_entity_id;
     let pose_authority = if movement.is_some() {
@@ -733,6 +938,7 @@ async fn run_play_session(
         RenderPoseAuthority::AuthoritativeWorld
     };
     let mut world = WorldState::default();
+    let entity_clock = Instant::now();
     world.apply(WorldEvent::BeginConfiguration)?;
     world.apply(WorldEvent::RuntimeDimensionTypes(dimension_types))?;
     world.apply(WorldEvent::RuntimeBiomes(biomes))?;
@@ -766,6 +972,7 @@ async fn run_play_session(
     });
     let mut movement_ticks = tokio::time::interval(std::time::Duration::from_millis(50));
     movement_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut seen_entity_serializer_bits = 0_u64;
 
     loop {
         tokio::select! {
@@ -802,6 +1009,28 @@ async fn run_play_session(
                 };
                 let decode_started = std::time::Instant::now();
                 let frame_bytes = frame.len();
+                if let Some(profile) = &entity_types
+                    && let Some(event) = v775::decode_entity_packet(&frame, profile, inventory_profile.as_ref())?
+                {
+                    if let v775::EntityWireEvent::Metadata { values, .. } = &event {
+                        for (accessor, value) in values {
+                            let serializer = value.serializer_id();
+                            let bit = 1_u64 << serializer;
+                            if seen_entity_serializer_bits & bit == 0 {
+                                seen_entity_serializer_bits |= bit;
+                                tracing::debug!(target: "entity::metadata", serializer, accessor,
+                                    "observed entity metadata serializer for first time in this session");
+                            }
+                        }
+                    }
+                    if matches!(event, v775::EntityWireEvent::Spawn(ref spawn) if spawn.id == player_entity_id) {
+                        continue;
+                    }
+                    if !matches!(event, v775::EntityWireEvent::Velocity { id, .. } if id == player_entity_id) {
+                        apply_entity_wire_event(&mut world, event, entity_clock.elapsed().as_millis() as u64, &render)?;
+                        continue;
+                    }
+                }
                 if let Some(profile) = &inventory_profile
                     && let Some(packet) = v775::decode_inventory_clientbound(&frame, profile)?
                 {
@@ -1236,6 +1465,9 @@ async fn run_play_session(
                         if let Some(profile) = &mut inventory_profile {
                             profile.install_banner_patterns(configuration.banner_patterns)?;
                         }
+                        if let Some(profile) = &mut entity_types {
+                            profile.install_connection_registries(configuration.entity_registries);
+                        }
                         world.apply(WorldEvent::RuntimeDimensionTypes(configuration.dimension_types))?;
                         world.apply(WorldEvent::RuntimeBiomes(configuration.biomes))?;
                         world.apply(crate::world_adapter::initial_world_event(configuration.initial_login)?)?;
@@ -1256,6 +1488,241 @@ async fn run_play_session(
             }
         }
     }
+}
+
+fn apply_entity_wire_event(
+    world: &mut WorldState,
+    event: v775::EntityWireEvent,
+    at_ms: u64,
+    render: &Option<WorldRenderRunner>,
+) -> Result<(), ChatSessionError> {
+    use v775::EntityWireEvent;
+    let touched = match &event {
+        EntityWireEvent::Spawn(spawn) => vec![spawn.id],
+        EntityWireEvent::Remove(ids) => ids.clone(),
+        EntityWireEvent::RelativeMove { id, .. }
+        | EntityWireEvent::Rotate { id, .. }
+        | EntityWireEvent::HeadRotate { id, .. }
+        | EntityWireEvent::PositionSync { id, .. }
+        | EntityWireEvent::Teleport { id, .. }
+        | EntityWireEvent::Velocity { id, .. }
+        | EntityWireEvent::Attributes { id, .. }
+        | EntityWireEvent::Metadata { id, .. } => vec![*id],
+    };
+    let entities = world.entities_mut();
+    match event {
+        EntityWireEvent::Spawn(spawn) => {
+            let entity = Entity {
+                id: spawn.id,
+                uuid: spawn.uuid,
+                entity_type: spawn.entity_type,
+                authoritative: EntityTransform {
+                    position: Vec3d::new(spawn.position[0], spawn.position[1], spawn.position[2]),
+                    yaw: spawn.yaw,
+                    pitch: spawn.pitch,
+                    head_yaw: spawn.head_yaw,
+                },
+                velocity: Vec3d::new(spawn.velocity[0], spawn.velocity[1], spawn.velocity[2]),
+                spawn_data: spawn.data,
+                metadata: BTreeMap::new(),
+                attributes: BTreeMap::new(),
+            };
+            tracing::debug!(target: "world::entities", id = entity.id, entity_type = %entity.entity_type, uuid = ?entity.uuid, position = ?entity.authoritative.position, "remote entity spawned");
+            entities.spawn(entity, at_ms)?;
+        }
+        EntityWireEvent::Remove(ids) => {
+            for id in ids {
+                if entities.remove(id) {
+                    tracing::debug!(target: "world::entities", id, "remote entity removed");
+                }
+            }
+        }
+        EntityWireEvent::RelativeMove {
+            id,
+            delta,
+            yaw,
+            pitch,
+        } => {
+            if let Some(handle) = entities.handle(id)
+                && let Some(entity) = entities.get(handle)
+            {
+                let mut next = entity.authoritative;
+                next.position.x += delta[0];
+                next.position.y += delta[1];
+                next.position.z += delta[2];
+                if let Some(yaw) = yaw {
+                    next.yaw = yaw;
+                }
+                if let Some(pitch) = pitch {
+                    next.pitch = pitch;
+                }
+                entities.update_transform(id, next, at_ms, false)?;
+            }
+        }
+        EntityWireEvent::Rotate { id, yaw, pitch } => {
+            if let Some(handle) = entities.handle(id)
+                && let Some(entity) = entities.get(handle)
+            {
+                let next = EntityTransform {
+                    yaw,
+                    pitch,
+                    ..entity.authoritative
+                };
+                entities.update_transform(id, next, at_ms, false)?;
+            }
+        }
+        EntityWireEvent::HeadRotate { id, head_yaw } => {
+            if let Some(handle) = entities.handle(id)
+                && let Some(entity) = entities.get(handle)
+            {
+                let next = EntityTransform {
+                    head_yaw,
+                    ..entity.authoritative
+                };
+                entities.update_transform(id, next, at_ms, false)?;
+            }
+        }
+        EntityWireEvent::Velocity { id, velocity } => {
+            if let Some(handle) = entities.handle(id) {
+                // Velocity is authoritative state only; no remote mob physics runs here.
+                if let Some(entity) = entities.get_mut(handle) {
+                    entity.velocity = Vec3d::new(velocity[0], velocity[1], velocity[2]);
+                }
+            }
+        }
+        EntityWireEvent::Attributes { id, values } => {
+            if let Some(handle) = entities.handle(id)
+                && let Some(entity) = entities.get_mut(handle)
+            {
+                for value in values {
+                    let modifiers = value
+                        .modifiers
+                        .into_iter()
+                        .map(|modifier| {
+                            (
+                                modifier.identifier,
+                                EntityAttributeModifier {
+                                    amount: modifier.amount,
+                                    operation: modifier.operation,
+                                },
+                            )
+                        })
+                        .collect();
+                    entity.attributes.insert(
+                        value.identifier,
+                        EntityAttribute {
+                            base: value.base,
+                            modifiers,
+                        },
+                    );
+                }
+            }
+        }
+        EntityWireEvent::Metadata { id, values } => {
+            if let Some(handle) = entities.handle(id)
+                && let Some(entity) = entities.get_mut(handle)
+            {
+                for (index, value) in values {
+                    let semantic = semantic_metadata(value)?;
+                    entity.set_metadata(index, semantic)?;
+                }
+            }
+        }
+        EntityWireEvent::PositionSync {
+            id,
+            position,
+            velocity,
+            yaw,
+            pitch,
+        } => {
+            if let Some(handle) = entities.handle(id)
+                && let Some(entity) = entities.get(handle)
+            {
+                let next = EntityTransform {
+                    position: Vec3d::new(position[0], position[1], position[2]),
+                    yaw,
+                    pitch,
+                    ..entity.authoritative
+                };
+                entities.update_transform(id, next, at_ms, false)?;
+                if let Some(entity) = entities.get_mut(handle) {
+                    entity.velocity = Vec3d::new(velocity[0], velocity[1], velocity[2]);
+                }
+            }
+        }
+        EntityWireEvent::Teleport {
+            id,
+            position,
+            velocity,
+            yaw,
+            pitch,
+            relative_flags,
+        } => {
+            if let Some(handle) = entities.handle(id)
+                && let Some(entity) = entities.get(handle)
+            {
+                let old = entity.authoritative;
+                let old_velocity = entity.velocity;
+                let value = |bit: u32, received: f64, current: f64| {
+                    if relative_flags & (1 << bit) != 0 {
+                        received + current
+                    } else {
+                        received
+                    }
+                };
+                let next = EntityTransform {
+                    position: Vec3d::new(
+                        value(0, position[0], old.position.x),
+                        value(1, position[1], old.position.y),
+                        value(2, position[2], old.position.z),
+                    ),
+                    yaw: value(3, f64::from(yaw), f64::from(old.yaw)) as f32,
+                    pitch: value(4, f64::from(pitch), f64::from(old.pitch)) as f32,
+                    ..old
+                };
+                // Mojang's ROTATE_DELTA flag rotates the pre-teleport motion
+                // into the corrected orientation before applying delta bits.
+                let prior_velocity = if relative_flags & 0x100 != 0 {
+                    let pitch = f64::from(old.pitch - next.pitch).to_radians();
+                    let yaw = f64::from(old.yaw - next.yaw).to_radians();
+                    let (sin_pitch, cos_pitch) = pitch.sin_cos();
+                    let rotated_x = Vec3d::new(
+                        old_velocity.x,
+                        old_velocity.y * cos_pitch + old_velocity.z * sin_pitch,
+                        old_velocity.z * cos_pitch - old_velocity.y * sin_pitch,
+                    );
+                    let (sin_yaw, cos_yaw) = yaw.sin_cos();
+                    Vec3d::new(
+                        rotated_x.x * cos_yaw + rotated_x.z * sin_yaw,
+                        rotated_x.y,
+                        rotated_x.z * cos_yaw - rotated_x.x * sin_yaw,
+                    )
+                } else {
+                    old_velocity
+                };
+                entities.update_transform(id, next, at_ms, true)?;
+                if let Some(entity) = entities.get_mut(handle) {
+                    entity.velocity = Vec3d::new(
+                        value(5, velocity[0], prior_velocity.x),
+                        value(6, velocity[1], prior_velocity.y),
+                        value(7, velocity[2], prior_velocity.z),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(render) = render {
+        for id in touched {
+            let delta = entities
+                .handle(id)
+                .and_then(|handle| entities.get(handle))
+                .map_or(cubic_world::EntityRenderDelta::Remove(id), |entity| {
+                    cubic_world::EntityRenderDelta::Upsert(entity.clone())
+                });
+            render.entity(delta, entities);
+        }
+    }
+    Ok(())
 }
 
 async fn service_movement_tick(
@@ -2142,6 +2609,7 @@ mod tests {
                     BlockCollisionProfile::synthetic([]),
                     cubic_world::BlockOutlineProfile::synthetic([]),
                 )),
+                None,
             )
             .await
         });
@@ -2258,6 +2726,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -2369,5 +2838,148 @@ mod tests {
             origin,
             cubic_world::LocalPlayerPose::new(8.0, 64.0, 0.0, 0.0, 0.0)
         ));
+    }
+
+    #[test]
+    fn entity_packet_sequence_updates_world_and_coalesced_render_mailbox() {
+        let (mut handle, runner) = crate::world_render::WorldRenderHandle::new();
+        let render = Some(runner);
+        let mut world = WorldState::default();
+        let spawn = v775::EntityWireEvent::Spawn(v775::EntitySpawn {
+            id: 12,
+            uuid: [7; 16],
+            entity_type: "minecraft:cow".to_owned(),
+            position: [1.0, 64.0, -2.0],
+            velocity: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+        });
+        apply_entity_wire_event(&mut world, spawn, 0, &render).unwrap();
+        let original = world.entities().handle(12).unwrap();
+        apply_entity_wire_event(
+            &mut world,
+            v775::EntityWireEvent::RelativeMove {
+                id: 12,
+                delta: [1.0, 0.0, 0.0],
+                yaw: Some(90.0),
+                pitch: None,
+            },
+            50,
+            &render,
+        )
+        .unwrap();
+        assert_eq!(
+            world
+                .entities()
+                .get(original)
+                .unwrap()
+                .authoritative
+                .position
+                .x,
+            2.0
+        );
+        let update = handle.take_update().unwrap();
+        assert_eq!(update.entities.len(), 1);
+        assert!(
+            matches!(&update.entities[0], cubic_world::EntityRenderDelta::Upsert(entity) if entity.authoritative.yaw == 90.0)
+        );
+        apply_entity_wire_event(
+            &mut world,
+            v775::EntityWireEvent::Remove(vec![12]),
+            100,
+            &render,
+        )
+        .unwrap();
+        assert!(world.entities().get(original).is_none());
+        assert!(matches!(
+            &handle.take_update().unwrap().entities[0],
+            cubic_world::EntityRenderDelta::Remove(12)
+        ));
+    }
+
+    #[test]
+    fn entity_teleport_rotates_prior_velocity_only_when_requested() {
+        let mut world = WorldState::default();
+        apply_entity_wire_event(
+            &mut world,
+            v775::EntityWireEvent::Spawn(v775::EntitySpawn {
+                id: 19,
+                uuid: [19; 16],
+                entity_type: "minecraft:cow".to_owned(),
+                position: [0.0; 3],
+                velocity: [1.0, 0.0, 0.0],
+                yaw: 0.0,
+                pitch: 0.0,
+                head_yaw: 0.0,
+                data: 0,
+            }),
+            0,
+            &None,
+        )
+        .unwrap();
+        apply_entity_wire_event(
+            &mut world,
+            v775::EntityWireEvent::Teleport {
+                id: 19,
+                position: [0.0; 3],
+                velocity: [0.0; 3],
+                yaw: 90.0,
+                pitch: 0.0,
+                relative_flags: 0x20 | 0x40 | 0x80 | 0x100,
+            },
+            20,
+            &None,
+        )
+        .unwrap();
+        let entity = world
+            .entities()
+            .get(world.entities().handle(19).unwrap())
+            .unwrap();
+        assert!(entity.velocity.x.abs() < 1e-8);
+        assert!((entity.velocity.z - 1.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn entity_metadata_updates_are_typed_and_replace_previous_accessor_value() {
+        let mut world = WorldState::default();
+        apply_entity_wire_event(
+            &mut world,
+            v775::EntityWireEvent::Spawn(v775::EntitySpawn {
+                id: 20,
+                uuid: [20; 16],
+                entity_type: "minecraft:zombie".to_owned(),
+                position: [0.0; 3],
+                velocity: [0.0; 3],
+                yaw: 0.0,
+                pitch: 0.0,
+                head_yaw: 0.0,
+                data: 0,
+            }),
+            0,
+            &None,
+        )
+        .unwrap();
+        for value in [10, 20] {
+            apply_entity_wire_event(
+                &mut world,
+                v775::EntityWireEvent::Metadata {
+                    id: 20,
+                    values: vec![(1, v775::EntityWireMetadataValue::Integer(value))],
+                },
+                0,
+                &None,
+            )
+            .unwrap();
+        }
+        let entity = world
+            .entities()
+            .get(world.entities().handle(20).unwrap())
+            .unwrap();
+        assert_eq!(
+            entity.metadata.get(&1),
+            Some(&EntityMetadataValue::Integer(20))
+        );
     }
 }

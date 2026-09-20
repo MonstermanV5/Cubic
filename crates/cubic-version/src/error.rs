@@ -4,6 +4,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum VersionError {
+    #[error("invalid generated Minecraft entity data: {reason}")]
+    InvalidEntityData { reason: String },
+    #[error("unsupported Cubic entity-data schema {found}; supported schema is {supported}")]
+    UnsupportedEntityDataFormat { found: u32, supported: u32 },
     #[error("invalid generated Minecraft shape data: {reason}")]
     InvalidShapeData { reason: String },
     #[error("unsupported Cubic shape-data schema {found}; supported schema is {supported}")]

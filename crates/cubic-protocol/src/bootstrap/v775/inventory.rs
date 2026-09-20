@@ -102,7 +102,7 @@ impl ItemStackProfile {
     }
 
     #[cfg(test)]
-    fn synthetic(
+    pub(super) fn synthetic(
         items: impl IntoIterator<Item = (u32, &'static str)>,
         components: impl IntoIterator<Item = (u32, &'static str)>,
         menus: impl IntoIterator<Item = (u32, &'static str)>,
@@ -690,7 +690,7 @@ pub fn decode_set_held_slot(body: &[u8]) -> Result<ClientboundSetHeldSlot, Inven
     Ok(ClientboundSetHeldSlot { slot })
 }
 
-fn decode_item_stack(
+pub(super) fn decode_item_stack(
     reader: &mut CodecReader<'_>,
     profile: &ItemStackProfile,
 ) -> Result<Option<ItemStack>, InventoryCodecError> {
@@ -698,6 +698,27 @@ fn decode_item_stack(
     if count == 0 {
         return Ok(None);
     }
+    let raw_item = read_nonnegative(reader, "item ID")?;
+    decode_nonempty_stack(reader, profile, count, raw_item).map(Some)
+}
+
+/// `ItemStackTemplate.STREAM_CODEC` (used by item particles) puts its
+/// non-optional item holder before the count; the component patch is shared.
+pub(super) fn decode_item_stack_template(
+    reader: &mut CodecReader<'_>,
+    profile: &ItemStackProfile,
+) -> Result<ItemStack, InventoryCodecError> {
+    let raw_item = read_nonnegative(reader, "item ID")?;
+    let count = reader.read_var_int()?;
+    decode_nonempty_stack(reader, profile, count, raw_item)
+}
+
+fn decode_nonempty_stack(
+    reader: &mut CodecReader<'_>,
+    profile: &ItemStackProfile,
+    count: i32,
+    raw_item: u32,
+) -> Result<ItemStack, InventoryCodecError> {
     if count < 0 || !u32::try_from(count).is_ok_and(|count| count <= MAX_STACK_COUNT) {
         return Err(InventoryCodecError::ValueOutOfRange {
             context: "item count",
@@ -705,7 +726,6 @@ fn decode_item_stack(
             max: i64::from(MAX_STACK_COUNT),
         });
     }
-    let raw_item = read_nonnegative(reader, "item ID")?;
     let item = profile
         .items
         .get(&raw_item)
@@ -764,7 +784,7 @@ fn decode_item_stack(
             return Err(InventoryCodecError::DuplicateComponent(identifier));
         }
     }
-    Ok(Some(ItemStack {
+    Ok(ItemStack {
         item,
         count: u32::try_from(count).map_err(|_| InventoryCodecError::ValueOutOfRange {
             context: "item count",
@@ -772,7 +792,7 @@ fn decode_item_stack(
             max: i64::from(MAX_STACK_COUNT),
         })?,
         components: patch,
-    }))
+    })
 }
 
 fn skip_component(

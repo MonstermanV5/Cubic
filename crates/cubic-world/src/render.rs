@@ -117,7 +117,17 @@ pub struct WorldRenderUpdate {
     /// Latest authoritative inventory snapshot. It coalesces independently of
     /// terrain work and never contains protocol runtime IDs.
     pub inventory: Option<crate::InventoryState>,
+    /// Coalesced dynamic entity changes; never baked into chunk meshes.
+    pub entities: Vec<EntityRenderDelta>,
     pub chunks: Vec<ChunkRenderDelta>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum EntityRenderDelta {
+    Upsert(crate::Entity),
+    Remove(i32),
+    /// Bounded authoritative resynchronization if delta churn fills the mailbox.
+    ReplaceAll(Vec<crate::Entity>),
 }
 
 #[cfg(test)]

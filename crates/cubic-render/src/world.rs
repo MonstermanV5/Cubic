@@ -11,8 +11,8 @@ use std::{
 
 use bytemuck::{Pod, Zeroable};
 use cubic_world::{
-    Chunk, ChunkCoordinate, ChunkRenderDelta, DimensionGeometry, LocalPlayerPose, RenderLookSample,
-    RenderPoseSample, WorldRenderUpdate,
+    Chunk, ChunkCoordinate, ChunkRenderDelta, DimensionGeometry, EntityRenderDelta,
+    EntityTransform, LocalPlayerPose, RenderLookSample, RenderPoseSample, WorldRenderUpdate,
 };
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
@@ -33,6 +33,8 @@ const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
 const MAX_PENDING_MESH_JOBS: usize = 32;
 const MAX_MESH_RESULTS_PER_PREPARE: usize = 16;
 const MAX_MESH_DISPATCHES_PER_PREPARE: usize = 8;
+const MAX_DEBUG_ENTITY_BOXES: usize = 256;
+const DEBUG_ENTITY_INTERPOLATION: Duration = Duration::from_millis(150);
 const MESH_INTEGRATION_TIME_BUDGET: Duration = Duration::from_millis(4);
 const _: () = assert!(MAX_MESH_RESULTS_PER_PREPARE < MAX_PENDING_MESH_JOBS);
 const SIMULATION_TICK: Duration = Duration::from_millis(50);
@@ -101,6 +103,10 @@ pub(crate) struct WorldRenderer {
     selection_buffer: Option<Buffer>,
     selection_vertex_count: u32,
     selection_dirty: bool,
+    entities: BTreeMap<i32, EntityPresentation>,
+    entity_buffer: Option<Buffer>,
+    entity_vertex_count: u32,
+    entity_dirty: bool,
     resources: Arc<BlockResources>,
     _destroy_textures: Vec<Texture>,
     destroy_bind_groups: Vec<BindGroup>,
@@ -109,6 +115,39 @@ pub(crate) struct WorldRenderer {
     destroy_index_buffer: Option<Buffer>,
     destroy_index_count: u32,
     rebuild_destroy_overlay: bool,
+}
+
+struct EntityPresentation {
+    entity_type: String,
+    dimensions: [f32; 2],
+    previous: EntityTransform,
+    target: EntityTransform,
+    received_at: Instant,
+}
+
+impl EntityPresentation {
+    fn display(&self, now: Instant) -> EntityTransform {
+        let t = (now
+            .saturating_duration_since(self.received_at)
+            .as_secs_f64()
+            / DEBUG_ENTITY_INTERPOLATION.as_secs_f64())
+        .clamp(0.0, 1.0);
+        if t >= 1.0 {
+            return self.target;
+        }
+        let lerp = |a: f64, b: f64| a + (b - a) * t;
+        let angle = |a: f32, b: f32| a + ((b - a + 180.0).rem_euclid(360.0) - 180.0) * t as f32;
+        EntityTransform {
+            position: cubic_world::Vec3d::new(
+                lerp(self.previous.position.x, self.target.position.x),
+                lerp(self.previous.position.y, self.target.position.y),
+                lerp(self.previous.position.z, self.target.position.z),
+            ),
+            yaw: angle(self.previous.yaw, self.target.yaw),
+            pitch: angle(self.previous.pitch, self.target.pitch),
+            head_yaw: angle(self.previous.head_yaw, self.target.head_yaw),
+        }
+    }
 }
 
 impl WorldRenderer {
@@ -673,6 +712,10 @@ impl WorldRenderer {
             selection_buffer: None,
             selection_vertex_count: 0,
             selection_dirty: false,
+            entities: BTreeMap::new(),
+            entity_buffer: None,
+            entity_vertex_count: 0,
+            entity_dirty: false,
             resources,
             _destroy_textures: destroy_textures,
             destroy_bind_groups,
@@ -710,6 +753,10 @@ impl WorldRenderer {
             self.selection_buffer = None;
             self.selection_vertex_count = 0;
             self.selection_dirty = false;
+            self.entities.clear();
+            self.entity_buffer = None;
+            self.entity_vertex_count = 0;
+            self.entity_dirty = false;
             self.destroy_vertex_buffer = None;
             self.destroy_index_buffer = None;
             self.destroy_index_count = 0;
@@ -733,6 +780,62 @@ impl WorldRenderer {
         if self.breaking != update.breaking {
             self.breaking = update.breaking;
             self.rebuild_destroy_overlay = true;
+        }
+        let now = Instant::now();
+        for delta in update.entities {
+            match delta {
+                EntityRenderDelta::Upsert(entity) => {
+                    let target = entity.authoritative;
+                    let dimensions = default_entity_dimensions(
+                        self.resources.entity_dimensions.as_ref(),
+                        &entity.entity_type,
+                    );
+                    let previous = self.entities.get(&entity.id).map_or(target, |existing| {
+                        let old = existing.display(now);
+                        let dx = target.position.x - old.position.x;
+                        let dy = target.position.y - old.position.y;
+                        let dz = target.position.z - old.position.z;
+                        if dx * dx + dy * dy + dz * dz > 64.0 {
+                            target
+                        } else {
+                            old
+                        }
+                    });
+                    self.entities.insert(
+                        entity.id,
+                        EntityPresentation {
+                            entity_type: entity.entity_type,
+                            dimensions,
+                            previous,
+                            target,
+                            received_at: now,
+                        },
+                    );
+                }
+                EntityRenderDelta::Remove(id) => {
+                    self.entities.remove(&id);
+                }
+                EntityRenderDelta::ReplaceAll(entities) => {
+                    self.entities.clear();
+                    for entity in entities {
+                        let dimensions = default_entity_dimensions(
+                            self.resources.entity_dimensions.as_ref(),
+                            &entity.entity_type,
+                        );
+                        self.entities.insert(
+                            entity.id,
+                            EntityPresentation {
+                                entity_type: entity.entity_type,
+                                dimensions,
+                                previous: entity.authoritative,
+                                target: entity.authoritative,
+                                received_at: now,
+                            },
+                        );
+                    }
+                }
+            }
+            self.entity_dirty = true;
         }
         for delta in update.chunks {
             match delta {
@@ -824,6 +927,31 @@ impl WorldRenderer {
                     usage: BufferUsages::VERTEX,
                 })
             });
+        }
+        if self.entity_dirty
+            || self
+                .entities
+                .values()
+                .any(|entity| entity.received_at.elapsed() < DEBUG_ENTITY_INTERPOLATION)
+        {
+            let now = Instant::now();
+            let vertices: Vec<SelectionVertex> = self
+                .entities
+                .values()
+                .take(MAX_DEBUG_ENTITY_BOXES)
+                .flat_map(|entity| {
+                    debug_entity_box_vertices(entity.display(now), entity.dimensions)
+                })
+                .collect();
+            self.entity_vertex_count = u32::try_from(vertices.len()).unwrap_or(0);
+            self.entity_buffer = (!vertices.is_empty()).then(|| {
+                device.create_buffer_init(&BufferInitDescriptor {
+                    label: Some("Cubic remote entity debug boxes"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: BufferUsages::VERTEX,
+                })
+            });
+            self.entity_dirty = false;
         }
         if self.rebuild_destroy_overlay {
             self.rebuild_destroy_overlay = false;
@@ -981,6 +1109,68 @@ impl WorldRenderer {
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         pass.set_vertex_buffer(0, buffer.slice(..));
         pass.draw(0..self.selection_vertex_count, 0..1);
+    }
+
+    pub(crate) fn draw_entity_boxes<'a>(&'a self, pass: &mut RenderPass<'a>) {
+        if self.pose.is_none() {
+            return;
+        }
+        let Some(buffer) = &self.entity_buffer else {
+            return;
+        };
+        pass.set_pipeline(&self.selection_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..self.entity_vertex_count, 0..1);
+    }
+
+    pub(crate) fn entity_labels(&self, width: u32, height: u32) -> Vec<(i32, String, f32, f32)> {
+        let Some(pose) = self.pose.map(|pose| pose.display(Instant::now())) else {
+            return Vec::new();
+        };
+        let matrix = CameraUniform::from_pose(pose, width, height).view_projection;
+        let now = Instant::now();
+        self.entities
+            .iter()
+            .take(MAX_DEBUG_ENTITY_BOXES)
+            .filter_map(|(&id, entity)| {
+                let transform = entity.display(now);
+                let point = [
+                    transform.position.x as f32,
+                    transform.position.y as f32 + entity.dimensions[1] + 0.2,
+                    transform.position.z as f32,
+                    1.0,
+                ];
+                let clip = [
+                    matrix[0][0] * point[0]
+                        + matrix[1][0] * point[1]
+                        + matrix[2][0] * point[2]
+                        + matrix[3][0],
+                    matrix[0][1] * point[0]
+                        + matrix[1][1] * point[1]
+                        + matrix[2][1] * point[2]
+                        + matrix[3][1],
+                    matrix[0][3] * point[0]
+                        + matrix[1][3] * point[1]
+                        + matrix[2][3] * point[2]
+                        + matrix[3][3],
+                ];
+                if clip[2] <= 0.0 {
+                    return None;
+                }
+                let x = clip[0] / clip[2];
+                let y = clip[1] / clip[2];
+                if !(-1.0..=1.0).contains(&x) || !(-1.0..=1.0).contains(&y) {
+                    return None;
+                }
+                Some((
+                    id,
+                    entity.entity_type.clone(),
+                    (x + 1.0) * width as f32 * 0.5,
+                    (1.0 - y) * height as f32 * 0.5,
+                ))
+            })
+            .collect()
     }
 
     pub(crate) fn draw_destroy_overlay<'a>(&'a self, pass: &mut RenderPass<'a>) {
@@ -1688,6 +1878,46 @@ struct SelectionVertex {
     corner: [f32; 2],
 }
 
+fn default_entity_dimensions(
+    data: Option<&cubic_version::EntityData>,
+    entity_type: &str,
+) -> [f32; 2] {
+    data.and_then(|data| data.get(entity_type))
+        .map_or([0.6, 1.8], |entity| [entity.width, entity.height])
+}
+
+fn debug_entity_box_vertices(
+    transform: EntityTransform,
+    dimensions: [f32; 2],
+) -> Vec<SelectionVertex> {
+    // Default 26.1.2 dimensions; pose-dependent changes remain deferred.
+    let x = transform.position.x;
+    let y = transform.position.y;
+    let z = transform.position.z;
+    let radius = f64::from(dimensions[0]) * 0.5;
+    let xs = [x - radius, x + radius];
+    let ys = [y, y + f64::from(dimensions[1])];
+    let zs = [z - radius, z + radius];
+    let mut vertices = Vec::with_capacity(12 * 6);
+    for a in 0..2 {
+        for b in 0..2 {
+            vertices.extend(selection_segment_vertices((
+                [xs[0], ys[a], zs[b]],
+                [xs[1], ys[a], zs[b]],
+            )));
+            vertices.extend(selection_segment_vertices((
+                [xs[a], ys[0], zs[b]],
+                [xs[a], ys[1], zs[b]],
+            )));
+            vertices.extend(selection_segment_vertices((
+                [xs[a], ys[b], zs[0]],
+                [xs[a], ys[b], zs[1]],
+            )));
+        }
+    }
+    vertices
+}
+
 fn selection_vertices(target: cubic_world::BlockTarget) -> Vec<SelectionVertex> {
     let boxes = target.outline.as_ref();
     let xs = shape_coordinates(boxes, |bounds| (bounds.min.x, bounds.max.x));
@@ -1985,6 +2215,53 @@ fn multiply(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_entity_debug_box_is_separate_from_chunk_geometry() {
+        let transform = EntityTransform {
+            position: cubic_world::Vec3d::new(4.0, 70.0, -3.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            head_yaw: 0.0,
+        };
+        let vertices = debug_entity_box_vertices(transform, [0.6, 1.8]);
+        assert_eq!(vertices.len(), 72);
+        let x_values: Vec<f32> = vertices.iter().map(|vertex| vertex.start[0]).collect();
+        assert!(x_values.contains(&3.7));
+        assert!(x_values.contains(&4.3));
+    }
+
+    #[test]
+    fn debug_boxes_use_exact_extracted_default_dimensions() {
+        let data = cubic_version::entity_data_for(
+            &cubic_version::MinecraftVersionId::new("26.1.2").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let transform = EntityTransform {
+            position: cubic_world::Vec3d::new(0.0, 64.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            head_yaw: 0.0,
+        };
+        for (name, expected) in [
+            ("minecraft:player", [0.6, 1.8]),
+            ("minecraft:zombie", [0.6, 1.95]),
+            ("minecraft:cow", [0.9, 1.4]),
+            ("minecraft:spider", [1.4, 0.9]),
+            ("minecraft:item", [0.25, 0.25]),
+            ("minecraft:oak_boat", [1.375, 0.5625]),
+            ("minecraft:block_display", [0.0, 0.0]),
+        ] {
+            let dimensions = default_entity_dimensions(Some(&data), name);
+            assert_eq!(dimensions, expected, "{name}");
+            assert_eq!(debug_entity_box_vertices(transform, dimensions).len(), 72);
+        }
+        assert_eq!(
+            default_entity_dimensions(Some(&data), "minecraft:missing"),
+            [0.6, 1.8]
+        );
+    }
 
     #[test]
     fn destroy_overlay_uses_vanillas_multiplicative_crumbling_state() {

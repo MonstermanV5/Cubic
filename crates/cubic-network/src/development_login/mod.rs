@@ -143,6 +143,8 @@ pub(crate) struct ConnectedPlay {
     pub(crate) dimension_types: Vec<cubic_world::RuntimeDimensionType>,
     pub(crate) biomes: Vec<cubic_world::RuntimeBiome>,
     pub(crate) banner_patterns: Vec<cubic_version::MinecraftIdentifier>,
+    pub(crate) entity_registries:
+        std::collections::BTreeMap<String, Vec<cubic_version::MinecraftIdentifier>>,
     pub(crate) result: DevelopmentLoginResult,
 }
 
@@ -215,6 +217,7 @@ async fn connect_to_play_inner(
         dimension_types: configuration.dimension_types,
         biomes: configuration.biomes,
         banner_patterns: configuration.banner_patterns,
+        entity_registries: configuration.entity_registries,
         result: DevelopmentLoginResult {
             address: address.clone(),
             minecraft_version: profile.minecraft_version().clone(),
@@ -312,6 +315,8 @@ pub(crate) struct ConfigurationOutcome {
     pub(crate) dimension_types: Vec<cubic_world::RuntimeDimensionType>,
     pub(crate) biomes: Vec<cubic_world::RuntimeBiome>,
     pub(crate) banner_patterns: Vec<cubic_version::MinecraftIdentifier>,
+    pub(crate) entity_registries:
+        std::collections::BTreeMap<String, Vec<cubic_version::MinecraftIdentifier>>,
 }
 
 pub(crate) async fn run_configuration(
@@ -322,6 +327,7 @@ pub(crate) async fn run_configuration(
     let mut dimension_types = Vec::new();
     let mut biomes = Vec::new();
     let mut banner_patterns = Vec::new();
+    let mut entity_registries = std::collections::BTreeMap::new();
     for _ in 0..=MAX_RECONFIGURATIONS_DURING_ACCEPTANCE {
         let phase = run_configuration_phase(connection, state).await?;
         skipped_packets = skipped_packets.saturating_add(phase.skipped_packets);
@@ -334,6 +340,7 @@ pub(crate) async fn run_configuration(
         if !phase.banner_patterns.is_empty() {
             banner_patterns = phase.banner_patterns;
         }
+        entity_registries.extend(phase.entity_registries);
         match await_initial_play_login(connection, state).await? {
             PlayAcceptance::Login(initial_login) => {
                 return Ok(ConfigurationOutcome {
@@ -342,6 +349,7 @@ pub(crate) async fn run_configuration(
                     dimension_types,
                     biomes,
                     banner_patterns,
+                    entity_registries,
                 });
             }
             PlayAcceptance::Reconfigure => {}
@@ -358,6 +366,7 @@ struct ConfigurationPhaseOutcome {
     dimension_types: Vec<cubic_world::RuntimeDimensionType>,
     biomes: Vec<cubic_world::RuntimeBiome>,
     banner_patterns: Vec<cubic_version::MinecraftIdentifier>,
+    entity_registries: std::collections::BTreeMap<String, Vec<cubic_version::MinecraftIdentifier>>,
 }
 
 async fn run_configuration_phase(
@@ -368,6 +377,7 @@ async fn run_configuration_phase(
     let mut dimension_types = Vec::new();
     let mut biomes = Vec::new();
     let mut banner_patterns = Vec::new();
+    let mut entity_registries = std::collections::BTreeMap::new();
     for _ in 0..MAX_CONFIGURATION_PACKETS {
         let frame = connection
             .read_frame("Configuration packet read")
@@ -410,6 +420,37 @@ async fn run_configuration_phase(
                             )
                         })
                         .collect::<Result<Vec<_>, _>>()?;
+                } else if matches!(
+                    registry,
+                    "minecraft:cat_variant"
+                        | "minecraft:cat_sound_variant"
+                        | "minecraft:chicken_variant"
+                        | "minecraft:chicken_sound_variant"
+                        | "minecraft:cow_variant"
+                        | "minecraft:cow_sound_variant"
+                        | "minecraft:wolf_variant"
+                        | "minecraft:wolf_sound_variant"
+                        | "minecraft:frog_variant"
+                        | "minecraft:pig_variant"
+                        | "minecraft:pig_sound_variant"
+                        | "minecraft:zombie_nautilus_variant"
+                        | "minecraft:painting_variant"
+                        | "minecraft:villager_type"
+                        | "minecraft:villager_profession"
+                ) {
+                    let identifiers = entries
+                        .into_iter()
+                        .map(|entry| {
+                            cubic_version::MinecraftIdentifier::new(entry.identifier).map_err(
+                                |_| {
+                                    DevelopmentLoginError::ConfigurationData(
+                                        "invalid entity registry identifier".to_owned(),
+                                    )
+                                },
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    entity_registries.insert(registry.to_owned(), identifiers);
                 }
             }
             ConfigurationClientbound::Disconnect { reason } => {
@@ -434,6 +475,7 @@ async fn run_configuration_phase(
                     dimension_types,
                     biomes,
                     banner_patterns,
+                    entity_registries,
                 });
             }
             ConfigurationClientbound::KeepAlive { id } => {

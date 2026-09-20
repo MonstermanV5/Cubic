@@ -272,6 +272,7 @@ impl TextureAtlasData {
 
 #[derive(Clone, Debug)]
 pub struct BlockResources {
+    pub(crate) entity_dimensions: Option<cubic_version::EntityData>,
     states: Vec<Option<StateModels>>,
     fallback: StateModels,
     pub atlas: TextureAtlasData,
@@ -647,6 +648,15 @@ impl BlockResources {
         let mut fallback = fallback_state();
         prepare_runtime_state(&mut fallback, &atlas);
         Ok(Self {
+            entity_dimensions: match cubic_version::entity_data_for(
+                &data.artifact().minecraft_version,
+            ) {
+                Ok(dimensions) => dimensions,
+                Err(error) => {
+                    tracing::warn!(%error, "exact-version entity dimensions unavailable; debug boxes use bounded fallback");
+                    None
+                }
+            },
             states: indexed_states,
             fallback,
             atlas,
@@ -727,6 +737,7 @@ impl BlockResources {
         .expect("synthetic missing atlas");
         let banner_atlas = atlas.clone();
         Self {
+            entity_dimensions: None,
             states,
             fallback: fallback_state(),
             atlas,

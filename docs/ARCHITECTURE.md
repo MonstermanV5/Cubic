@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes current and intended boundaries. Phases 1-19 provide the accepted terrain, movement, rendering-fidelity, special-movement, Play/Chat, and bounded block-interaction foundation. Phase 20 adds a version-aware inventory/items implementation that remains pending localhost acceptance; entities remain unimplemented.
+This document describes current and intended boundaries. Phases 1-20 provide the accepted terrain, movement, rendering-fidelity, special-movement, Play/Chat, block-interaction, and inventory/items foundation. Phase 21 is introducing generic multiplayer entity state.
 
 ## Workspace responsibilities
 
@@ -102,3 +102,7 @@ The exact scheduling design is intentionally deferred until those systems exist 
 ## Version boundaries
 
 Engine behavior should not depend directly on Minecraft numeric IDs where avoidable. Version-specific values and ordinary data differences should be isolated in generated version data. Small compatibility adapters may handle genuine behavioral differences. Version-dependent conditions must not be scattered throughout engine code.
+
+## Phase 21 entity boundary (accepted)
+
+The exact-version v775 adapter maps packet IDs and connection/static registry IDs to stable semantic events, including every current metadata serializer. `cubic-world::EntityStore` owns authoritative remote state, bounded typed metadata, generational handles and interpolation targets. Network-to-render entity deltas coalesce by ID independently of chunks; `cubic-render` owns only a diagnostic presentation copy using extracted exact default dimensions. The local controlled player continues to use the separate Phase 17 prediction path. This boundary and its debug presentation passed controlled localhost acceptance; see `ENTITIES.md`. Real models and animation remain Phase 22.

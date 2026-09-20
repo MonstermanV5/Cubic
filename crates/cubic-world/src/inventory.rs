@@ -92,7 +92,7 @@ impl ComponentPatch {
 }
 
 impl ComponentValue {
-    fn retained_bytes(&self) -> usize {
+    pub(crate) fn retained_bytes(&self) -> usize {
         match self {
             Self::Unit => 0,
             Self::VarInt(_) => size_of::<i32>(),

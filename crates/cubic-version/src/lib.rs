@@ -4,6 +4,7 @@
 //! performs no implicit network access.
 
 mod creative;
+mod entity_data;
 mod error;
 mod game_data;
 mod identity;
@@ -18,6 +19,7 @@ pub use creative::{
     MAX_CREATIVE_COMPONENT_BYTES, MAX_CREATIVE_COMPONENTS_PER_STACK, MAX_CREATIVE_DATA_BYTES,
     MAX_CREATIVE_STACKS_PER_TAB, MAX_CREATIVE_TABS, creative_order_hash, parse_creative_data,
 };
+pub use entity_data::{EntityData, EntityDimension, entity_data_for, parse_entity_data};
 pub use error::VersionError;
 pub use game_data::{
     BlockDefinition, BlockProperty, BlockState, GAME_DATA_FILE_NAME, GameData, GameDataArtifact,

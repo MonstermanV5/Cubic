@@ -6,10 +6,16 @@
 use thiserror::Error;
 
 mod chunk;
+mod entity;
 mod inventory;
 pub use chunk::{
     ChunkDecodeError, LevelChunkWithLight, LightUpdate, WireBlockEntity, WireChunkSection,
     WireHeightmap, WireLightData, WirePalettedContainer,
+};
+pub use entity::{
+    EntitySpawn, EntityTypeProfile, EntityWireAttribute, EntityWireEvent, EntityWireMetadataValue,
+    EntityWireModifier, EntityWireParticle, EntityWireParticleData, EntityWireProfile,
+    decode_entity_packet,
 };
 pub use inventory::{
     BannerPatternHolder, BannerPatternLayer, BannerPatternLayers, ClientboundContainerClose,
@@ -1301,6 +1307,12 @@ impl Default for ClientInformation<'static> {
 pub enum BootstrapProtocolError {
     #[error(transparent)]
     Codec(#[from] CodecError),
+    #[error("inventory metadata codec failed: {0}")]
+    Inventory(#[source] Box<InventoryCodecError>),
+    #[error("entity metadata registry {registry} is unavailable")]
+    EntityRegistryUnavailable { registry: &'static str },
+    #[error("entity metadata registry {registry} has no entry {raw_id}")]
+    EntityRegistryEntryUnknown { registry: &'static str, raw_id: u32 },
     #[error("malformed bounded NBT disconnect reason")]
     Nbt(#[source] NbtError),
     #[error("Block Entity Data NBT root is not a compound")]
@@ -2533,15 +2545,17 @@ fn decode_bound_chat_type(reader: &mut CodecReader<'_>) -> Result<String, Bootst
 fn decode_text_component(
     reader: &mut CodecReader<'_>,
 ) -> Result<TextComponent, BootstrapProtocolError> {
-    if reader.remaining() > MAX_CHAT_COMPONENT_BYTES {
+    let start = reader.position();
+    let value = decode_unnamed_network_tag(reader, NbtLimits::default())
+        .map_err(BootstrapProtocolError::Nbt)?;
+    let length = reader.consumed_since(start)?.len();
+    if length > MAX_CHAT_COMPONENT_BYTES {
         return Err(BootstrapProtocolError::PayloadTooLarge {
             context: "text component",
-            length: reader.remaining(),
+            length,
             max: MAX_CHAT_COMPONENT_BYTES,
         });
     }
-    let value = decode_unnamed_network_tag(reader, NbtLimits::default())
-        .map_err(BootstrapProtocolError::Nbt)?;
     let mut plain_text = String::new();
     project_plain_text(&value, &mut plain_text, 0);
     if plain_text.is_empty() {

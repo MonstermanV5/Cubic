@@ -55,6 +55,7 @@ pub struct WorldState {
     biomes: Vec<crate::RuntimeBiome>,
     session: Option<WorldSession>,
     chunks: LoadedChunks,
+    entities: crate::EntityStore,
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -135,6 +136,15 @@ impl WorldState {
     }
 
     #[must_use]
+    pub const fn entities(&self) -> &crate::EntityStore {
+        &self.entities
+    }
+
+    pub fn entities_mut(&mut self) -> &mut crate::EntityStore {
+        &mut self.entities
+    }
+
+    #[must_use]
     pub fn biomes(&self) -> &[crate::RuntimeBiome] {
         &self.biomes
     }
@@ -152,6 +162,7 @@ impl WorldState {
                 self.biomes.clear();
                 self.session = None;
                 self.chunks.clear();
+                self.entities.clear();
                 (ResetScope::Connection, false)
             }
             WorldEvent::RuntimeRegistries(mut registries) => {
@@ -204,6 +215,7 @@ impl WorldState {
                 self.session = Some(session_from_enter(enter, geometry));
                 self.lifecycle = WorldLifecycle::Active;
                 self.chunks.clear();
+                self.entities.clear();
                 (ResetScope::WorldContents, true)
             }
             WorldEvent::Respawn(respawn) => {
@@ -226,6 +238,7 @@ impl WorldState {
                     session.border = None;
                 }
                 self.chunks.clear();
+                self.entities.clear();
                 (ResetScope::WorldContents, dimension_changed)
             }
             WorldEvent::SynchronizePlayerPosition(update) => {
@@ -334,6 +347,7 @@ impl WorldState {
                 self.biomes.clear();
                 self.session = None;
                 self.chunks.clear();
+                self.entities.clear();
                 (ResetScope::Connection, false)
             }
         };
